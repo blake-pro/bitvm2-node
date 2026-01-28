@@ -31,6 +31,9 @@ pub struct MockAdaptor {
     latest_block_number: Arc<Mutex<i64>>,
     tx_receipts: Arc<Mutex<HashMap<String, TransactionReceipt>>>,
     gateway_contract_config: Arc<Mutex<GatewayContractConfig>>,
+    pegin_data_store: Arc<Mutex<HashMap<[u8; 16], PeginData>>>,
+    traces: Arc<Mutex<HashMap<String, GethTrace>>>,
+    quorum_size: Arc<Mutex<u64>>,
 }
 
 impl MockAdaptor {
@@ -52,9 +55,27 @@ impl MockAdaptor {
         }
     }
 
+    pub fn set_trace(&self, tx_hash: String, trace: GethTrace) {
+        if let Ok(mut t) = self.traces.lock() {
+            t.insert(tx_hash, trace);
+        }
+    }
+
     pub fn set_gateway_contract_config(&self, config: GatewayContractConfig) {
         if let Ok(mut h) = self.gateway_contract_config.lock() {
             *h = config;
+        }
+    }
+
+    pub fn set_pegin_data(&self, instance_id: [u8; 16], data: PeginData) {
+        if let Ok(mut h) = self.pegin_data_store.lock() {
+            h.insert(instance_id, data);
+        }
+    }
+
+    pub fn set_quorum_size(&self, size: u64) {
+        if let Ok(mut h) = self.quorum_size.lock() {
+            *h = size;
         }
     }
 }
@@ -89,9 +110,15 @@ impl ChainAdaptor for MockAdaptor {
 
     async fn debug_trace_tx(
         &self,
-        _tx_hash: &str,
+        tx_hash: &str,
         _trace_options: Option<GethDebugTracingOptions>,
     ) -> anyhow::Result<GethTrace> {
+        #[allow(clippy::collapsible_if)]
+        if let Ok(traces) = self.traces.lock() {
+            if let Some(trace) = traces.get(tx_hash) {
+                return Ok(trace.clone());
+            }
+        }
         // Mock adaptor returns empty trace structure.
         Ok(GethTrace::NoopTracer(NoopFrame::default()))
     }
@@ -152,9 +179,14 @@ impl ChainAdaptor for MockAdaptor {
         Ok([0_u8; 20])
     }
 
-    async fn gateway_get_pegin_data(&self, _instance_id: &[u8; 16]) -> anyhow::Result<PeginData> {
+    async fn gateway_get_pegin_data(&self, instance_id: &[u8; 16]) -> anyhow::Result<PeginData> {
         info!("call get_pegin_data");
-
+        #[allow(clippy::collapsible_if)]
+        if let Ok(store) = self.pegin_data_store.lock() {
+            if let Some(data) = store.get(instance_id) {
+                return Ok(data.clone());
+            }
+        }
         bail!("not find pegin data")
     }
 
@@ -411,7 +443,7 @@ impl ChainAdaptor for MockAdaptor {
     }
 
     async fn committee_mana_quorum_size(&self) -> anyhow::Result<u64> {
-        Ok(0)
+        Ok(if let Ok(h) = self.quorum_size.lock() { *h } else { 0 })
     }
 
     async fn committee_mana_verify_signatures(
@@ -473,6 +505,9 @@ impl MockAdaptor {
             latest_block_number: Arc::new(Mutex::new(0)),
             tx_receipts: Arc::new(Mutex::new(HashMap::new())),
             gateway_contract_config: Arc::new(Mutex::new(Default::default())),
+            pegin_data_store: Arc::new(Mutex::new(HashMap::new())),
+            traces: Arc::new(Mutex::new(HashMap::new())),
+            quorum_size: Arc::new(Mutex::new(0)),
         }
     }
 }

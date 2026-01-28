@@ -19,8 +19,8 @@ pub use chain_adaptor::{
 pub use goat_adaptor::GoatInitConfig;
 mod chain_adaptor;
 mod evmchain;
-mod goat_adaptor;
-mod mock_goat_adaptor;
+pub mod goat_adaptor;
+pub mod mock_goat_adaptor;
 use crate::goat_chain::evmchain::EvmChain;
 use crate::goat_chain::mock_goat_adaptor::MockAdaptor;
 pub use chain_adaptor::{DisproveTxType, Utxo};

@@ -1,4 +1,4 @@
-mod event_watch_task;
+pub mod event_watch_task;
 pub mod graph_maintenance_tasks;
 pub mod instance_maintenance_tasks;
 mod node_maintenance_tasks;

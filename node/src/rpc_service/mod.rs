@@ -112,7 +112,7 @@ async fn root() -> &'static str {
 }
 
 pub async fn serve(
-    addr: String,
+    listener: TcpListener,
     local_db: LocalDB,
     actor: Actor,
     peer_id: String,
@@ -175,7 +175,7 @@ pub async fn serve(
         .layer(middleware::from_fn_with_state(app_state.clone(), metrics_middleware))
         .with_state(app_state);
 
-    let listener = TcpListener::bind(addr).await.unwrap();
+    // Listener is passed in
     tracing::info!("RPC listening on {}", listener.local_addr().unwrap());
 
     tokio::select! {
@@ -255,6 +255,7 @@ mod tests {
     use std::time::Duration;
     use store::localdb::LocalDB;
     use store::{Graph, GraphStatus, Instance, InstanceBridgeInStatus, Node, create_local_db};
+    use tokio::net::TcpListener;
     use tokio::time::sleep;
     use tokio_util::sync::CancellationToken;
     use tracing::{error, info};
@@ -418,8 +419,9 @@ mod tests {
 
         let local_db = create_local_db(&temp_sqlite_db_path()).await;
         init_nodes_data(&local_db, &nodes).await?;
+        let listener = TcpListener::bind(addr.clone()).await.unwrap();
         tokio::spawn(rpc_service::serve(
-            addr.clone(),
+            listener,
             local_db,
             Actor::Challenger,
             generate_local_key().public().to_peer_id().to_string(),
@@ -620,8 +622,9 @@ mod tests {
 
         init_instance_graph_data(&local_db, &instances, &graphs).await?;
 
+        let listener = TcpListener::bind(addr.clone()).await.unwrap();
         tokio::spawn(rpc_service::serve(
-            addr.clone(),
+            listener,
             local_db.clone(),
             actor.clone(),
             peer_id.clone(),
@@ -773,8 +776,9 @@ mod tests {
         let committee = Actor::Committee;
         let committee_peer_id = generate_local_key().public().to_peer_id().to_string();
         let local_db = create_local_db(&temp_sqlite_db_path()).await;
+        let listener = TcpListener::bind(addr.clone()).await.unwrap();
         tokio::spawn(rpc_service::serve(
-            addr.clone(),
+            listener,
             local_db,
             committee,
             committee_peer_id,

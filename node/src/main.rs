@@ -171,8 +171,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Spawn RPC service task with cancellation support
     let cancel_token_clone = cancellation_token.clone();
     task_handles.push(tokio::spawn(async move {
+        // Bind the listener here before passing to serve
+        let listener = match tokio::net::TcpListener::bind(&opt_rpc_addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("Failed to bind RPC address {}: {}", opt_rpc_addr, e);
+                return Err(format!("Failed to bind RPC address: {e}"));
+            }
+        };
+
         match rpc_service::serve(
-            opt_rpc_addr,
+            listener,
             local_db_clone1,
             actor_clone1,
             peer_id_string_clone,

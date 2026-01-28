@@ -1861,6 +1861,7 @@ async fn detect_take2(
                 .await?
                 .unwrap_or_default()
                 .height;
+
             let ready = check_operator_withdraw_ready_condition(
                 btc_client,
                 local_db,
