@@ -111,3 +111,8 @@ client = { workspace = true }
 bitcoin-light-client-circuit = { workspace = true }
 commit-chain = { workspace = true }
 cbft-rpc = { workspace = true }
+
+[dev-dependencies]
+serial_test = "3.2"
+regex = "1.11"
+scopeguard = "1.2"

@@ -41,6 +41,8 @@ use client::{
 };
 use esplora_client::{Tx, TxStatus, Vout};
 use goat::transactions::base::Input;
+use regex::Regex;
+use serial_test::serial;
 use std::str::FromStr;
 use std::{sync::Arc, time::Duration};
 use store::{
@@ -53,9 +55,188 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+/// Well-known test instance and graph IDs used in mock responses
+#[allow(dead_code)]
+mod test_fixtures {
+    /// Standard test instance ID used in bridge-in tests and mock graph responses
+    pub const BRIDGE_IN_INSTANCE_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+    /// Standard test graph ID used in bridge-out disprove tests
+    pub const BRIDGE_OUT_GRAPH_ID: &str = "11111111-1111-1111-1111-111111111111";
+
+    /// Get bridge_in instance ID as Uuid
+    pub fn bridge_in_instance_id() -> uuid::Uuid {
+        uuid::Uuid::parse_str(BRIDGE_IN_INSTANCE_ID).unwrap()
+    }
+
+    /// Get bridge_out graph ID as Uuid
+    pub fn bridge_out_graph_id() -> uuid::Uuid {
+        uuid::Uuid::parse_str(BRIDGE_OUT_GRAPH_ID).unwrap()
+    }
+
+    /// Format instance ID as hex without dashes (for mock responses)
+    pub fn instance_id_hex() -> String {
+        format!("0x{}", BRIDGE_IN_INSTANCE_ID.replace("-", ""))
+    }
+
+    /// Format graph ID as hex without dashes (for mock responses)
+    pub fn graph_id_hex() -> String {
+        format!("0x{}", BRIDGE_OUT_GRAPH_ID.replace("-", ""))
+    }
+}
+
+#[allow(dead_code)]
+mod test_helpers {
+    use super::*;
+    use store::localdb::StorageProcessor;
+
+    // Re-export scopeguard::defer for tests needing RAII cleanup patterns
+    #[allow(unused_imports)]
+    pub use scopeguard::defer;
+
+    /// Create a default EscrowData for bridge-out tests
+    pub fn default_escrow_data() -> EscrowData {
+        EscrowData {
+            offerer: Address::ZERO,
+            claimer: Address::ZERO,
+            amount: U256::from(100000),
+            token: Address::ZERO,
+            flags: U256::ZERO,
+            claimHandler: Address::ZERO,
+            claimData: B256::ZERO,
+            refundHandler: Address::ZERO,
+            refundData: B256::ZERO,
+            securityDeposit: U256::ZERO,
+            claimerBounty: U256::ZERO,
+            depositToken: Address::ZERO,
+            successActionCommitment: B256::ZERO,
+        }
+    }
+
+    /// Create a confirmed TxStatus
+    pub fn confirmed_tx_status(block_height: u32) -> TxStatus {
+        TxStatus {
+            confirmed: true,
+            block_height: Some(block_height),
+            block_hash: None,
+            block_time: None,
+        }
+    }
+
+    /// Create a mock Tx with optional confirmation
+    pub fn mock_tx(txid: BitcoinTxid, block_height: Option<u32>) -> Tx {
+        Tx {
+            txid,
+            version: 2,
+            locktime: 0,
+            vin: vec![],
+            vout: vec![],
+            status: TxStatus {
+                confirmed: block_height.is_some(),
+                block_height,
+                block_hash: None,
+                block_time: None,
+            },
+            fee: 100,
+            size: 100,
+            weight: 400,
+        }
+    }
+
+    /// Create a mock Tx with vouts
+    pub fn mock_tx_with_vouts(txid: BitcoinTxid, block_height: u32, vouts: Vec<Vout>) -> Tx {
+        Tx {
+            txid,
+            version: 2,
+            locktime: 0,
+            vin: vec![],
+            vout: vouts,
+            status: confirmed_tx_status(block_height),
+            fee: 100,
+            size: 100,
+            weight: 400,
+        }
+    }
+
+    /// Start a mock graph server and return its URL
+    pub async fn start_mock_graph_server() -> String {
+        let graph_router = Router::new().route("/", post(super::mock_graph_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let graph_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, graph_router).await.unwrap();
+        });
+        graph_url
+    }
+
+    /// Assert instance has expected status
+    pub async fn assert_instance_status(
+        storage: &mut StorageProcessor<'_>,
+        instance_id: &Uuid,
+        expected: InstanceBridgeInStatus,
+    ) {
+        let instance = storage.find_instance(instance_id).await.unwrap().unwrap();
+        assert_eq!(
+            instance.status,
+            expected.to_string(),
+            "Expected status {:?}, got {}",
+            expected,
+            instance.status
+        );
+    }
+
+    /// Assert graph has expected status
+    pub async fn assert_graph_status(
+        storage: &mut StorageProcessor<'_>,
+        graph_id: &Uuid,
+        expected: GraphStatus,
+    ) {
+        let graph = storage.find_graph(graph_id).await.unwrap().unwrap();
+        assert_eq!(
+            graph.status,
+            expected.to_string(),
+            "Expected graph status {:?}, got {}",
+            expected,
+            graph.status
+        );
+    }
+
+    /// Create a valid test committee keypair
+    pub fn test_committee_keypair() -> (bitcoin::PrivateKey, bitcoin::PublicKey) {
+        let privkey =
+            bitcoin::PrivateKey::from_slice(&[1u8; 32], bitcoin::Network::Regtest).unwrap();
+        let pubkey = privkey.public_key(&bitcoin::secp256k1::Secp256k1::new());
+        (privkey, pubkey)
+    }
+
+    /// Create a default PeginData for testing
+    pub fn default_pegin_data(instance_id: Uuid, input_txid: [u8; 32]) -> PeginData {
+        let (_privkey, pubkey) = test_committee_keypair();
+        let committee_pubkey_bytes = pubkey.to_bytes();
+        let committee_addr = [4u8; 20];
+
+        PeginData {
+            status: PeginStatus::Pending,
+            instance_id: *instance_id.as_bytes(),
+            depositor_address: [0u8; 20],
+            pegin_amount_sats: 100000,
+            txn_fees: [100, 100, 100],
+            user_inputs: vec![GoatUtxo { txid: input_txid, vout: 0, amount_sats: 200000 }],
+            user_xonly_pubkey: [2u8; 32],
+            user_change_addr: "bcrt1q...".to_string(),
+            user_refund_addr: "bcrt1q...".to_string(),
+            pegin_txid: [3u8; 32],
+            created_at: 0,
+            committee_addresses: vec![Address::from(committee_addr)],
+            committee_pubkeys: vec![committee_pubkey_bytes],
+        }
+    }
+}
+
 async fn setup() -> (LocalDB, BTCClient, MockBitcoinAdaptor, GOATClient, MockAdaptor, NamedTempFile)
 {
     // Set Env Vars for RPC start
+    // SAFETY: Tests using this function must be marked with #[serial] to prevent
+    // race conditions since environment variables are process-global state.
     unsafe {
         std::env::set_var("BTC_Node_URL", "http://127.0.0.1:18443");
         std::env::set_var("GOAT_CHAIN_URL", "http://127.0.0.1:8545");
@@ -65,7 +246,7 @@ async fn setup() -> (LocalDB, BTCClient, MockBitcoinAdaptor, GOATClient, MockAda
         );
     }
 
-    // Setup LocalDB
+    // Setup LocalDB with temp file (file handle kept alive by caller)
     let db_file = NamedTempFile::new().unwrap();
     let db_path = db_file.path().to_str().unwrap().to_string();
     let local_db = create_local_db(&db_path).await;
@@ -78,9 +259,9 @@ async fn setup() -> (LocalDB, BTCClient, MockBitcoinAdaptor, GOATClient, MockAda
 
     // Default config for Goat mock
     goat_mock.set_gateway_contract_config(GatewayContractConfig {
-        min_challenge_amount_sats: 100000,        // 0.01 BTC,
+        min_challenge_amount_sats: 100000,        // 0.01 BTC
         min_pegin_fee_sats: 5000,                 // 0.00005 BTC
-        pegin_fee_rate: 50,                       //0.5%
+        pegin_fee_rate: 50,                       // 0.5%
         min_operator_reward_sats: 3000,           // 0.00003 BTC
         operator_reward_rate: 30,                 // 0.3%
         min_stake_amount: 60000000000000000,      // 0.06 stakeToken(pegBTC)
@@ -93,6 +274,7 @@ async fn setup() -> (LocalDB, BTCClient, MockBitcoinAdaptor, GOATClient, MockAda
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn test_rpc_service_integration() {
     let (local_db, _, _, _, _, _db_file) = setup().await;
     let actor = Actor::Challenger;
@@ -146,6 +328,7 @@ async fn mock_goat_rpc_handler(Json(payload): Json<serde_json::Value>) -> Json<s
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn test_bridge_out_flow() {
     let (local_db, btc_client, _btc_mock, goat_client, goat_mock, _db_file) = setup().await;
     let actor = Actor::Challenger;
@@ -332,6 +515,7 @@ async fn test_bridge_out_flow() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn test_bridge_in_timeout() {
     let (local_db, btc_client, btc_mock, _, _, _db_file) = setup().await;
 
@@ -392,6 +576,7 @@ async fn test_bridge_in_timeout() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn test_bridge_in_flow() {
     let (local_db, btc_client, btc_mock, goat_client, goat_mock, _db_file) = setup().await;
     let actor = Actor::Challenger;
@@ -639,6 +824,7 @@ async fn test_bridge_in_flow() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn test_bridge_out_disprove_event() {
     let (local_db, btc_client, _, goat_client, _, _db_file) = setup().await;
     let actor = Actor::Challenger;
@@ -726,6 +912,7 @@ async fn test_bridge_out_disprove_event() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn test_bridge_in_utxo_spent() {
     let (local_db, btc_client, btc_mock, goat_client, goat_mock, _db_file) = setup().await;
 
@@ -832,6 +1019,7 @@ async fn test_bridge_in_utxo_spent() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn test_bridge_out_refund() {
     let (local_db, btc_client, _btc_mock, goat_client, goat_mock, _db_file) = setup().await;
     let actor = Actor::Challenger;
@@ -964,6 +1152,10 @@ async fn mock_graph_handler(Json(payload): Json<serde_json::Value>) -> Json<serd
     use alloy::sol_types::SolValue;
     use bitvm2_noded::utils::evm_swap_utils::IEscrowManager::EscrowData;
 
+    // Use test_fixtures for consistent IDs across tests and mock responses
+    let instance_id_hex = test_fixtures::instance_id_hex();
+    let graph_id_hex = test_fixtures::graph_id_hex();
+
     // Common EscrowData construction (same as in test)
     let escrow_data = EscrowData {
         offerer: Address::ZERO,
@@ -983,7 +1175,12 @@ async fn mock_graph_handler(Json(payload): Json<serde_json::Value>) -> Json<serd
     let hash = keccak256(escrow_data.abi_encode());
     let hash_str = hex::encode(hash);
 
-    if query.contains("initializes") {
+    // Use regex word-boundary matching to prevent false matches (e.g., "claims" vs "reclaims")
+    let matches_query = |pattern: &str| -> bool {
+        Regex::new(&format!(r"\b{}\b", pattern)).map(|re| re.is_match(query)).unwrap_or(false)
+    };
+
+    if matches_query("initializes") {
         data.insert(
             "initializes".to_string(),
             serde_json::json!([
@@ -1002,14 +1199,14 @@ async fn mock_graph_handler(Json(payload): Json<serde_json::Value>) -> Json<serd
         );
     }
 
-    if query.contains("claims") {
+    if matches_query("claims") {
         data.insert(
             "claims".to_string(),
             serde_json::json!([
                 {
                     "id": "claim_1",
                     "transactionHash": "0xclaim",
-                     "blockNumber": "2",
+                    "blockNumber": "2",
                     "blockTimestamp": "2000",
                     "offerer": "0x0000000000000000000000000000000000000000",
                     "claimer": "0x0000000000000000000000000000000000000000",
@@ -1021,7 +1218,7 @@ async fn mock_graph_handler(Json(payload): Json<serde_json::Value>) -> Json<serd
         );
     }
 
-    if query.contains("refunds") {
+    if matches_query("refunds") {
         data.insert(
             "refunds".to_string(),
             serde_json::json!([
@@ -1039,14 +1236,14 @@ async fn mock_graph_handler(Json(payload): Json<serde_json::Value>) -> Json<serd
         );
     }
 
-    if query.contains("bridgeInRequests") {
+    if matches_query("bridgeInRequests") {
         data.insert("bridgeInRequests".to_string(), serde_json::json!([
                 {
                     "id": "test_id",
                     "transactionHash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
                     "blockNumber": "10",
                     "blockTimestamp": "1600000000",
-                    "instanceId": "0x550e8400e29b41d4a716446655440000",
+                    "instanceId": instance_id_hex,
                     "depositorAddress": "0x0000000000000000000000000000000000000100",
                     "peginAmountSats": "100000",
                     "txnFees": ["100", "100", "100"],
@@ -1057,7 +1254,7 @@ async fn mock_graph_handler(Json(payload): Json<serde_json::Value>) -> Json<serd
             ]));
     }
 
-    if query.contains("bridgeIns") {
+    if matches_query("bridgeIns") {
         data.insert(
             "bridgeIns".to_string(),
             serde_json::json!([
@@ -1065,7 +1262,7 @@ async fn mock_graph_handler(Json(payload): Json<serde_json::Value>) -> Json<serd
                     "id": "test_bridge_in",
                     "transactionHash": "0xbridge_in_tx_hash",
                     "blockNumber": "20",
-                    "instanceId": "0x550e8400e29b41d4a716446655440000",
+                    "instanceId": instance_id_hex,
                     "depositorAddress": "0xdepositor",
                     "peginAmountSats": "100000",
                     "feeAmountSats": "1000"
@@ -1074,7 +1271,7 @@ async fn mock_graph_handler(Json(payload): Json<serde_json::Value>) -> Json<serd
         );
     }
 
-    if query.contains("withdrawDisproveds") {
+    if matches_query("withdrawDisproveds") {
         data.insert(
             "withdrawDisproveds".to_string(),
             serde_json::json!([
@@ -1083,8 +1280,8 @@ async fn mock_graph_handler(Json(payload): Json<serde_json::Value>) -> Json<serd
                     "transactionHash": "0xdisprove_tx_hash",
                     "blockNumber": "20",
                     "blockTimestamp": "1600000100",
-                    "instanceId": "0x550e8400e29b41d4a716446655440000",
-                    "graphId": "0x11111111111111111111111111111111",
+                    "instanceId": instance_id_hex,
+                    "graphId": graph_id_hex,
                     "disproveTxType": 1,
                     "txnIndex": "0",
                     "challengeStartTxid": "0xstart",
@@ -1104,6 +1301,7 @@ async fn mock_graph_handler(Json(payload): Json<serde_json::Value>) -> Json<serd
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn test_bridge_in_user_cancel() {
     let (local_db, btc_client, btc_mock, _, _, _db_file) = setup().await;
 
@@ -1153,6 +1351,7 @@ async fn test_bridge_in_user_cancel() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn test_bridge_out_operator_kickoff() {
     let (local_db, _, _, _, _, _db_file) = setup().await;
     let mut storage_processor = local_db.acquire().await.unwrap();
@@ -1216,6 +1415,7 @@ async fn test_bridge_out_operator_kickoff() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn test_bridge_out_take2() {
     let (local_db, btc_client, btc_mock, _, _, _db_file) = setup().await;
     let mut storage_processor = local_db.acquire().await.unwrap();
@@ -1372,6 +1572,7 @@ async fn test_bridge_out_take2() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn test_bridge_in_committee_fail() {
     let (local_db, _, _, goat_client, goat_mock, _db_file) = setup().await;
     let mut storage_processor = local_db.acquire().await.unwrap();
@@ -1430,6 +1631,7 @@ async fn test_bridge_in_committee_fail() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn test_bridge_out_complex_challenge() {
     let (local_db, btc_client, btc_mock, _, _, _db_file) = setup().await;
     let mut storage_processor = local_db.acquire().await.unwrap();
@@ -1534,6 +1736,7 @@ async fn test_bridge_out_complex_challenge() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn test_bridge_out_challenge_timeouts() {
     let (local_db, btc_client, btc_mock, _, _, _db_file) = setup().await;
     let mut storage_processor = local_db.acquire().await.unwrap();
