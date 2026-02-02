@@ -2641,6 +2641,7 @@ dependencies = [
  "once_cell",
  "prometheus-client",
  "proof-builder",
+ "proptest",
  "rand 0.8.5",
  "regex",
  "reqwest 0.12.28",
@@ -2657,6 +2658,7 @@ dependencies = [
  "tendermint",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-test",
  "tokio-util",
  "tower-http",
  "tracing",
@@ -12214,6 +12216,17 @@ dependencies = [
  "pin-project-lite",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "tokio-test"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6d24790a10a7af737693a3e8f1d03faef7e6ca0cc99aae5066f533766de545"
+dependencies = [
+ "futures-core",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
