@@ -41,7 +41,6 @@ use client::{
 };
 use esplora_client::{Tx, TxStatus, Vout};
 use goat::transactions::base::Input;
-use regex::Regex;
 use serial_test::serial;
 use std::str::FromStr;
 use std::{sync::Arc, time::Duration};
@@ -56,34 +55,9 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-/// Well-known test instance and graph IDs used in mock responses
-#[allow(dead_code)]
-mod test_fixtures {
-    /// Standard test instance ID used in bridge-in tests and mock graph responses
-    pub const BRIDGE_IN_INSTANCE_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
-    /// Standard test graph ID used in bridge-out disprove tests
-    pub const BRIDGE_OUT_GRAPH_ID: &str = "11111111-1111-1111-1111-111111111111";
-
-    /// Get bridge_in instance ID as Uuid
-    pub fn bridge_in_instance_id() -> uuid::Uuid {
-        uuid::Uuid::parse_str(BRIDGE_IN_INSTANCE_ID).unwrap()
-    }
-
-    /// Get bridge_out graph ID as Uuid
-    pub fn bridge_out_graph_id() -> uuid::Uuid {
-        uuid::Uuid::parse_str(BRIDGE_OUT_GRAPH_ID).unwrap()
-    }
-
-    /// Format instance ID as hex without dashes (for mock responses)
-    pub fn instance_id_hex() -> String {
-        format!("0x{}", BRIDGE_IN_INSTANCE_ID.replace("-", ""))
-    }
-
-    /// Format graph ID as hex without dashes (for mock responses)
-    pub fn graph_id_hex() -> String {
-        format!("0x{}", BRIDGE_OUT_GRAPH_ID.replace("-", ""))
-    }
-}
+mod test_support;
+use test_support::mock_graph_handler;
+use test_support::test_fixtures;
 
 #[allow(dead_code)]
 mod test_helpers {
@@ -156,17 +130,6 @@ mod test_helpers {
             size: 100,
             weight: 400,
         }
-    }
-
-    /// Start a mock graph server and return its URL
-    pub async fn start_mock_graph_server() -> String {
-        let graph_router = Router::new().route("/", post(super::mock_graph_handler));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let graph_url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move {
-            axum::serve(listener, graph_router).await.unwrap();
-        });
-        graph_url
     }
 
     /// Assert instance has expected status
@@ -1145,161 +1108,6 @@ async fn test_bridge_out_refund() {
     assert_eq!(instance.status, InstanceBridgeOutStatus::Refund.to_string());
 }
 
-async fn mock_graph_handler(Json(payload): Json<serde_json::Value>) -> Json<serde_json::Value> {
-    let query = payload.get("query").and_then(|v| v.as_str()).unwrap_or("");
-    let mut data = serde_json::Map::new();
-
-    use alloy::primitives::{Address, B256, U256, keccak256};
-    use alloy::sol_types::SolValue;
-    use bitvm2_noded::utils::evm_swap_utils::IEscrowManager::EscrowData;
-
-    // Use test_fixtures for consistent IDs across tests and mock responses
-    let instance_id_hex = test_fixtures::instance_id_hex();
-    let graph_id_hex = test_fixtures::graph_id_hex();
-
-    // Common EscrowData construction (same as in test)
-    let escrow_data = EscrowData {
-        offerer: Address::ZERO,
-        claimer: Address::ZERO,
-        amount: U256::from(100000),
-        token: Address::ZERO,
-        flags: U256::ZERO,
-        claimHandler: Address::ZERO,
-        claimData: B256::ZERO,
-        refundHandler: Address::ZERO,
-        refundData: B256::ZERO,
-        securityDeposit: U256::ZERO,
-        claimerBounty: U256::ZERO,
-        depositToken: Address::ZERO,
-        successActionCommitment: B256::ZERO,
-    };
-    let hash = keccak256(escrow_data.abi_encode());
-    let hash_str = hex::encode(hash);
-
-    // Use regex word-boundary matching to prevent false matches (e.g., "claims" vs "reclaims")
-    let matches_query = |pattern: &str| -> bool {
-        Regex::new(&format!(r"\b{}\b", pattern)).map(|re| re.is_match(query)).unwrap_or(false)
-    };
-
-    if matches_query("initializes") {
-        data.insert(
-            "initializes".to_string(),
-            serde_json::json!([
-                {
-                    "id": "init_1",
-                    "transactionHash": "0xinit",
-                    "blockNumber": "1",
-                    "blockTimestamp": "1000",
-                    "offerer": "0x0000000000000000000000000000000000000000",
-                    "claimer": "0x0000000000000000000000000000000000000000",
-                    "escrowHash": format!("0x{}", hash_str),
-                    "claimHandler": "0x0000000000000000000000000000000000000000",
-                    "refundHandler": "0x0000000000000000000000000000000000000000"
-                }
-            ]),
-        );
-    }
-
-    if matches_query("claims") {
-        data.insert(
-            "claims".to_string(),
-            serde_json::json!([
-                {
-                    "id": "claim_1",
-                    "transactionHash": "0xclaim",
-                    "blockNumber": "2",
-                    "blockTimestamp": "2000",
-                    "offerer": "0x0000000000000000000000000000000000000000",
-                    "claimer": "0x0000000000000000000000000000000000000000",
-                    "escrowHash": format!("0x{}", hash_str),
-                    "claimHandler": "0x0000000000000000000000000000000000000000",
-                    "witnessResult": "0x"
-                }
-            ]),
-        );
-    }
-
-    if matches_query("refunds") {
-        data.insert(
-            "refunds".to_string(),
-            serde_json::json!([
-                {
-                    "id": "refund_1",
-                    "transactionHash": "0xrefund",
-                    "blockNumber": "3",
-                    "offerer": "0x0000000000000000000000000000000000000000",
-                    "claimer": "0x0000000000000000000000000000000000000000",
-                    "escrowHash": format!("0x{}", hash_str),
-                    "refundHandler": "0x0000000000000000000000000000000000000000",
-                    "witnessResult": "0x"
-                }
-            ]),
-        );
-    }
-
-    if matches_query("bridgeInRequests") {
-        data.insert("bridgeInRequests".to_string(), serde_json::json!([
-                {
-                    "id": "test_id",
-                    "transactionHash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-                    "blockNumber": "10",
-                    "blockTimestamp": "1600000000",
-                    "instanceId": instance_id_hex,
-                    "depositorAddress": "0x0000000000000000000000000000000000000100",
-                    "peginAmountSats": "100000",
-                    "txnFees": ["100", "100", "100"],
-                    "userXonlyPubkey": "0xpubkey",
-                    "userChangeAddress": "change_addr",
-                    "userRefundAddress": "refund_addr"
-                }
-            ]));
-    }
-
-    if matches_query("bridgeIns") {
-        data.insert(
-            "bridgeIns".to_string(),
-            serde_json::json!([
-                 {
-                    "id": "test_bridge_in",
-                    "transactionHash": "0xbridge_in_tx_hash",
-                    "blockNumber": "20",
-                    "instanceId": instance_id_hex,
-                    "depositorAddress": "0xdepositor",
-                    "peginAmountSats": "100000",
-                    "feeAmountSats": "1000"
-                }
-            ]),
-        );
-    }
-
-    if matches_query("withdrawDisproveds") {
-        data.insert(
-            "withdrawDisproveds".to_string(),
-            serde_json::json!([
-                {
-                    "id": "test_disprove",
-                    "transactionHash": "0xdisprove_tx_hash",
-                    "blockNumber": "20",
-                    "blockTimestamp": "1600000100",
-                    "instanceId": instance_id_hex,
-                    "graphId": graph_id_hex,
-                    "disproveTxType": 1,
-                    "txnIndex": "0",
-                    "challengeStartTxid": "0xstart",
-                    "challengeFinishTxid": "0xfinish",
-                    "challengerAddress": "0x0000000000000000000000000000000000000001",
-                    "disproverAddress": "0x0000000000000000000000000000000000000002",
-                    "challengerRewardAmount": "1000",
-                    "disproverRewardAmount": "1000"
-                }
-            ]),
-        );
-    }
-
-    Json(serde_json::json!({
-        "data": data
-    }))
-}
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial]

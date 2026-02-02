@@ -1,4 +1,5 @@
 mod bitvm2;
+pub use bitvm2::{BridgeInPrepareRequest, BridgeOutInitTagRequest};
 mod cors_config;
 pub mod handler;
 mod node;

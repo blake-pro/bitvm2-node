@@ -116,3 +116,5 @@ cbft-rpc = { workspace = true }
 serial_test = "3.2"
 regex = "1.11"
 scopeguard = "1.2"
+tokio-test = "0.4"
+proptest = "1.6"
