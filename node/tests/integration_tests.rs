@@ -692,7 +692,8 @@ async fn test_bridge_in_flow() {
     assert_eq!(instance.status, InstanceBridgeInStatus::UserInited.to_string());
 
     // 2. Test UserInited -> CommitteesAnswered
-    goat_mock.set_latest_block_number(20);
+    goat_mock.set_latest_block_number(211);
+    goat_mock.set_response_window_blocks(200);
 
     // Run window monitor
     instance_window_expiration_monitor(&local_db, &goat_client).await.unwrap();
@@ -827,7 +828,6 @@ async fn test_bridge_out_disprove_event() {
         kickoff_index: 0,
         from_addr: "goat_addr".to_string(),
         to_addr: "btc_addr".to_string(),
-        graph_ipfs_base_url: "".to_string(),
         amount: 1000,
         challenge_amount: 1000,
         sub_status: "{}".to_string(),
@@ -1290,7 +1290,8 @@ async fn test_bridge_in_utxo_spent() {
         committee_pubkeys: vec![committee_pubkey_bytes],
     };
     goat_mock.set_pegin_data(*instance_id.as_bytes(), pegin_data);
-    goat_mock.set_latest_block_number(20);
+    goat_mock.set_latest_block_number(211);
+    goat_mock.set_response_window_blocks(200);
 
     // Run window monitor to transition to CommitteesAnswered and generate btc_txid
     instance_window_expiration_monitor(&local_db, &goat_client).await.unwrap();
@@ -1757,7 +1758,8 @@ async fn test_bridge_in_committee_fail() {
     storage_processor.upsert_instance(&instance).await.unwrap();
 
     // Set Mock State
-    goat_mock.set_latest_block_number(200);
+    goat_mock.set_latest_block_number(301);
+    goat_mock.set_response_window_blocks(200);
     goat_mock.set_quorum_size(3);
 
     // Mock Pegin Data with only 1 answer (Insufficient)
@@ -2296,7 +2298,8 @@ mod bridge_in_committee_boundary_tests {
         // Set quorum size to 3, but only provide 2 committee members
         let quorum_size = 3u64;
         goat_mock.set_quorum_size(quorum_size);
-        goat_mock.set_latest_block_number(500);
+        goat_mock.set_latest_block_number(501);
+        goat_mock.set_response_window_blocks(200);
 
         // Create 2 committee members (one less than quorum)
         let committee_count = (quorum_size - 1) as usize;
@@ -2367,7 +2370,8 @@ mod bridge_in_committee_boundary_tests {
         // Set quorum size to 3 and provide exactly 3 committee members
         let quorum_size = 3u64;
         goat_mock.set_quorum_size(quorum_size);
-        goat_mock.set_latest_block_number(500);
+        goat_mock.set_latest_block_number(501);
+        goat_mock.set_response_window_blocks(200);
 
         let mut committee_addresses = Vec::new();
         let mut committee_pubkeys = Vec::new();

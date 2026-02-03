@@ -1,8 +1,8 @@
+use bitcoin::hashes::Hash;
 use bitvm2_noded::scheduled_tasks::instance_maintenance_tasks::{
     instance_answers_monitor, instance_btc_tx_monitor, instance_expiration_monitor,
     instance_window_expiration_monitor,
 };
-use bitcoin::hashes::Hash;
 use client::btc_chain::BTCClient;
 use client::goat_chain::GOATClient;
 use proptest::prelude::*;
@@ -10,10 +10,10 @@ use proptest::test_runner::{RngAlgorithm, TestRng, TestRunner};
 use serial_test::serial;
 use std::env;
 use std::str::FromStr;
-use store::{Instance, InstanceBridgeInStatus};
-use store::create_local_db;
 use store::MessageType;
+use store::create_local_db;
 use store::localdb::InstanceQuery;
+use store::{Instance, InstanceBridgeInStatus};
 use tempfile::NamedTempFile;
 use tokio::runtime::Runtime;
 use uuid::Uuid;
@@ -22,10 +22,7 @@ mod test_support;
 
 fn test_config() -> ProptestConfig {
     let mut config = ProptestConfig::default();
-    config.cases = env::var("PROPTEST_CASES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100);
+    config.cases = env::var("PROPTEST_CASES").ok().and_then(|s| s.parse().ok()).unwrap_or(100);
     config.failure_persistence = None;
     config
 }
@@ -64,7 +61,8 @@ fn prop_instance_expiration_boundary() {
             run_async(async move {
                 setup_env();
                 let temp_db = NamedTempFile::new().unwrap();
-                let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
+                let local_db =
+                    create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, btc_mock) = BTCClient::new_mock_client();
 
                 let instance_id = Uuid::new_v4();
@@ -113,7 +111,8 @@ fn prop_instance_btc_tx_monitor_confirmed_vs_unconfirmed() {
             run_async(async move {
                 setup_env();
                 let temp_db = NamedTempFile::new().unwrap();
-                let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
+                let local_db =
+                    create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, btc_mock) = BTCClient::new_mock_client();
 
                 let instance_id = Uuid::new_v4();
@@ -182,12 +181,14 @@ fn prop_instance_window_expiration_monitor_quorum() {
             run_async(async move {
                 setup_env();
                 let temp_db = NamedTempFile::new().unwrap();
-                let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
+                let local_db =
+                    create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (_btc_client, _btc_mock) = BTCClient::new_mock_client();
                 let (goat_client, goat_mock) = GOATClient::new_mock_client();
 
-                goat_mock.set_latest_block_number(200);
-                goat_mock.set_finalized_block_number(200);
+                goat_mock.set_latest_block_number(300);
+                goat_mock.set_finalized_block_number(300);
+                goat_mock.set_response_window_blocks(200);
                 goat_mock.set_quorum_size(if quorum_enough { 1 } else { 2 });
 
                 let instance_id = Uuid::new_v4();
@@ -226,9 +227,7 @@ fn prop_instance_window_expiration_monitor_quorum() {
                 };
                 goat_mock.set_pegin_data(*instance_id.as_bytes(), pegin_data);
 
-                instance_window_expiration_monitor(&local_db, &goat_client)
-                    .await
-                    .unwrap();
+                instance_window_expiration_monitor(&local_db, &goat_client).await.unwrap();
                 let updated = test_support::get_instance(&mut storage, &instance_id).await.unwrap();
                 if quorum_enough {
                     assert_eq!(
@@ -258,7 +257,8 @@ fn prop_instance_answers_monitor_branches() {
             run_async(async move {
                 setup_env();
                 let temp_db = NamedTempFile::new().unwrap();
-                let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
+                let local_db =
+                    create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, btc_mock) = BTCClient::new_mock_client();
                 let (goat_client, goat_mock) = GOATClient::new_mock_client();
 
@@ -295,8 +295,9 @@ fn prop_instance_answers_monitor_branches() {
                 )
                 .await;
 
+                goat_mock.set_response_window_blocks(200);
                 if outside_window {
-                    goat_mock.set_finalized_block_number(200);
+                    goat_mock.set_finalized_block_number(300);
                 } else {
                     goat_mock.set_finalized_block_number(10);
                 }
@@ -343,9 +344,7 @@ fn prop_instance_answers_monitor_branches() {
                     );
                 }
 
-                instance_answers_monitor(&local_db, &btc_client, &goat_client)
-                    .await
-                    .unwrap();
+                instance_answers_monitor(&local_db, &btc_client, &goat_client).await.unwrap();
 
                 let mut storage = local_db.acquire().await.unwrap();
                 let (instances, _) = storage
@@ -357,7 +356,10 @@ fn prop_instance_answers_monitor_branches() {
                     assert_eq!(instance.status, InstanceBridgeInStatus::UserDiscarded.to_string());
                 } else {
                     let msg = storage
-                        .find_message_by_business_id(&instance_id, &MessageType::PeginRequest.to_string())
+                        .find_message_by_business_id(
+                            &instance_id,
+                            &MessageType::PeginRequest.to_string(),
+                        )
                         .await
                         .unwrap();
                     assert!(msg.is_some());

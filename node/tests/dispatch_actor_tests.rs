@@ -1,3 +1,6 @@
+#[cfg(not(dispatch_test))]
+compile_error!("dispatch_actor_tests requires RUSTFLAGS=\"--cfg dispatch_test\"");
+
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, Network, OutPoint, PublicKey, Txid as BitcoinTxid};
 use bitvm2_lib::actors::Actor;
@@ -45,7 +48,6 @@ use secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
 use serial_test::serial;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use store::ipfs::IPFS;
 use store::{
     ByteArray32, Instance, InstanceBridgeInStatus, UInt64Array3, create_local_db, localdb::LocalDB,
 };
@@ -205,7 +207,6 @@ async fn dispatch_pegin_request_committee_once() {
 
     let mut swarm = build_swarm();
     let http_client = HttpAsyncClient::new(None);
-    let ipfs = IPFS::new(&env::get_ipfs_url());
     let from_peer_id = PeerId::random();
     let message_id = MessageId::new(b"pegin_committee_once");
     let mut ctx = HandlerContext {
@@ -214,7 +215,6 @@ async fn dispatch_pegin_request_committee_once() {
         btc_client: &btc_client,
         goat_client: &goat_client,
         http_client: &http_client,
-        ipfs: &ipfs,
         actor: Actor::Committee,
         from_peer_id,
         id: message_id,
@@ -561,7 +561,6 @@ fn prop_dispatch_pegin_request_committee_calls_gateway_answer() {
                 goat_mock.set_committee_member([0u8; 20], true);
                 let mut swarm = build_swarm();
                 let http_client = HttpAsyncClient::new(None);
-                let ipfs = IPFS::new(&env::get_ipfs_url());
                 let from_peer_id = PeerId::random();
                 let message_id = MessageId::new(b"pegin_committee");
                 let mut ctx = HandlerContext {
@@ -570,7 +569,6 @@ fn prop_dispatch_pegin_request_committee_calls_gateway_answer() {
                     btc_client: &btc_client,
                     goat_client: &goat_client,
                     http_client: &http_client,
-                    ipfs: &ipfs,
                     actor: Actor::Committee,
                     from_peer_id,
                     id: message_id,
@@ -626,7 +624,6 @@ fn prop_dispatch_pegin_request_non_committee_no_gateway_answer() {
                     .await;
                 let mut swarm = build_swarm();
                 let http_client = HttpAsyncClient::new(None);
-                let ipfs = IPFS::new(&env::get_ipfs_url());
                 let from_peer_id = PeerId::random();
                 let message_id = MessageId::new(b"pegin_non_committee");
                 let mut ctx = HandlerContext {
@@ -635,7 +632,6 @@ fn prop_dispatch_pegin_request_non_committee_no_gateway_answer() {
                     btc_client: &btc_client,
                     goat_client: &goat_client,
                     http_client: &http_client,
-                    ipfs: &ipfs,
                     actor: Actor::Operator,
                     from_peer_id,
                     id: message_id,
@@ -680,7 +676,6 @@ fn prop_dispatch_confirm_instance_operator_sends_create_graph() {
                 let (goat_client, _goat_mock) = GOATClient::new_mock_client();
                 let mut swarm = build_swarm();
                 let http_client = HttpAsyncClient::new(None);
-                let ipfs = IPFS::new(&env::get_ipfs_url());
                 let from_peer_id = PeerId::random();
                 let message_id = MessageId::new(b"confirm_instance_operator");
 
@@ -704,7 +699,6 @@ fn prop_dispatch_confirm_instance_operator_sends_create_graph() {
                     btc_client: &btc_client,
                     goat_client: &goat_client,
                     http_client: &http_client,
-                    ipfs: &ipfs,
                     actor: Actor::Operator,
                     from_peer_id,
                     id: message_id,
@@ -741,7 +735,6 @@ fn prop_dispatch_confirm_instance_non_operator_stores_parameters() {
                     .await;
                 let mut swarm = build_swarm();
                 let http_client = HttpAsyncClient::new(None);
-                let ipfs = IPFS::new(&env::get_ipfs_url());
                 let from_peer_id = PeerId::random();
                 let message_id = MessageId::new(b"confirm_instance_default");
                 let mut ctx = HandlerContext {
@@ -750,7 +743,6 @@ fn prop_dispatch_confirm_instance_non_operator_stores_parameters() {
                     btc_client: &btc_client,
                     goat_client: &goat_client,
                     http_client: &http_client,
-                    ipfs: &ipfs,
                     actor: Actor::Committee,
                     from_peer_id,
                     id: message_id,
@@ -767,6 +759,3 @@ fn prop_dispatch_confirm_instance_non_operator_stores_parameters() {
         })
         .unwrap();
 }
-
-#[cfg(not(dispatch_test))]
-compile_error!("dispatch_actor_tests requires RUSTFLAGS=\"--cfg dispatch_test\"");

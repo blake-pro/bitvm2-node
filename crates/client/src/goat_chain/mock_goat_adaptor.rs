@@ -40,6 +40,7 @@ pub struct MockAdaptor {
     gateway_answer_pegin_request_calls: Arc<AtomicUsize>,
     committee_pubkeys: Arc<Mutex<Vec<Vec<u8>>>>,
     committee_members: Arc<Mutex<HashSet<[u8; 20]>>>,
+    response_window_blocks: Arc<Mutex<u64>>,
 }
 
 impl MockAdaptor {
@@ -106,6 +107,12 @@ impl MockAdaptor {
             } else {
                 h.remove(&member);
             }
+        }
+    }
+
+    pub fn set_response_window_blocks(&self, blocks: u64) {
+        if let Ok(mut h) = self.response_window_blocks.lock() {
+            *h = blocks;
         }
     }
 }
@@ -234,7 +241,7 @@ impl ChainAdaptor for MockAdaptor {
     }
 
     async fn gateway_get_response_window_blocks(&self) -> anyhow::Result<u64> {
-        Ok(1000)
+        Ok(if let Ok(h) = self.response_window_blocks.lock() { *h } else { 1000 })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -542,6 +549,7 @@ impl MockAdaptor {
             gateway_answer_pegin_request_calls: Arc::new(AtomicUsize::new(0)),
             committee_pubkeys: Arc::new(Mutex::new(Vec::new())),
             committee_members: Arc::new(Mutex::new(HashSet::new())),
+            response_window_blocks: Arc::new(Mutex::new(1000)),
         }
     }
 }
