@@ -2,13 +2,13 @@
 
 use alloy::primitives::{Address, B256, U256, keccak256};
 use alloy::sol_types::SolValue;
-use axum::{Json, Router, routing::post};
+use axum::{Json, Router, extract::State, routing::post};
 use regex::Regex;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use bitvm2_noded::utils::evm_swap_utils::IEscrowManager::EscrowData;
 use store::localdb::StorageProcessor;
-use store::{GoatTxRecord, Graph, Instance, Message, BridgeOutGlobalStats};
+use store::{BridgeOutGlobalStats, GoatTxRecord, Graph, Instance, Message};
 use uuid::Uuid;
 
 /// Well-known test instance and graph IDs used in mock responses
@@ -57,31 +57,38 @@ pub struct GraphMockState {
     pub post_graph_datas: Option<serde_json::Value>,
 }
 
-static GRAPH_MOCK_STATE: OnceLock<Mutex<GraphMockState>> = OnceLock::new();
+pub type SharedGraphMockState = Arc<Mutex<GraphMockState>>;
 
-fn graph_state() -> &'static Mutex<GraphMockState> {
-    GRAPH_MOCK_STATE.get_or_init(|| Mutex::new(GraphMockState::default()))
+#[derive(Clone)]
+pub struct GraphMockAppState {
+    pub state: SharedGraphMockState,
 }
 
-pub fn set_graph_mock_state(state: GraphMockState) {
-    if let Ok(mut guard) = graph_state().lock() {
+pub fn new_graph_mock_state() -> SharedGraphMockState {
+    Arc::new(Mutex::new(GraphMockState::default()))
+}
+
+pub fn set_graph_mock_state(shared: &SharedGraphMockState, state: GraphMockState) {
+    if let Ok(mut guard) = shared.lock() {
         *guard = state;
     }
 }
 
-pub fn clear_graph_mock_state() {
-    set_graph_mock_state(GraphMockState::default());
+pub fn clear_graph_mock_state(shared: &SharedGraphMockState) {
+    set_graph_mock_state(shared, GraphMockState::default());
 }
 
-fn snapshot_graph_state() -> GraphMockState {
-    graph_state().lock().map(|v| v.clone()).unwrap_or_default()
+fn snapshot_graph_state(shared: &SharedGraphMockState) -> GraphMockState {
+    shared.lock().map(|v| v.clone()).unwrap_or_default()
 }
 
-pub async fn mock_graph_handler(Json(payload): Json<serde_json::Value>) -> Json<serde_json::Value> {
+fn build_graph_mock_response(
+    payload: serde_json::Value,
+    state: GraphMockState,
+) -> Json<serde_json::Value> {
     let query = payload.get("query").and_then(|v| v.as_str()).unwrap_or("");
     let mut data = serde_json::Map::new();
 
-    let state = snapshot_graph_state();
     let instance_id_hex = test_fixtures::instance_id_hex();
     let graph_id_hex = test_fixtures::graph_id_hex();
 
@@ -207,9 +214,7 @@ pub async fn mock_graph_handler(Json(payload): Json<serde_json::Value>) -> Json<
     }
 
     if matches_query("committeeResponses") {
-        let value = state
-            .committee_responses
-            .unwrap_or_else(|| serde_json::json!([]));
+        let value = state.committee_responses.unwrap_or_else(|| serde_json::json!([]));
         data.insert("committeeResponses".to_string(), value);
     }
 
@@ -229,16 +234,12 @@ pub async fn mock_graph_handler(Json(payload): Json<serde_json::Value>) -> Json<
     }
 
     if matches_query("withdrawHappyPaths") {
-        let value = state
-            .withdraw_happy_paths
-            .unwrap_or_else(|| serde_json::json!([]));
+        let value = state.withdraw_happy_paths.unwrap_or_else(|| serde_json::json!([]));
         data.insert("withdrawHappyPaths".to_string(), value);
     }
 
     if matches_query("withdrawUnhappyPaths") {
-        let value = state
-            .withdraw_unhappy_paths
-            .unwrap_or_else(|| serde_json::json!([]));
+        let value = state.withdraw_unhappy_paths.unwrap_or_else(|| serde_json::json!([]));
         data.insert("withdrawUnhappyPaths".to_string(), value);
     }
 
@@ -277,6 +278,17 @@ pub async fn mock_graph_handler(Json(payload): Json<serde_json::Value>) -> Json<
     }))
 }
 
+pub async fn mock_graph_handler(Json(payload): Json<serde_json::Value>) -> Json<serde_json::Value> {
+    build_graph_mock_response(payload, GraphMockState::default())
+}
+
+pub async fn mock_graph_handler_with_state(
+    State(app_state): State<GraphMockAppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    build_graph_mock_response(payload, snapshot_graph_state(&app_state.state))
+}
+
 pub async fn start_mock_graph_server() -> String {
     let graph_router = Router::new().route("/", post(mock_graph_handler));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -287,13 +299,27 @@ pub async fn start_mock_graph_server() -> String {
     graph_url
 }
 
+pub async fn start_mock_graph_server_with_state(state: SharedGraphMockState) -> String {
+    let graph_router = Router::new()
+        .route("/", post(mock_graph_handler_with_state))
+        .with_state(GraphMockAppState { state });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let graph_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, graph_router).await.unwrap();
+    });
+
+    graph_url
+}
+
 pub fn valid_btc_address() -> String {
     let compressed = bitcoin::CompressedPublicKey::from_slice(&[
-        0x02, 0x50, 0x86, 0x3a, 0xd6, 0x4a, 0x87, 0xae, 0x8a, 0x2f, 0xe8, 0x3c, 0x1a, 0xf1,
-        0xa8, 0x40, 0x3c, 0xb5, 0x3f, 0x53, 0xe4, 0x86, 0xd8, 0x51, 0x1d, 0xad, 0x8a, 0x04,
-        0x88, 0x7e, 0x5b, 0x23, 0x52,
+        0x02, 0x50, 0x86, 0x3a, 0xd6, 0x4a, 0x87, 0xae, 0x8a, 0x2f, 0xe8, 0x3c, 0x1a, 0xf1, 0xa8,
+        0x40, 0x3c, 0xb5, 0x3f, 0x53, 0xe4, 0x86, 0xd8, 0x51, 0x1d, 0xad, 0x8a, 0x04, 0x88, 0x7e,
+        0x5b, 0x23, 0x52,
     ])
     .unwrap();
+
     bitcoin::Address::p2wpkh(&compressed, bitvm2_noded::env::get_network()).to_string()
 }
 
@@ -313,11 +339,17 @@ pub async fn insert_message(storage: &mut StorageProcessor<'_>, message: &Messag
     storage.upsert_message(message.clone()).await.unwrap();
 }
 
-pub async fn upsert_bridge_out_stats(storage: &mut StorageProcessor<'_>, stats: &BridgeOutGlobalStats) {
+pub async fn upsert_bridge_out_stats(
+    storage: &mut StorageProcessor<'_>,
+    stats: &BridgeOutGlobalStats,
+) {
     storage.upsert_bridge_out_global_stats(stats).await.unwrap();
 }
 
-pub async fn get_instance(storage: &mut StorageProcessor<'_>, instance_id: &Uuid) -> Option<Instance> {
+pub async fn get_instance(
+    storage: &mut StorageProcessor<'_>,
+    instance_id: &Uuid,
+) -> Option<Instance> {
     storage.find_instance(instance_id).await.unwrap()
 }
 
@@ -335,11 +367,8 @@ pub async fn get_goat_tx(
 }
 
 pub async fn get_bridge_out_stats(storage: &mut StorageProcessor<'_>) -> BridgeOutGlobalStats {
-    storage
-        .find_bridge_out_global_stats_by_id(1)
-        .await
-        .unwrap()
-        .unwrap_or_else(|| BridgeOutGlobalStats {
+    storage.find_bridge_out_global_stats_by_id(1).await.unwrap().unwrap_or_else(|| {
+        BridgeOutGlobalStats {
             id: 1,
             initial_txn: 0,
             initial_amount: "0".to_string(),
@@ -349,5 +378,6 @@ pub async fn get_bridge_out_stats(storage: &mut StorageProcessor<'_>) -> BridgeO
             refund_amount: "0".to_string(),
             created_at: 0,
             updated_at: 0,
-        })
+        }
+    })
 }

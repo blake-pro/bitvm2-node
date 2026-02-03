@@ -23,7 +23,10 @@ use tempfile::NamedTempFile;
 use tokio::runtime::Runtime;
 
 mod test_support;
-use test_support::{GraphMockState, set_graph_mock_state, clear_graph_mock_state};
+use test_support::{
+    GraphMockState, clear_graph_mock_state, new_graph_mock_state, set_graph_mock_state,
+    start_mock_graph_server_with_state,
+};
 
 fn test_config() -> ProptestConfig {
     let mut config = ProptestConfig::default();
@@ -193,7 +196,8 @@ fn prop_swap_initialize_claim_refund() {
         .run(&strat, |(do_claim, do_refund)| {
             run_async(async move {
                 setup_env();
-                clear_graph_mock_state();
+                let graph_state = new_graph_mock_state();
+                clear_graph_mock_state(&graph_state);
                 let temp_db = NamedTempFile::new().unwrap();
                 let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, _btc_mock) = BTCClient::new_mock_client();
@@ -226,14 +230,14 @@ fn prop_swap_initialize_claim_refund() {
                 let claims = if do_claim { vec![build_claim_event(&escrow_hash_hex)] } else { vec![] };
                 let refunds = if do_refund { vec![build_refund_event(&escrow_hash_hex)] } else { vec![] };
 
-                set_graph_mock_state(GraphMockState {
+                set_graph_mock_state(&graph_state, GraphMockState {
                     initializes: Some(serde_json::to_value(initializes).unwrap()),
                     claims: Some(serde_json::to_value(claims).unwrap()),
                     refunds: Some(serde_json::to_value(refunds).unwrap()),
                     ..Default::default()
                 });
 
-                let graph_url = test_support::start_mock_graph_server().await;
+                let graph_url = start_mock_graph_server_with_state(graph_state.clone()).await;
                 let config_init = WatchEventConfig::Swap(TheGraphConfig {
                     address: swap_contract,
                     the_graph_url: graph_url.clone(),

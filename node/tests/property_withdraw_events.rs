@@ -21,7 +21,10 @@ use tokio::runtime::Runtime;
 use uuid::Uuid;
 
 mod test_support;
-use test_support::{GraphMockState, set_graph_mock_state, clear_graph_mock_state};
+use test_support::{
+    GraphMockState, clear_graph_mock_state, new_graph_mock_state, set_graph_mock_state,
+    start_mock_graph_server_with_state,
+};
 
 fn test_config() -> ProptestConfig {
     let mut config = ProptestConfig::default();
@@ -136,7 +139,8 @@ fn prop_withdraw_init_or_cancel_updates_graph() {
         .run(&strat, |is_cancel| {
             run_async(async move {
                 setup_env();
-                clear_graph_mock_state();
+                let graph_state = new_graph_mock_state();
+                clear_graph_mock_state(&graph_state);
                 let temp_db = NamedTempFile::new().unwrap();
                 let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, _btc_mock) = BTCClient::new_mock_client();
@@ -172,7 +176,9 @@ fn prop_withdraw_init_or_cancel_updates_graph() {
                 } else {
                     serde_json::json!([])
                 };
-                set_graph_mock_state(GraphMockState {
+                set_graph_mock_state(
+                    &graph_state,
+                    GraphMockState {
                     init_withdraws: Some(init_events),
                     cancel_withdraws: Some(cancel_events),
                     proceed_withdraws: Some(serde_json::json!([])),
@@ -180,9 +186,10 @@ fn prop_withdraw_init_or_cancel_updates_graph() {
                     withdraw_unhappy_paths: Some(serde_json::json!([])),
                     withdraw_disproveds: Some(serde_json::json!([])),
                     ..Default::default()
-                });
+                },
+                );
 
-                let graph_url = test_support::start_mock_graph_server().await;
+                let graph_url = start_mock_graph_server_with_state(graph_state.clone()).await;
                 let config = gateway_config(
                     &graph_url,
                     vec![GatewayEventEntity::InitWithdraws, GatewayEventEntity::CancelWithdraws],
@@ -250,7 +257,8 @@ fn prop_withdraw_proceed_updates_graph_and_tx() {
         .run(&strat, |_| {
             run_async(async move {
                 setup_env();
-                clear_graph_mock_state();
+                let graph_state = new_graph_mock_state();
+                clear_graph_mock_state(&graph_state);
                 let temp_db = NamedTempFile::new().unwrap();
                 let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, _btc_mock) = BTCClient::new_mock_client();
@@ -275,7 +283,9 @@ fn prop_withdraw_proceed_updates_graph_and_tx() {
                 };
                 test_support::insert_goat_tx(&mut storage, &init_tx).await;
 
-                set_graph_mock_state(GraphMockState {
+                set_graph_mock_state(
+                    &graph_state,
+                    GraphMockState {
                     proceed_withdraws: Some(serde_json::json!([{
                         "id": "proceed_1",
                         "transactionHash": "0xproceed",
@@ -290,9 +300,10 @@ fn prop_withdraw_proceed_updates_graph_and_tx() {
                     withdraw_unhappy_paths: Some(serde_json::json!([])),
                     withdraw_disproveds: Some(serde_json::json!([])),
                     ..Default::default()
-                });
+                },
+                );
 
-                let graph_url = test_support::start_mock_graph_server().await;
+                let graph_url = start_mock_graph_server_with_state(graph_state.clone()).await;
                 let config = gateway_config(
                     &graph_url,
                     vec![GatewayEventEntity::ProceedWithdraws],
@@ -355,7 +366,8 @@ fn prop_withdraw_proceed_skipped_with_proof_server() {
             run_async(async move {
                 setup_env();
                 set_proof_server_url(Some("http://proof.local"));
-                clear_graph_mock_state();
+                let graph_state = new_graph_mock_state();
+                clear_graph_mock_state(&graph_state);
                 let temp_db = NamedTempFile::new().unwrap();
                 let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, _btc_mock) = BTCClient::new_mock_client();
@@ -380,7 +392,9 @@ fn prop_withdraw_proceed_skipped_with_proof_server() {
                 };
                 test_support::insert_goat_tx(&mut storage, &init_tx).await;
 
-                set_graph_mock_state(GraphMockState {
+                set_graph_mock_state(
+                    &graph_state,
+                    GraphMockState {
                     proceed_withdraws: Some(serde_json::json!([{
                         "id": "proceed_1",
                         "transactionHash": "0xproceed",
@@ -395,9 +409,10 @@ fn prop_withdraw_proceed_skipped_with_proof_server() {
                     withdraw_unhappy_paths: Some(serde_json::json!([])),
                     withdraw_disproveds: Some(serde_json::json!([])),
                     ..Default::default()
-                });
+                },
+                );
 
-                let graph_url = test_support::start_mock_graph_server().await;
+                let graph_url = start_mock_graph_server_with_state(graph_state.clone()).await;
                 let config = gateway_config(&graph_url, vec![GatewayEventEntity::ProceedWithdraws]);
                 let client = GraphQueryClient::new();
 
@@ -454,7 +469,8 @@ fn prop_withdraw_paths_update_graph_reward_and_messages() {
         .run(&strat, |is_happy| {
             run_async(async move {
                 setup_env();
-                clear_graph_mock_state();
+                let graph_state = new_graph_mock_state();
+                clear_graph_mock_state(&graph_state);
                 let temp_db = NamedTempFile::new().unwrap();
                 let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, _btc_mock) = BTCClient::new_mock_client();
@@ -499,7 +515,9 @@ fn prop_withdraw_paths_update_graph_reward_and_messages() {
                         "rewardAmountSats": reward
                     }])
                 };
-                set_graph_mock_state(GraphMockState {
+                set_graph_mock_state(
+                    &graph_state,
+                    GraphMockState {
                     withdraw_happy_paths: Some(happy_events),
                     withdraw_unhappy_paths: Some(unhappy_events),
                     withdraw_disproveds: Some(serde_json::json!([])),
@@ -507,9 +525,10 @@ fn prop_withdraw_paths_update_graph_reward_and_messages() {
                     cancel_withdraws: Some(serde_json::json!([])),
                     proceed_withdraws: Some(serde_json::json!([])),
                     ..Default::default()
-                });
+                },
+                );
 
-                let graph_url = test_support::start_mock_graph_server().await;
+                let graph_url = start_mock_graph_server_with_state(graph_state.clone()).await;
                 let config = gateway_config(
                     &graph_url,
                     if is_happy {
@@ -565,7 +584,8 @@ fn prop_withdraw_disproved_updates_graph_reward_and_messages() {
         .run(&strat, |_| {
             run_async(async move {
                 setup_env();
-                clear_graph_mock_state();
+                let graph_state = new_graph_mock_state();
+                clear_graph_mock_state(&graph_state);
                 let temp_db = NamedTempFile::new().unwrap();
                 let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, _btc_mock) = BTCClient::new_mock_client();
@@ -584,7 +604,9 @@ fn prop_withdraw_disproved_updates_graph_reward_and_messages() {
                 let message = build_message("msg_2", graph_id);
                 test_support::insert_message(&mut storage, &message).await;
 
-                set_graph_mock_state(GraphMockState {
+                set_graph_mock_state(
+                    &graph_state,
+                    GraphMockState {
                     withdraw_disproveds: Some(serde_json::json!([{
                         "id": "disprove_1",
                         "transactionHash": "0xdisprove",
@@ -607,9 +629,10 @@ fn prop_withdraw_disproved_updates_graph_reward_and_messages() {
                     withdraw_happy_paths: Some(serde_json::json!([])),
                     withdraw_unhappy_paths: Some(serde_json::json!([])),
                     ..Default::default()
-                });
+                },
+                );
 
-                let graph_url = test_support::start_mock_graph_server().await;
+                let graph_url = start_mock_graph_server_with_state(graph_state.clone()).await;
                 let config = gateway_config(
                     &graph_url,
                     vec![GatewayEventEntity::WithdrawDisproveds],
@@ -664,7 +687,8 @@ fn prop_withdraw_invalid_address_skips_updates() {
         .run(&strat, |is_happy| {
             run_async(async move {
                 setup_env();
-                clear_graph_mock_state();
+                let graph_state = new_graph_mock_state();
+                clear_graph_mock_state(&graph_state);
                 let temp_db = NamedTempFile::new().unwrap();
                 let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, _btc_mock) = BTCClient::new_mock_client();
@@ -710,7 +734,9 @@ fn prop_withdraw_invalid_address_skips_updates() {
                         "disproverRewardAmount": "700"
                     }])
                 };
-                set_graph_mock_state(GraphMockState {
+                set_graph_mock_state(
+                    &graph_state,
+                    GraphMockState {
                     withdraw_happy_paths: Some(if is_happy { events.clone() } else { serde_json::json!([]) }),
                     withdraw_unhappy_paths: Some(serde_json::json!([])),
                     withdraw_disproveds: Some(if is_happy { serde_json::json!([]) } else { events }),
@@ -718,9 +744,10 @@ fn prop_withdraw_invalid_address_skips_updates() {
                     cancel_withdraws: Some(serde_json::json!([])),
                     proceed_withdraws: Some(serde_json::json!([])),
                     ..Default::default()
-                });
+                },
+                );
 
-                let graph_url = test_support::start_mock_graph_server().await;
+                let graph_url = start_mock_graph_server_with_state(graph_state.clone()).await;
                 let config = gateway_config(
                     &graph_url,
                     if is_happy {
@@ -771,7 +798,8 @@ fn prop_withdraw_init_cancel_out_of_order() {
         .run(&strat, |_| {
             run_async(async move {
                 setup_env();
-                clear_graph_mock_state();
+                let graph_state = new_graph_mock_state();
+                clear_graph_mock_state(&graph_state);
                 let temp_db = NamedTempFile::new().unwrap();
                 let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, _btc_mock) = BTCClient::new_mock_client();
@@ -786,7 +814,9 @@ fn prop_withdraw_init_cancel_out_of_order() {
                 let instance_id_hex = test_support::test_fixtures::instance_id_hex();
                 let graph_id_hex = test_support::test_fixtures::graph_id_hex();
 
-                set_graph_mock_state(GraphMockState {
+                set_graph_mock_state(
+                    &graph_state,
+                    GraphMockState {
                     init_withdraws: Some(serde_json::json!([{
                         "id": "init_1",
                         "transactionHash": "0xinit",
@@ -806,9 +836,10 @@ fn prop_withdraw_init_cancel_out_of_order() {
                     withdraw_unhappy_paths: Some(serde_json::json!([])),
                     withdraw_disproveds: Some(serde_json::json!([])),
                     ..Default::default()
-                });
+                },
+                );
 
-                let graph_url = test_support::start_mock_graph_server().await;
+                let graph_url = start_mock_graph_server_with_state(graph_state.clone()).await;
                 let config = gateway_config(
                     &graph_url,
                     vec![GatewayEventEntity::InitWithdraws, GatewayEventEntity::CancelWithdraws],

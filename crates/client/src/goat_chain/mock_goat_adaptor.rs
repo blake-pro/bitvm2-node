@@ -7,8 +7,11 @@ use alloy::rpc::types::{
 };
 use anyhow::bail;
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 use tracing::info;
 use uuid::Uuid;
 
@@ -34,6 +37,9 @@ pub struct MockAdaptor {
     pegin_data_store: Arc<Mutex<HashMap<[u8; 16], PeginData>>>,
     traces: Arc<Mutex<HashMap<String, GethTrace>>>,
     quorum_size: Arc<Mutex<u64>>,
+    gateway_answer_pegin_request_calls: Arc<AtomicUsize>,
+    committee_pubkeys: Arc<Mutex<Vec<Vec<u8>>>>,
+    committee_members: Arc<Mutex<HashSet<[u8; 20]>>>,
 }
 
 impl MockAdaptor {
@@ -76,6 +82,30 @@ impl MockAdaptor {
     pub fn set_quorum_size(&self, size: u64) {
         if let Ok(mut h) = self.quorum_size.lock() {
             *h = size;
+        }
+    }
+
+    pub fn set_committee_pubkeys(&self, pubkeys: Vec<Vec<u8>>) {
+        if let Ok(mut h) = self.committee_pubkeys.lock() {
+            *h = pubkeys;
+        }
+    }
+
+    pub fn get_gateway_answer_pegin_request_calls(&self) -> usize {
+        self.gateway_answer_pegin_request_calls.load(Ordering::SeqCst)
+    }
+
+    pub fn reset_gateway_answer_pegin_request_calls(&self) {
+        self.gateway_answer_pegin_request_calls.store(0, Ordering::SeqCst);
+    }
+
+    pub fn set_committee_member(&self, member: [u8; 20], is_member: bool) {
+        if let Ok(mut h) = self.committee_members.lock() {
+            if is_member {
+                h.insert(member);
+            } else {
+                h.remove(&member);
+            }
         }
     }
 }
@@ -204,7 +234,7 @@ impl ChainAdaptor for MockAdaptor {
     }
 
     async fn gateway_get_response_window_blocks(&self) -> anyhow::Result<u64> {
-        Ok(0)
+        Ok(1000)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -227,6 +257,7 @@ impl ChainAdaptor for MockAdaptor {
         _instance_id: &[u8; 16],
         _committee_pubkey: &[u8],
     ) -> anyhow::Result<String> {
+        self.gateway_answer_pegin_request_calls.fetch_add(1, Ordering::SeqCst);
         Ok(TxHash::default().to_string())
     }
 
@@ -328,7 +359,7 @@ impl ChainAdaptor for MockAdaptor {
         &self,
         _instance_id: &[u8; 16],
     ) -> anyhow::Result<Vec<Vec<u8>>> {
-        Ok(vec![])
+        Ok(self.committee_pubkeys.lock().map(|v| v.clone()).unwrap_or_default())
     }
 
     async fn gateway_get_post_graph_digest(
@@ -434,8 +465,8 @@ impl ChainAdaptor for MockAdaptor {
         Ok("".to_string())
     }
 
-    async fn committee_mana_is_committee_member(&self, _member: &[u8; 20]) -> anyhow::Result<bool> {
-        Ok(false)
+    async fn committee_mana_is_committee_member(&self, member: &[u8; 20]) -> anyhow::Result<bool> {
+        Ok(if let Ok(h) = self.committee_members.lock() { h.contains(member) } else { false })
     }
 
     async fn committee_mana_committee_size(&self) -> anyhow::Result<u64> {
@@ -508,6 +539,9 @@ impl MockAdaptor {
             pegin_data_store: Arc::new(Mutex::new(HashMap::new())),
             traces: Arc::new(Mutex::new(HashMap::new())),
             quorum_size: Arc::new(Mutex::new(0)),
+            gateway_answer_pegin_request_calls: Arc::new(AtomicUsize::new(0)),
+            committee_pubkeys: Arc::new(Mutex::new(Vec::new())),
+            committee_members: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 }

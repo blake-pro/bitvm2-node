@@ -19,8 +19,12 @@ use client::{btc_chain::BTCClient, goat_chain::GOATClient};
 use libp2p::gossipsub::MessageId;
 use libp2p::{PeerId, Swarm, gossipsub};
 use musig2::{PartialSignature, PubNonce};
+#[cfg(any(test, dispatch_test))]
+use once_cell::sync::Lazy;
 use secp256k1::schnorr::Signature as SchnorrSignature;
 use serde::{Deserialize, Serialize};
+#[cfg(any(test, dispatch_test))]
+use std::sync::{Arc, Mutex};
 use store::MessageState;
 use store::localdb::LocalDB;
 use tracing::warn;
@@ -454,6 +458,7 @@ pub async fn try_finalize_graph(
     Ok(())
 }
 
+#[cfg(not(any(test, dispatch_test)))]
 pub async fn send_to_peer(
     swarm: &mut Swarm<AllBehaviours>,
     message: GOATMessage,
@@ -465,6 +470,30 @@ pub async fn send_to_peer(
         .behaviour_mut()
         .gossipsub
         .publish(gossipsub_topic, message.serialize_message().await?)?)
+}
+
+#[cfg(any(test, dispatch_test))]
+static TEST_SEND_HOOK: Lazy<
+    Mutex<Option<Arc<dyn Fn(GOATMessage) -> Result<MessageId> + Send + Sync>>>,
+> = Lazy::new(|| Mutex::new(None));
+
+#[cfg(any(test, dispatch_test))]
+pub fn set_test_send_hook(
+    hook: Option<Arc<dyn Fn(GOATMessage) -> Result<MessageId> + Send + Sync>>,
+) {
+    let mut guard = TEST_SEND_HOOK.lock().expect("TEST_SEND_HOOK poisoned");
+    *guard = hook;
+}
+
+#[cfg(any(test, dispatch_test))]
+pub async fn send_to_peer(
+    _swarm: &mut Swarm<AllBehaviours>,
+    message: GOATMessage,
+) -> Result<MessageId> {
+    if let Some(hook) = TEST_SEND_HOOK.lock().expect("TEST_SEND_HOOK poisoned").as_ref() {
+        return hook(message);
+    }
+    Ok(GOATMessage::default_message_id())
 }
 
 pub async fn push_local_unhandled_messages(

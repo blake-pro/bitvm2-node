@@ -20,7 +20,10 @@ use tokio::runtime::Runtime;
 use uuid::Uuid;
 
 mod test_support;
-use test_support::{GraphMockState, set_graph_mock_state, clear_graph_mock_state};
+use test_support::{
+    GraphMockState, clear_graph_mock_state, new_graph_mock_state, set_graph_mock_state,
+    start_mock_graph_server_with_state,
+};
 
 fn test_config() -> ProptestConfig {
     let mut config = ProptestConfig::default();
@@ -138,7 +141,8 @@ fn prop_bridge_in_request_creates_goat_tx() {
         .run(&strat, |empty_flag| {
             run_async(async move {
                 setup_env();
-                clear_graph_mock_state();
+                let graph_state = new_graph_mock_state();
+                clear_graph_mock_state(&graph_state);
                 let temp_db = NamedTempFile::new().unwrap();
                 let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, _btc_mock) = BTCClient::new_mock_client();
@@ -162,7 +166,7 @@ fn prop_bridge_in_request_creates_goat_tx() {
                         "userRefundAddress": test_support::valid_btc_address(),
                     })]
                 };
-                set_graph_mock_state(GraphMockState {
+                set_graph_mock_state(&graph_state, GraphMockState {
                     bridge_in_requests: Some(serde_json::Value::Array(events)),
                     bridge_ins: Some(serde_json::json!([])),
                     committee_responses: Some(serde_json::json!([])),
@@ -170,7 +174,7 @@ fn prop_bridge_in_request_creates_goat_tx() {
                     ..Default::default()
                 });
 
-                let graph_url = test_support::start_mock_graph_server().await;
+                let graph_url = start_mock_graph_server_with_state(graph_state.clone()).await;
                 let config = gateway_config(&graph_url);
                 let client = GraphQueryClient::new();
 
@@ -223,7 +227,8 @@ fn prop_committee_response_updates_instance() {
         .run(&strat, |committee_count| {
             run_async(async move {
                 setup_env();
-                clear_graph_mock_state();
+                let graph_state = new_graph_mock_state();
+                clear_graph_mock_state(&graph_state);
                 let temp_db = NamedTempFile::new().unwrap();
                 let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, _btc_mock) = BTCClient::new_mock_client();
@@ -253,7 +258,7 @@ fn prop_committee_response_updates_instance() {
                         committee_pubkey: hex::encode([2u8; 33]),
                     });
                 }
-                set_graph_mock_state(GraphMockState {
+                set_graph_mock_state(&graph_state, GraphMockState {
                     committee_responses: Some(serde_json::to_value(responses).unwrap()),
                     bridge_in_requests: Some(serde_json::json!([])),
                     bridge_ins: Some(serde_json::json!([])),
@@ -261,7 +266,7 @@ fn prop_committee_response_updates_instance() {
                     ..Default::default()
                 });
 
-                let graph_url = test_support::start_mock_graph_server().await;
+                let graph_url = start_mock_graph_server_with_state(graph_state.clone()).await;
                 let config = gateway_config(&graph_url);
                 let client = GraphQueryClient::new();
                 event_watch_task::fetch_and_handle_block_range_events(
@@ -295,7 +300,8 @@ fn prop_post_graph_data_updates_status() {
         .run(&strat, |has_graph| {
             run_async(async move {
                 setup_env();
-                clear_graph_mock_state();
+                let graph_state = new_graph_mock_state();
+                clear_graph_mock_state(&graph_state);
                 let temp_db = NamedTempFile::new().unwrap();
                 let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, _btc_mock) = BTCClient::new_mock_client();
@@ -314,7 +320,7 @@ fn prop_post_graph_data_updates_status() {
                     test_support::insert_graph(&mut storage, &graph).await;
                 }
 
-                set_graph_mock_state(GraphMockState {
+                set_graph_mock_state(&graph_state, GraphMockState {
                     post_graph_datas: Some(serde_json::json!([{
                         "id": "post_1",
                         "transactionHash": "0xpost",
@@ -329,7 +335,7 @@ fn prop_post_graph_data_updates_status() {
                     ..Default::default()
                 });
 
-                let graph_url = test_support::start_mock_graph_server().await;
+                let graph_url = start_mock_graph_server_with_state(graph_state.clone()).await;
                 let config = gateway_config(&graph_url);
                 let client = GraphQueryClient::new();
 
@@ -369,7 +375,8 @@ fn prop_bridge_in_history_creates_instance() {
         .run(&strat, |_| {
             run_async(async move {
                 setup_env();
-                clear_graph_mock_state();
+                let graph_state = new_graph_mock_state();
+                clear_graph_mock_state(&graph_state);
                 let temp_db = NamedTempFile::new().unwrap();
                 let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, btc_mock) = BTCClient::new_mock_client();
@@ -411,7 +418,7 @@ fn prop_bridge_in_history_creates_instance() {
                 )
                 .await;
 
-                set_graph_mock_state(GraphMockState {
+                set_graph_mock_state(&graph_state, GraphMockState {
                     bridge_ins: Some(serde_json::json!([{
                         "id": "bridge_in_1",
                         "transactionHash": "0xbridge_in_tx",
@@ -427,7 +434,7 @@ fn prop_bridge_in_history_creates_instance() {
                     ..Default::default()
                 });
 
-                let graph_url = test_support::start_mock_graph_server().await;
+                let graph_url = start_mock_graph_server_with_state(graph_state.clone()).await;
                 let config = gateway_config(&graph_url);
                 let client = GraphQueryClient::new();
 
@@ -478,7 +485,8 @@ fn prop_bridge_in_updates_existing_instance() {
         .run(&strat, |_| {
             run_async(async move {
                 setup_env();
-                clear_graph_mock_state();
+                let graph_state = new_graph_mock_state();
+                clear_graph_mock_state(&graph_state);
                 let temp_db = NamedTempFile::new().unwrap();
                 let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, _btc_mock) = BTCClient::new_mock_client();
@@ -499,7 +507,7 @@ fn prop_bridge_in_updates_existing_instance() {
                 )
                 .await;
 
-                set_graph_mock_state(GraphMockState {
+                set_graph_mock_state(&graph_state, GraphMockState {
                     bridge_ins: Some(serde_json::json!([{
                         "id": "bridge_in_1",
                         "transactionHash": "0xbridge_in_tx",
@@ -515,7 +523,7 @@ fn prop_bridge_in_updates_existing_instance() {
                     ..Default::default()
                 });
 
-                let graph_url = test_support::start_mock_graph_server().await;
+                let graph_url = start_mock_graph_server_with_state(graph_state.clone()).await;
                 let config = gateway_config(&graph_url);
                 let client = GraphQueryClient::new();
 

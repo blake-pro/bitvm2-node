@@ -1,7 +1,6 @@
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::rpc::types::trace::geth::{CallFrame, GethTrace};
 use alloy::sol_types::{SolCall, SolValue};
-use axum::{Router, routing::post};
 use bitvm2_lib::actors::Actor;
 use bitvm2_noded::scheduled_tasks::event_watch_task;
 use bitvm2_noded::utils::evm_swap_utils::IEscrowManager;
@@ -24,7 +23,10 @@ use tempfile::NamedTempFile;
 use tokio::runtime::Runtime;
 
 mod test_support;
-use test_support::{GraphMockState, clear_graph_mock_state, set_graph_mock_state};
+use test_support::{
+    GraphMockState, clear_graph_mock_state, new_graph_mock_state, set_graph_mock_state,
+    start_mock_graph_server_with_state,
+};
 
 fn test_config() -> ProptestConfig {
     let mut config = ProptestConfig::default();
@@ -262,7 +264,8 @@ fn property_bridge_out_stats_conservation() {
         .run(&strat, |(claim_count, refund_count)| {
             run_async(async move {
                 setup_env();
-                clear_graph_mock_state();
+                let graph_state = new_graph_mock_state();
+                clear_graph_mock_state(&graph_state);
                 let temp_db = NamedTempFile::new().unwrap();
                 let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, _btc_mock, goat_client, goat_mock) = setup_clients();
@@ -298,7 +301,7 @@ fn property_bridge_out_stats_conservation() {
                     refunds.push(build_swap_refund_event(&escrow_hash_hex));
                 }
 
-                set_graph_mock_state(GraphMockState {
+                set_graph_mock_state(&graph_state, GraphMockState {
                     initializes: Some(serde_json::to_value(initializes).unwrap()),
                     claims: Some(serde_json::to_value(claims).unwrap()),
                     refunds: Some(serde_json::to_value(refunds).unwrap()),
@@ -307,10 +310,7 @@ fn property_bridge_out_stats_conservation() {
                     ..Default::default()
                 });
 
-                let graph_router = Router::new().route("/", post(test_support::mock_graph_handler));
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let graph_url = format!("http://{}", listener.local_addr().unwrap());
-                tokio::spawn(async move { axum::serve(listener, graph_router).await.unwrap(); });
+                let graph_url = start_mock_graph_server_with_state(graph_state.clone()).await;
 
                 let client = GraphQueryClient::new();
                 let config_init = WatchEventConfig::Swap(TheGraphConfig {
@@ -403,7 +403,8 @@ fn property_bridge_in_idempotency() {
         .run(&strat, |repeat_times| {
             run_async(async move {
                 setup_env();
-                clear_graph_mock_state();
+                let graph_state = new_graph_mock_state();
+                clear_graph_mock_state(&graph_state);
                 let temp_db = NamedTempFile::new().unwrap();
                 let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, _btc_mock, goat_client, goat_mock) = setup_clients();
@@ -414,7 +415,7 @@ fn property_bridge_in_idempotency() {
                 let bridge_in_req = build_bridge_in_request_event(&instance_id_hex);
                 let bridge_in = build_bridge_in_event(&instance_id_hex);
 
-                set_graph_mock_state(GraphMockState {
+                set_graph_mock_state(&graph_state, GraphMockState {
                     initializes: None,
                     claims: None,
                     refunds: None,
@@ -423,10 +424,7 @@ fn property_bridge_in_idempotency() {
                     ..Default::default()
                 });
 
-                let graph_router = Router::new().route("/", post(test_support::mock_graph_handler));
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let graph_url = format!("http://{}", listener.local_addr().unwrap());
-                tokio::spawn(async move { axum::serve(listener, graph_router).await.unwrap(); });
+                let graph_url = start_mock_graph_server_with_state(graph_state.clone()).await;
 
                 let client = GraphQueryClient::new();
                 let config_gateway = WatchEventConfig::Gateway(TheGraphConfig {

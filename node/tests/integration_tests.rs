@@ -56,8 +56,11 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 mod test_support;
-use test_support::mock_graph_handler;
 use test_support::test_fixtures;
+use test_support::{
+    GraphMockState, mock_graph_handler, new_graph_mock_state, set_graph_mock_state,
+    start_mock_graph_server_with_state,
+};
 
 #[allow(dead_code)]
 mod test_helpers {
@@ -168,7 +171,8 @@ mod test_helpers {
     pub fn test_committee_keypair() -> (bitcoin::PrivateKey, bitcoin::PublicKey) {
         let privkey =
             bitcoin::PrivateKey::from_slice(&[1u8; 32], bitcoin::Network::Regtest).unwrap();
-        let pubkey = privkey.public_key(&bitcoin::secp256k1::Secp256k1::new());
+        let pubkey = privkey.public_key(&secp256k1::Secp256k1::new());
+
         (privkey, pubkey)
     }
 
@@ -241,7 +245,7 @@ async fn setup() -> (LocalDB, BTCClient, MockBitcoinAdaptor, GOATClient, MockAda
 #[serial]
 async fn test_rpc_service_integration() {
     let (local_db, _, _, _, _, _db_file) = setup().await;
-    let actor = Actor::Challenger;
+    let actor = Actor::Committee;
     let peer_id = "test_peer_id".to_string();
     let registry = Arc::new(std::sync::Mutex::new(libp2p_metrics::Registry::default()));
     let cancel_token = CancellationToken::new();
@@ -285,7 +289,7 @@ async fn mock_goat_rpc_handler(Json(payload): Json<serde_json::Value>) -> Json<s
         return Json(serde_json::json!({
             "jsonrpc": "2.0",
             "id": payload.get("id"),
-            "result": "0x7a69" // 31337
+            "result": "0xbeb0" // 48816
         }));
     }
     Json(serde_json::json!({"jsonrpc": "2.0", "id": payload.get("id"), "result": null}))
@@ -295,7 +299,7 @@ async fn mock_goat_rpc_handler(Json(payload): Json<serde_json::Value>) -> Json<s
 #[serial]
 async fn test_bridge_out_flow() {
     let (local_db, btc_client, _btc_mock, goat_client, goat_mock, _db_file) = setup().await;
-    let actor = Actor::Challenger;
+    let actor = Actor::Operator;
     let client = GraphQueryClient::new();
 
     // Start Mock Graph
@@ -344,7 +348,7 @@ async fn test_bridge_out_flow() {
         timeout: U256::ZERO,
         _extraData: Bytes::new(),
     };
-    let initialize_input = initialize_call.abi_encode(); // This includes selector
+    let initialize_input = initialize_call.abi_encode();
 
     let initialize_tx_hash = "0xinit";
     let trace = GethTrace::CallTracer(CallFrame {
@@ -543,7 +547,7 @@ async fn test_bridge_in_timeout() {
 #[serial]
 async fn test_bridge_in_flow() {
     let (local_db, btc_client, btc_mock, goat_client, goat_mock, _db_file) = setup().await;
-    let actor = Actor::Challenger;
+    let actor = Actor::Operator;
     let client = GraphQueryClient::new();
 
     // Start a mock Graph Node server
@@ -575,7 +579,7 @@ async fn test_bridge_in_flow() {
         &mut storage_processor,
         &default_config,
         0,
-        100, // Block range
+        100,
     )
     .await
     .unwrap();
@@ -603,7 +607,7 @@ async fn test_bridge_in_flow() {
     let committee_addr = [4u8; 20];
 
     let pegin_data = PeginData {
-        status: PeginStatus::Pending, // Must be Pending for answer
+        status: PeginStatus::Pending,
         instance_id: *instance_id.as_bytes(),
         depositor_address: [0u8; 20],
         pegin_amount_sats: 100000,
@@ -635,7 +639,6 @@ async fn test_bridge_in_flow() {
     let bitcoin_txid = BitcoinTxid::from_byte_array(input_txid);
 
     // Use valid regtest address strings
-
     let user_change_address = bitcoin::Address::p2pkh(
         bitcoin::PublicKey::from_slice(&[2u8; 33]).unwrap(),
         bitcoin::Network::Regtest,
@@ -877,6 +880,354 @@ async fn test_bridge_out_disprove_event() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
+async fn test_gateway_proceed_withdraw_operator_pending_without_proof_server() {
+    let (local_db, btc_client, _btc_mock, goat_client, _goat_mock, _db_file) = setup().await;
+    let client = GraphQueryClient::new();
+
+    let old_proof_server = std::env::var(env::ENV_PROOF_SEVER_URL).ok();
+    unsafe {
+        std::env::remove_var(env::ENV_PROOF_SEVER_URL);
+    }
+
+    let graph_state = new_graph_mock_state();
+    set_graph_mock_state(
+        &graph_state,
+        GraphMockState {
+            proceed_withdraws: Some(serde_json::json!([{
+                "id": "proceed_1",
+                "transactionHash": "0xproceed",
+                "blockNumber": "20",
+                "instanceId": test_fixtures::instance_id_hex(),
+                "graphId": test_fixtures::graph_id_hex(),
+                "kickoffTxid": "0xkickoff"
+            }])),
+            init_withdraws: Some(serde_json::json!([])),
+            cancel_withdraws: Some(serde_json::json!([])),
+            withdraw_happy_paths: Some(serde_json::json!([])),
+            withdraw_unhappy_paths: Some(serde_json::json!([])),
+            withdraw_disproveds: Some(serde_json::json!([])),
+            ..Default::default()
+        },
+    );
+    let graph_url = start_mock_graph_server_with_state(graph_state).await;
+
+    let config = WatchEventConfig::Gateway(TheGraphConfig {
+        address: Address::ZERO,
+        the_graph_url: graph_url,
+        event_entities: vec![GatewayEventEntity::ProceedWithdraws],
+    });
+
+    let instance_id = test_fixtures::bridge_in_instance_id();
+    let graph_id = test_fixtures::bridge_out_graph_id();
+    let mut storage_processor = local_db.acquire().await.unwrap();
+    storage_processor
+        .upsert_graph(&Graph {
+            graph_id,
+            instance_id,
+            status: GraphStatus::OperatorKickOff.to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    storage_processor
+        .upsert_goat_tx_record(&store::GoatTxRecord {
+            instance_id,
+            graph_id,
+            tx_type: store::GoatTxType::InitWithdraw.to_string(),
+            tx_hash: "0xinit".to_string(),
+            height: 1,
+            is_local: false,
+            processing_status: store::GoatTxProcessingStatus::Pending.to_string(),
+            extra: None,
+            created_at: 0,
+        })
+        .await
+        .unwrap();
+
+    event_watch_task::fetch_and_handle_block_range_events(
+        Actor::Operator,
+        Arc::new(btc_client),
+        Arc::new(goat_client),
+        &client,
+        &mut storage_processor,
+        &config,
+        0,
+        30,
+    )
+    .await
+    .unwrap();
+
+    let proceed_record = storage_processor
+        .find_graph_goat_tx_record(
+            &instance_id,
+            &graph_id,
+            &store::GoatTxType::ProceedWithdraw.to_string(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        proceed_record.processing_status,
+        store::GoatTxProcessingStatus::Pending.to_string()
+    );
+
+    let init_record = storage_processor
+        .find_graph_goat_tx_record(
+            &instance_id,
+            &graph_id,
+            &store::GoatTxType::InitWithdraw.to_string(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(init_record.processing_status, store::GoatTxProcessingStatus::Processed.to_string());
+
+    let updated_graph = storage_processor.find_graph(&graph_id).await.unwrap().unwrap();
+    assert_eq!(updated_graph.proceed_withdraw_height, 20);
+
+    unsafe {
+        if let Some(value) = old_proof_server {
+            std::env::set_var(env::ENV_PROOF_SEVER_URL, value);
+        } else {
+            std::env::remove_var(env::ENV_PROOF_SEVER_URL);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_gateway_proceed_withdraw_operator_skipped_with_proof_server() {
+    let (local_db, btc_client, _btc_mock, goat_client, _goat_mock, _db_file) = setup().await;
+    let client = GraphQueryClient::new();
+
+    let old_proof_server = std::env::var(env::ENV_PROOF_SEVER_URL).ok();
+    unsafe {
+        std::env::set_var(env::ENV_PROOF_SEVER_URL, "http://proof.local");
+    }
+
+    let graph_state = new_graph_mock_state();
+    set_graph_mock_state(
+        &graph_state,
+        GraphMockState {
+            proceed_withdraws: Some(serde_json::json!([{
+                "id": "proceed_1",
+                "transactionHash": "0xproceed",
+                "blockNumber": "20",
+                "instanceId": test_fixtures::instance_id_hex(),
+                "graphId": test_fixtures::graph_id_hex(),
+                "kickoffTxid": "0xkickoff"
+            }])),
+            init_withdraws: Some(serde_json::json!([])),
+            cancel_withdraws: Some(serde_json::json!([])),
+            withdraw_happy_paths: Some(serde_json::json!([])),
+            withdraw_unhappy_paths: Some(serde_json::json!([])),
+            withdraw_disproveds: Some(serde_json::json!([])),
+            ..Default::default()
+        },
+    );
+    let graph_url = start_mock_graph_server_with_state(graph_state).await;
+
+    let config = WatchEventConfig::Gateway(TheGraphConfig {
+        address: Address::ZERO,
+        the_graph_url: graph_url,
+        event_entities: vec![GatewayEventEntity::ProceedWithdraws],
+    });
+
+    let instance_id = test_fixtures::bridge_in_instance_id();
+    let graph_id = test_fixtures::bridge_out_graph_id();
+    let mut storage_processor = local_db.acquire().await.unwrap();
+    storage_processor
+        .upsert_graph(&Graph {
+            graph_id,
+            instance_id,
+            status: GraphStatus::OperatorKickOff.to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    storage_processor
+        .upsert_goat_tx_record(&store::GoatTxRecord {
+            instance_id,
+            graph_id,
+            tx_type: store::GoatTxType::InitWithdraw.to_string(),
+            tx_hash: "0xinit".to_string(),
+            height: 1,
+            is_local: false,
+            processing_status: store::GoatTxProcessingStatus::Pending.to_string(),
+            extra: None,
+            created_at: 0,
+        })
+        .await
+        .unwrap();
+
+    event_watch_task::fetch_and_handle_block_range_events(
+        Actor::Operator,
+        Arc::new(btc_client),
+        Arc::new(goat_client),
+        &client,
+        &mut storage_processor,
+        &config,
+        0,
+        30,
+    )
+    .await
+    .unwrap();
+
+    let proceed_record = storage_processor
+        .find_graph_goat_tx_record(
+            &instance_id,
+            &graph_id,
+            &store::GoatTxType::ProceedWithdraw.to_string(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        proceed_record.processing_status,
+        store::GoatTxProcessingStatus::Skipped.to_string()
+    );
+
+    let init_record = storage_processor
+        .find_graph_goat_tx_record(
+            &instance_id,
+            &graph_id,
+            &store::GoatTxType::InitWithdraw.to_string(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(init_record.processing_status, store::GoatTxProcessingStatus::Processed.to_string());
+
+    let updated_graph = storage_processor.find_graph(&graph_id).await.unwrap().unwrap();
+    assert_eq!(updated_graph.proceed_withdraw_height, 20);
+
+    unsafe {
+        if let Some(value) = old_proof_server {
+            std::env::set_var(env::ENV_PROOF_SEVER_URL, value);
+        } else {
+            std::env::remove_var(env::ENV_PROOF_SEVER_URL);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_gateway_proceed_withdraw_non_operator_skipped() {
+    let (local_db, btc_client, _btc_mock, goat_client, _goat_mock, _db_file) = setup().await;
+    let client = GraphQueryClient::new();
+
+    let old_proof_server = std::env::var(env::ENV_PROOF_SEVER_URL).ok();
+    unsafe {
+        std::env::remove_var(env::ENV_PROOF_SEVER_URL);
+    }
+
+    let graph_state = new_graph_mock_state();
+    set_graph_mock_state(
+        &graph_state,
+        GraphMockState {
+            proceed_withdraws: Some(serde_json::json!([{
+                "id": "proceed_1",
+                "transactionHash": "0xproceed",
+                "blockNumber": "20",
+                "instanceId": test_fixtures::instance_id_hex(),
+                "graphId": test_fixtures::graph_id_hex(),
+                "kickoffTxid": "0xkickoff"
+            }])),
+            init_withdraws: Some(serde_json::json!([])),
+            cancel_withdraws: Some(serde_json::json!([])),
+            withdraw_happy_paths: Some(serde_json::json!([])),
+            withdraw_unhappy_paths: Some(serde_json::json!([])),
+            withdraw_disproveds: Some(serde_json::json!([])),
+            ..Default::default()
+        },
+    );
+    let graph_url = start_mock_graph_server_with_state(graph_state).await;
+
+    let config = WatchEventConfig::Gateway(TheGraphConfig {
+        address: Address::ZERO,
+        the_graph_url: graph_url,
+        event_entities: vec![GatewayEventEntity::ProceedWithdraws],
+    });
+
+    let instance_id = test_fixtures::bridge_in_instance_id();
+    let graph_id = test_fixtures::bridge_out_graph_id();
+    let mut storage_processor = local_db.acquire().await.unwrap();
+    storage_processor
+        .upsert_graph(&Graph {
+            graph_id,
+            instance_id,
+            status: GraphStatus::OperatorKickOff.to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    storage_processor
+        .upsert_goat_tx_record(&store::GoatTxRecord {
+            instance_id,
+            graph_id,
+            tx_type: store::GoatTxType::InitWithdraw.to_string(),
+            tx_hash: "0xinit".to_string(),
+            height: 1,
+            is_local: false,
+            processing_status: store::GoatTxProcessingStatus::Pending.to_string(),
+            extra: None,
+            created_at: 0,
+        })
+        .await
+        .unwrap();
+
+    event_watch_task::fetch_and_handle_block_range_events(
+        Actor::Committee,
+        Arc::new(btc_client),
+        Arc::new(goat_client),
+        &client,
+        &mut storage_processor,
+        &config,
+        0,
+        30,
+    )
+    .await
+    .unwrap();
+
+    let proceed_record = storage_processor
+        .find_graph_goat_tx_record(
+            &instance_id,
+            &graph_id,
+            &store::GoatTxType::ProceedWithdraw.to_string(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        proceed_record.processing_status,
+        store::GoatTxProcessingStatus::Skipped.to_string()
+    );
+
+    let init_record = storage_processor
+        .find_graph_goat_tx_record(
+            &instance_id,
+            &graph_id,
+            &store::GoatTxType::InitWithdraw.to_string(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(init_record.processing_status, store::GoatTxProcessingStatus::Processed.to_string());
+
+    let updated_graph = storage_processor.find_graph(&graph_id).await.unwrap().unwrap();
+    assert_eq!(updated_graph.proceed_withdraw_height, 20);
+
+    unsafe {
+        if let Some(value) = old_proof_server {
+            std::env::set_var(env::ENV_PROOF_SEVER_URL, value);
+        } else {
+            std::env::remove_var(env::ENV_PROOF_SEVER_URL);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn test_bridge_in_utxo_spent() {
     let (local_db, btc_client, btc_mock, goat_client, goat_mock, _db_file) = setup().await;
 
@@ -1010,7 +1361,7 @@ async fn test_bridge_out_refund() {
 
     let mut storage_processor = local_db.acquire().await.unwrap();
 
-    // 1. Initialize Instance (Same as happy path)
+    // 1. Initialize Instance
     let escrow_data = EscrowData {
         offerer: Address::ZERO,
         claimer: Address::ZERO,
@@ -1091,7 +1442,7 @@ async fn test_bridge_out_refund() {
         &client,
         &mut storage_processor,
         &config_refund,
-        101, // Simulate later block
+        101,
         200,
     )
     .await
@@ -1107,7 +1458,6 @@ async fn test_bridge_out_refund() {
     let instance = instances.first().expect("Instance not found");
     assert_eq!(instance.status, InstanceBridgeOutStatus::Refund.to_string());
 }
-
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
@@ -2713,7 +3063,7 @@ mod graph_monitor_boundary_tests {
 
         let monitor = GraphBtcTxVoutMonitor {
             graph_id,
-            tx_name: "watchtower_init".to_string(),
+            tx_name: "watchtower_init".into(),
             txid: SerializableTxid(BitcoinTxid::from_byte_array([2u8; 32])),
             height: 1000,
             vout_len: 100,
