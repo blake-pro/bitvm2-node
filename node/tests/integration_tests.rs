@@ -15,8 +15,8 @@ use bitvm2_noded::{
     scheduled_tasks::{
         event_watch_task,
         instance_maintenance_tasks::{
-            instance_answers_monitor, instance_btc_tx_monitor, instance_expiration_monitor,
-            instance_window_expiration_monitor,
+            instance_answers_monitor, instance_bridge_out_monitor, instance_btc_tx_monitor,
+            instance_expiration_monitor, instance_window_expiration_monitor,
         },
     },
     utils::{
@@ -3090,4 +3090,35 @@ mod graph_monitor_boundary_tests {
         let items = parsed.get("items").unwrap().as_array().unwrap();
         assert_eq!(items.len(), 100, "Should store 100 vout items without truncation");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_bridge_out_timeout() {
+    let (local_db, _, _, _, _, _db_file) = setup().await;
+    let mut storage_processor = local_db.acquire().await.unwrap();
+
+    let instance_id = Uuid::new_v4();
+
+    // 1. Create Instance in Initialize status with expired lock time
+    let lock_time_expired = rpc_service::current_time_secs() - 3600; // 1 hour ago
+    let instance = Instance {
+        instance_id,
+        is_bridge_in: false,
+        status: InstanceBridgeOutStatus::Initialize.to_string(),
+        bridge_out_amount: "100000".to_string(),
+        bridge_out_lock_time: lock_time_expired,
+        escrow_hash: Some("0x123".to_string()), // Required filter condition
+        created_at: rpc_service::current_time_secs(),
+        updated_at: rpc_service::current_time_secs(),
+        ..Default::default()
+    };
+    storage_processor.upsert_instance(&instance).await.unwrap();
+
+    // 2. Run Monitor
+    instance_bridge_out_monitor(&local_db).await.unwrap();
+
+    // 3. Verify Transition to Timeout
+    let instance = storage_processor.find_instance(&instance_id).await.unwrap().unwrap();
+    assert_eq!(instance.status, InstanceBridgeOutStatus::Timeout.to_string());
 }

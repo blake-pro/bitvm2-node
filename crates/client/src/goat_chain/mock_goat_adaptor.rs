@@ -35,6 +35,7 @@ pub struct MockAdaptor {
     tx_receipts: Arc<Mutex<HashMap<String, TransactionReceipt>>>,
     gateway_contract_config: Arc<Mutex<GatewayContractConfig>>,
     pegin_data_store: Arc<Mutex<HashMap<[u8; 16], PeginData>>>,
+    graph_data_store: Arc<Mutex<HashMap<[u8; 16], GraphData>>>,
     traces: Arc<Mutex<HashMap<String, GethTrace>>>,
     quorum_size: Arc<Mutex<u64>>,
     gateway_answer_pegin_request_calls: Arc<AtomicUsize>,
@@ -77,6 +78,12 @@ impl MockAdaptor {
     pub fn set_pegin_data(&self, instance_id: [u8; 16], data: PeginData) {
         if let Ok(mut h) = self.pegin_data_store.lock() {
             h.insert(instance_id, data);
+        }
+    }
+
+    pub fn set_graph_data(&self, graph_id: [u8; 16], data: GraphData) {
+        if let Ok(mut h) = self.graph_data_store.lock() {
+            h.insert(graph_id, data);
         }
     }
 
@@ -235,8 +242,13 @@ impl ChainAdaptor for MockAdaptor {
         bail!("not find withdraw data")
     }
 
-    async fn gateway_get_graph_data(&self, _graph_id: &[u8; 16]) -> anyhow::Result<GraphData> {
+    async fn gateway_get_graph_data(&self, graph_id: &[u8; 16]) -> anyhow::Result<GraphData> {
         info!("call get_operator_data");
+        if let Ok(store) = self.graph_data_store.lock() {
+            if let Some(data) = store.get(graph_id) {
+                return Ok(data.clone());
+            }
+        }
         bail!("not find operator data")
     }
 
@@ -544,6 +556,7 @@ impl MockAdaptor {
             tx_receipts: Arc::new(Mutex::new(HashMap::new())),
             gateway_contract_config: Arc::new(Mutex::new(Default::default())),
             pegin_data_store: Arc::new(Mutex::new(HashMap::new())),
+            graph_data_store: Arc::new(Mutex::new(HashMap::new())),
             traces: Arc::new(Mutex::new(HashMap::new())),
             quorum_size: Arc::new(Mutex::new(0)),
             gateway_answer_pegin_request_calls: Arc::new(AtomicUsize::new(0)),

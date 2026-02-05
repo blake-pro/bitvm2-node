@@ -46,7 +46,7 @@ pub struct ChallengeTimeLockConfig {
     pub assert_commit_timelock: i64,
 }
 
-fn get_challenge_timelock_config() -> ChallengeTimeLockConfig {
+pub fn get_challenge_timelock_config() -> ChallengeTimeLockConfig {
     ChallengeTimeLockConfig {
         watchtower_challenge_timelock: watchtower_challenge_timeout_timelock(get_network()) as i64,
         watchtower_ack_timelock: nack_timelock(get_network()) as i64,
@@ -881,7 +881,7 @@ pub async fn scan_obsolete_sibling_graphs(local_db: &LocalDB) -> anyhow::Result<
 
 /// Process watchtower challenge monitoring
 #[tracing::instrument(level = "info", skip(btc_client, local_db))]
-async fn process_watchtower_challenge_monitoring(
+pub async fn process_watchtower_challenge_monitoring(
     btc_client: &BTCClient,
     local_db: &LocalDB,
     graph: &Graph,
@@ -1244,7 +1244,7 @@ async fn process_watchtower_challenge_monitoring(
 }
 
 /// Process assert commit monitoring
-async fn process_assert_commit_monitoring(
+pub async fn process_assert_commit_monitoring(
     btc_client: &BTCClient,
     local_db: &LocalDB,
     graph: &Graph,
