@@ -21,10 +21,11 @@ use uuid::Uuid;
 mod test_support;
 
 fn test_config() -> ProptestConfig {
-    let mut config = ProptestConfig::default();
-    config.cases = env::var("PROPTEST_CASES").ok().and_then(|s| s.parse().ok()).unwrap_or(100);
-    config.failure_persistence = None;
-    config
+    ProptestConfig {
+        cases: env::var("PROPTEST_CASES").ok().and_then(|s| s.parse().ok()).unwrap_or(100),
+        failure_persistence: None,
+        ..Default::default()
+    }
 }
 
 fn build_test_runner() -> TestRunner {

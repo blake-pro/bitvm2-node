@@ -673,7 +673,7 @@ async fn refresh_graph_status(
 }
 
 #[tracing::instrument(level = "info", skip_all, fields(instance_id = %instance_id))]
-async fn handle_pegin_request_committee(
+pub async fn handle_pegin_request_committee(
     ctx: &mut HandlerContext<'_>,
     instance_id: Uuid,
     pegin_request_tx_hash: &str,

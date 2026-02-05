@@ -1,6 +1,3 @@
-#[cfg(not(dispatch_test))]
-compile_error!("dispatch_actor_tests requires RUSTFLAGS=\"--cfg dispatch_test\"");
-
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, Network, OutPoint, PublicKey, Txid as BitcoinTxid};
 use bitvm2_lib::actors::Actor;
@@ -10,22 +7,20 @@ use bitvm2_lib::types::{
     Bitvm2GraphParameters, Bitvm2InstanceParameters, PrekickoffParameters, SimplifiedBitvm2Graph,
     UserInfo,
 };
-use bitvm2_noded::action::{
-    ConfirmInstance, GOATMessage, GOATMessageContent, PeginRequest, set_test_send_hook,
-};
+use bitvm2_noded::action::{ConfirmInstance, GOATMessageContent, PeginRequest};
 use bitvm2_noded::env;
 use bitvm2_noded::handle::{HandlerContext, dispatch};
 use bitvm2_noded::middleware::AllBehaviours;
-use bitvm2_noded::utils::{
-    GenerateInstanceParams, read_instance_info_from_goat, store_graph, store_pegin_request,
-    todo_funcs,
-};
+use bitvm2_noded::middleware::behaviour::AllBehavioursEvent;
+use bitvm2_noded::middleware::get_topic_name;
+use bitvm2_noded::utils::{read_instance_info_from_goat, store_graph, todo_funcs};
 use client::btc_chain::{BTCClient, mock_bitcoin_adaptor::MockBitcoinAdaptor};
 use client::goat_chain::{
     GOATClient, PeginData, PeginStatus, Utxo as GoatUtxo, mock_goat_adaptor::MockAdaptor,
 };
 use client::http_client::async_client::HttpAsyncClient;
 use esplora_client::{OutputStatus, Tx, TxStatus, Vout};
+use futures::StreamExt;
 use goat::connectors::kickoff_connectors::{
     ForceSkipConnector, KickoffConnector, PrekickoffConnector,
 };
@@ -38,20 +33,21 @@ use libp2p::PeerId;
 use libp2p::Swarm;
 use libp2p::Transport;
 use libp2p::core::transport::dummy::DummyTransport;
-use libp2p::gossipsub::MessageId;
+use libp2p::gossipsub::{self, MessageId};
 use libp2p::identity;
 use libp2p::swarm::Config as SwarmConfig;
+use libp2p::swarm::SwarmEvent;
+use libp2p::{noise, tcp, yamux};
 use proptest::prelude::*;
 use proptest::test_runner::TestRunner;
-use scopeguard::guard;
 use secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
 use serial_test::serial;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use store::{
     ByteArray32, Instance, InstanceBridgeInStatus, UInt64Array3, create_local_db, localdb::LocalDB,
 };
 use tempfile::NamedTempFile;
+use tokio::time::Instant;
 use uuid::Uuid;
 use zkm_sdk::ZKM_CIRCUIT_VERSION;
 
@@ -92,105 +88,14 @@ impl Drop for TestEnvGuard {
 }
 
 fn proptest_config() -> ProptestConfig {
-    ProptestConfig { cases: PROPTEST_CASES, ..ProptestConfig::default() }
-}
-
-#[test]
-fn smoke_noop() {
-    assert!(true);
-}
-
-#[test]
-fn sigill_probe_keys_only() {
-    let _env_guard = TestEnvGuard::new();
-    let keypair = env::get_bitvm_key().unwrap();
-    let operator_master_key = OperatorMasterKey::new(keypair);
-    let _pubkey: PublicKey = operator_master_key.master_keypair().public_key().into();
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn sigill_probe_read_pegin_request() {
-    let _env_guard = TestEnvGuard::new();
-    let instance_id = Uuid::new_v4();
-    let input_txid = [1u8; 32];
-    let pegin_amount = 100_000u64;
-    let input_amount = 200_000u64;
-    let (_local_db, btc_client, _btc_mock, goat_client, _goat_mock, _db_file) =
-        setup_pegin_request_fixtures(instance_id, input_txid, input_amount, pegin_amount).await;
-    let _ = bitvm2_noded::utils::read_pegin_request(&btc_client, &goat_client, instance_id)
-        .await
-        .unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn sigill_probe_read_instance_info() {
-    let _env_guard = TestEnvGuard::new();
-    let instance_id = Uuid::new_v4();
-    let (goat_client, goat_mock) = GOATClient::new_mock_client();
-    let network = env::get_network();
-    let user_change_address = test_address(network);
-    let user_refund_address = user_change_address.clone();
-    let committee_pubkeys = test_committee_pubkeys_bytes();
-    goat_mock.set_committee_pubkeys(committee_pubkeys.clone());
-    let pegin_data = PeginData {
-        status: PeginStatus::Pending,
-        instance_id: *instance_id.as_bytes(),
-        depositor_address: [0u8; 20],
-        pegin_amount_sats: 100000,
-        txn_fees: [100, 100, 100],
-        user_inputs: vec![GoatUtxo { txid: [9u8; 32], vout: 0, amount_sats: 200000 }],
-        user_xonly_pubkey: test_xonly_pubkey(),
-        user_change_addr: user_change_address.to_string(),
-        user_refund_addr: user_refund_address.to_string(),
-        pegin_txid: [3u8; 32],
-        created_at: 0,
-        committee_addresses: vec![],
-        committee_pubkeys,
-    };
-    goat_mock.set_pegin_data(*instance_id.as_bytes(), pegin_data);
-    let _ = read_instance_info_from_goat(&goat_client, instance_id).await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn sigill_probe_store_pegin_request_only() {
-    let _env_guard = TestEnvGuard::new();
-    let instance_id = Uuid::new_v4();
-    let input_txid = [1u8; 32];
-    let pegin_amount = 100_000u64;
-    let input_amount = 200_000u64;
-    let (local_db, btc_client, _btc_mock, _goat_client, _goat_mock, _db_file) =
-        setup_pegin_request_fixtures(instance_id, input_txid, input_amount, pegin_amount).await;
-
-    let network = env::get_network();
-    let user_change_address = test_address(network);
-    let user_refund_address = user_change_address.clone();
-    let user_info = UserInfo {
-        depositor_evm_address: [0u8; 20],
-        txn_fees: [100, 100, 100],
-        inputs: vec![Input {
-            outpoint: OutPoint { txid: BitcoinTxid::from_byte_array(input_txid), vout: 0 },
-            amount: Amount::from_sat(input_amount),
-        }],
-        user_change_address,
-        user_refund_address,
-        user_xonly_pubkey: XOnlyPublicKey::from_slice(&test_xonly_pubkey()).unwrap(),
-    };
-    let params = GenerateInstanceParams {
-        instance_id,
-        user_info,
-        pegin_amount: Amount::from_sat(pegin_amount),
-        pegin_request_tx_hash: "0xpegin".to_string(),
-        pegin_request_height: 10,
-        pegin_timestamp: 123,
-    };
-
-    store_pegin_request(&btc_client, &local_db, params).await.unwrap();
-    let mut storage_processor = local_db.acquire().await.unwrap();
-    let instance = storage_processor.find_instance(&instance_id).await.unwrap();
-    assert!(instance.is_some());
+    ProptestConfig {
+        cases: PROPTEST_CASES,
+        failure_persistence: Some(Box::new(
+            proptest::test_runner::FileFailurePersistence::WithSource("proptest-regressions"),
+        )),
+        source_file: Some(file!()),
+        ..ProptestConfig::default()
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -227,8 +132,8 @@ async fn dispatch_pegin_request_committee_once() {
         pegin_timestamp: 123,
     });
     dispatch(&mut ctx, &content).await.unwrap();
-    //
-    // assert_eq!(goat_mock.get_gateway_answer_pegin_request_calls(), 1);
+
+    assert_eq!(goat_mock.get_gateway_answer_pegin_request_calls(), 1);
 }
 
 fn build_swarm() -> Swarm<AllBehaviours> {
@@ -239,6 +144,61 @@ fn build_swarm() -> Swarm<AllBehaviours> {
     Swarm::new(transport, behaviour, peer_id, SwarmConfig::with_tokio_executor())
 }
 
+fn build_network_swarm() -> Swarm<AllBehaviours> {
+    let identity_key = identity::Keypair::generate_ed25519();
+    libp2p::SwarmBuilder::with_existing_identity(identity_key.clone())
+        .with_tokio()
+        .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)
+        .expect("create tcp transport")
+        .with_behaviour(AllBehaviours::new)
+        .expect("create behaviour")
+        .build()
+}
+
+async fn connect_swarms_with_topic(
+    swarm_a: &mut Swarm<AllBehaviours>,
+    swarm_b: &mut Swarm<AllBehaviours>,
+    topic: &gossipsub::IdentTopic,
+) {
+    swarm_a.behaviour_mut().gossipsub.subscribe(topic).unwrap();
+    swarm_b.behaviour_mut().gossipsub.subscribe(topic).unwrap();
+
+    swarm_b.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+    let listen_addr = loop {
+        if let SwarmEvent::NewListenAddr { address, .. } = swarm_b.select_next_some().await {
+            break address;
+        }
+    };
+    swarm_a.dial(listen_addr).unwrap();
+
+    let peer_a = *swarm_a.local_peer_id();
+    let peer_b = *swarm_b.local_peer_id();
+    let topic_hash = topic.hash();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let a_has_b = swarm_a
+            .behaviour()
+            .gossipsub
+            .all_peers()
+            .any(|(peer, topics)| peer == &peer_b && topics.contains(&&topic_hash));
+        let b_has_a = swarm_b
+            .behaviour()
+            .gossipsub
+            .all_peers()
+            .any(|(peer, topics)| peer == &peer_a && topics.contains(&&topic_hash));
+        if a_has_b && b_has_a {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("timeout waiting for gossipsub subscriptions to propagate");
+        }
+        tokio::select! {
+            _ = swarm_a.select_next_some() => {},
+            _ = swarm_b.select_next_some() => {},
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {},
+        }
+    }
+}
 fn test_keypair_from_byte(byte: u8) -> Keypair {
     let secp = Secp256k1::new();
     let secret_key = SecretKey::from_slice(&[byte; 32]).unwrap();
@@ -582,6 +542,7 @@ fn prop_dispatch_pegin_request_committee_calls_gateway_answer() {
                 });
                 prop_assert!(dispatch(&mut ctx, &content).await.is_ok());
                 prop_assert_eq!(goat_mock.get_gateway_answer_pegin_request_calls(), 1);
+
                 let mut storage_processor = local_db.acquire().await.unwrap();
                 let instance = storage_processor.find_instance(&instance_id).await.unwrap();
                 prop_assert!(instance.is_some());
@@ -589,6 +550,7 @@ fn prop_dispatch_pegin_request_committee_calls_gateway_answer() {
                     instance.unwrap().status,
                     InstanceBridgeInStatus::UserInited.to_string()
                 );
+
                 Ok(())
             })
         })
@@ -645,6 +607,7 @@ fn prop_dispatch_pegin_request_non_committee_no_gateway_answer() {
                 });
                 prop_assert!(dispatch(&mut ctx, &content).await.is_ok());
                 prop_assert_eq!(goat_mock.get_gateway_answer_pegin_request_calls(), 0);
+
                 let mut storage_processor = local_db.acquire().await.unwrap();
                 let instance = storage_processor.find_instance(&instance_id).await.unwrap();
                 prop_assert!(instance.is_some());
@@ -652,6 +615,7 @@ fn prop_dispatch_pegin_request_non_committee_no_gateway_answer() {
                     instance.unwrap().status,
                     InstanceBridgeInStatus::UserInited.to_string()
                 );
+
                 Ok(())
             })
         })
@@ -674,24 +638,16 @@ fn prop_dispatch_confirm_instance_operator_sends_create_graph() {
                     create_local_db(&format!("sqlite:{}", db_file.path().display())).await;
                 let (btc_client, _btc_mock) = BTCClient::new_mock_client();
                 let (goat_client, _goat_mock) = GOATClient::new_mock_client();
-                let mut swarm = build_swarm();
+                let mut swarm = build_network_swarm();
+                let mut receiver_swarm = build_network_swarm();
+                let topic = gossipsub::IdentTopic::new(get_topic_name(&Actor::All.to_string()));
+                connect_swarms_with_topic(&mut swarm, &mut receiver_swarm, &topic).await;
                 let http_client = HttpAsyncClient::new(None);
-                let from_peer_id = PeerId::random();
+                let from_peer_id = *receiver_swarm.local_peer_id();
                 let message_id = MessageId::new(b"confirm_instance_operator");
 
                 let simplified_graph = build_test_simplified_graph(instance_id);
                 store_graph(&local_db, &simplified_graph).await.unwrap();
-
-                let send_calls = Arc::new(AtomicUsize::new(0));
-                let hook = {
-                    let send_calls = send_calls.clone();
-                    Arc::new(move |_msg: GOATMessage| {
-                        send_calls.fetch_add(1, Ordering::SeqCst);
-                        Ok(GOATMessage::default_message_id())
-                    })
-                };
-                set_test_send_hook(Some(hook));
-                let _cleanup = guard((), |_| set_test_send_hook(None));
 
                 let mut ctx = HandlerContext {
                     swarm: &mut swarm,
@@ -705,8 +661,32 @@ fn prop_dispatch_confirm_instance_operator_sends_create_graph() {
                     is_self_peer: false,
                 };
                 let content = GOATMessageContent::ConfirmInstance(ConfirmInstance { instance_id });
-                prop_assert!(dispatch(&mut ctx, &content).await.is_ok());
-                prop_assert_eq!(send_calls.load(Ordering::SeqCst), 1);
+                let dispatch_result = dispatch(&mut ctx, &content).await;
+                prop_assert!(
+                    dispatch_result.is_ok(),
+                    "dispatch failed: {:#}",
+                    dispatch_result.unwrap_err()
+                );
+
+                let mut received = false;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !received && Instant::now() < deadline {
+                    tokio::select! {
+                        event = swarm.select_next_some() => {
+                            let _ = event;
+                        }
+                        event = receiver_swarm.select_next_some() => {
+                            if let SwarmEvent::Behaviour(AllBehavioursEvent::Gossipsub(
+                                gossipsub::Event::Message { .. }
+                            )) = event {
+                                received = true;
+                            }
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                    }
+                }
+                prop_assert!(received, "did not receive gossipsub message");
+
                 Ok(())
             })
         })
@@ -750,10 +730,12 @@ fn prop_dispatch_confirm_instance_non_operator_stores_parameters() {
                 };
                 let content = GOATMessageContent::ConfirmInstance(ConfirmInstance { instance_id });
                 prop_assert!(dispatch(&mut ctx, &content).await.is_ok());
+
                 let mut storage_processor = local_db.acquire().await.unwrap();
                 let instance = storage_processor.find_instance(&instance_id).await.unwrap();
                 prop_assert!(instance.is_some());
                 prop_assert!(instance.unwrap().parameters.is_some());
+
                 Ok(())
             })
         })

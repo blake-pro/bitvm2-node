@@ -770,7 +770,7 @@ pub mod evm_swap_utils {
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::redundant_pattern_matching)]
 #[allow(clippy::collapsible_else_if)]
-pub(crate) async fn refresh_graph(
+pub async fn refresh_graph(
     local_db: &LocalDB,
     btc_client: &BTCClient,
     goat_client: &GOATClient,

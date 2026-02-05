@@ -10,12 +10,12 @@ use serial_test::serial;
 use std::env;
 use std::str::FromStr;
 use std::sync::Arc;
+use store::create_local_db;
+use store::localdb::NodeQuery;
 use store::{
     GoatTxProcessingStatus, GoatTxRecord, GoatTxType, Graph, GraphStatus, Message, MessageState,
     Node,
 };
-use store::create_local_db;
-use store::localdb::NodeQuery;
 use tempfile::NamedTempFile;
 use tokio::runtime::Runtime;
 use uuid::Uuid;
@@ -27,13 +27,11 @@ use test_support::{
 };
 
 fn test_config() -> ProptestConfig {
-    let mut config = ProptestConfig::default();
-    config.cases = env::var("PROPTEST_CASES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100);
-    config.failure_persistence = None;
-    config
+    ProptestConfig {
+        cases: env::var("PROPTEST_CASES").ok().and_then(|s| s.parse().ok()).unwrap_or(100),
+        failure_persistence: None,
+        ..Default::default()
+    }
 }
 
 fn build_test_runner() -> TestRunner {
@@ -142,7 +140,8 @@ fn prop_withdraw_init_or_cancel_updates_graph() {
                 let graph_state = new_graph_mock_state();
                 clear_graph_mock_state(&graph_state);
                 let temp_db = NamedTempFile::new().unwrap();
-                let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
+                let local_db =
+                    create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, _btc_mock) = BTCClient::new_mock_client();
                 let (goat_client, _goat_mock) = GOATClient::new_mock_client();
 
@@ -179,14 +178,14 @@ fn prop_withdraw_init_or_cancel_updates_graph() {
                 set_graph_mock_state(
                     &graph_state,
                     GraphMockState {
-                    init_withdraws: Some(init_events),
-                    cancel_withdraws: Some(cancel_events),
-                    proceed_withdraws: Some(serde_json::json!([])),
-                    withdraw_happy_paths: Some(serde_json::json!([])),
-                    withdraw_unhappy_paths: Some(serde_json::json!([])),
-                    withdraw_disproveds: Some(serde_json::json!([])),
-                    ..Default::default()
-                },
+                        init_withdraws: Some(init_events),
+                        cancel_withdraws: Some(cancel_events),
+                        proceed_withdraws: Some(serde_json::json!([])),
+                        withdraw_happy_paths: Some(serde_json::json!([])),
+                        withdraw_unhappy_paths: Some(serde_json::json!([])),
+                        withdraw_disproveds: Some(serde_json::json!([])),
+                        ..Default::default()
+                    },
                 );
 
                 let graph_url = start_mock_graph_server_with_state(graph_state.clone()).await;
@@ -260,7 +259,8 @@ fn prop_withdraw_proceed_updates_graph_and_tx() {
                 let graph_state = new_graph_mock_state();
                 clear_graph_mock_state(&graph_state);
                 let temp_db = NamedTempFile::new().unwrap();
-                let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
+                let local_db =
+                    create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, _btc_mock) = BTCClient::new_mock_client();
                 let (goat_client, _goat_mock) = GOATClient::new_mock_client();
 
@@ -286,28 +286,25 @@ fn prop_withdraw_proceed_updates_graph_and_tx() {
                 set_graph_mock_state(
                     &graph_state,
                     GraphMockState {
-                    proceed_withdraws: Some(serde_json::json!([{
-                        "id": "proceed_1",
-                        "transactionHash": "0xproceed",
-                        "blockNumber": "20",
-                        "instanceId": test_support::test_fixtures::instance_id_hex(),
-                        "graphId": test_support::test_fixtures::graph_id_hex(),
-                        "kickoffTxid": "0xkickoff"
-                    }])),
-                    init_withdraws: Some(serde_json::json!([])),
-                    cancel_withdraws: Some(serde_json::json!([])),
-                    withdraw_happy_paths: Some(serde_json::json!([])),
-                    withdraw_unhappy_paths: Some(serde_json::json!([])),
-                    withdraw_disproveds: Some(serde_json::json!([])),
-                    ..Default::default()
-                },
+                        proceed_withdraws: Some(serde_json::json!([{
+                            "id": "proceed_1",
+                            "transactionHash": "0xproceed",
+                            "blockNumber": "20",
+                            "instanceId": test_support::test_fixtures::instance_id_hex(),
+                            "graphId": test_support::test_fixtures::graph_id_hex(),
+                            "kickoffTxid": "0xkickoff"
+                        }])),
+                        init_withdraws: Some(serde_json::json!([])),
+                        cancel_withdraws: Some(serde_json::json!([])),
+                        withdraw_happy_paths: Some(serde_json::json!([])),
+                        withdraw_unhappy_paths: Some(serde_json::json!([])),
+                        withdraw_disproveds: Some(serde_json::json!([])),
+                        ..Default::default()
+                    },
                 );
 
                 let graph_url = start_mock_graph_server_with_state(graph_state.clone()).await;
-                let config = gateway_config(
-                    &graph_url,
-                    vec![GatewayEventEntity::ProceedWithdraws],
-                );
+                let config = gateway_config(&graph_url, vec![GatewayEventEntity::ProceedWithdraws]);
                 let client = GraphQueryClient::new();
 
                 event_watch_task::fetch_and_handle_block_range_events(
@@ -333,10 +330,7 @@ fn prop_withdraw_proceed_updates_graph_and_tx() {
                 )
                 .await
                 .unwrap();
-                assert_eq!(
-                    proceed.processing_status,
-                    GoatTxProcessingStatus::Pending.to_string()
-                );
+                assert_eq!(proceed.processing_status, GoatTxProcessingStatus::Pending.to_string());
                 let init = test_support::get_goat_tx(
                     &mut storage,
                     &instance_id,
@@ -345,10 +339,7 @@ fn prop_withdraw_proceed_updates_graph_and_tx() {
                 )
                 .await
                 .unwrap();
-                assert_eq!(
-                    init.processing_status,
-                    GoatTxProcessingStatus::Processed.to_string()
-                );
+                assert_eq!(init.processing_status, GoatTxProcessingStatus::Processed.to_string());
             });
             Ok(())
         })
@@ -369,7 +360,8 @@ fn prop_withdraw_proceed_skipped_with_proof_server() {
                 let graph_state = new_graph_mock_state();
                 clear_graph_mock_state(&graph_state);
                 let temp_db = NamedTempFile::new().unwrap();
-                let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
+                let local_db =
+                    create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, _btc_mock) = BTCClient::new_mock_client();
                 let (goat_client, _goat_mock) = GOATClient::new_mock_client();
 
@@ -395,21 +387,21 @@ fn prop_withdraw_proceed_skipped_with_proof_server() {
                 set_graph_mock_state(
                     &graph_state,
                     GraphMockState {
-                    proceed_withdraws: Some(serde_json::json!([{
-                        "id": "proceed_1",
-                        "transactionHash": "0xproceed",
-                        "blockNumber": "20",
-                        "instanceId": test_support::test_fixtures::instance_id_hex(),
-                        "graphId": test_support::test_fixtures::graph_id_hex(),
-                        "kickoffTxid": "0xkickoff"
-                    }])),
-                    init_withdraws: Some(serde_json::json!([])),
-                    cancel_withdraws: Some(serde_json::json!([])),
-                    withdraw_happy_paths: Some(serde_json::json!([])),
-                    withdraw_unhappy_paths: Some(serde_json::json!([])),
-                    withdraw_disproveds: Some(serde_json::json!([])),
-                    ..Default::default()
-                },
+                        proceed_withdraws: Some(serde_json::json!([{
+                            "id": "proceed_1",
+                            "transactionHash": "0xproceed",
+                            "blockNumber": "20",
+                            "instanceId": test_support::test_fixtures::instance_id_hex(),
+                            "graphId": test_support::test_fixtures::graph_id_hex(),
+                            "kickoffTxid": "0xkickoff"
+                        }])),
+                        init_withdraws: Some(serde_json::json!([])),
+                        cancel_withdraws: Some(serde_json::json!([])),
+                        withdraw_happy_paths: Some(serde_json::json!([])),
+                        withdraw_unhappy_paths: Some(serde_json::json!([])),
+                        withdraw_disproveds: Some(serde_json::json!([])),
+                        ..Default::default()
+                    },
                 );
 
                 let graph_url = start_mock_graph_server_with_state(graph_state.clone()).await;
@@ -437,10 +429,7 @@ fn prop_withdraw_proceed_skipped_with_proof_server() {
                 )
                 .await
                 .unwrap();
-                assert_eq!(
-                    proceed.processing_status,
-                    GoatTxProcessingStatus::Skipped.to_string()
-                );
+                assert_eq!(proceed.processing_status, GoatTxProcessingStatus::Skipped.to_string());
                 let init = test_support::get_goat_tx(
                     &mut storage,
                     &instance_id,
@@ -449,10 +438,7 @@ fn prop_withdraw_proceed_skipped_with_proof_server() {
                 )
                 .await
                 .unwrap();
-                assert_eq!(
-                    init.processing_status,
-                    GoatTxProcessingStatus::Processed.to_string()
-                );
+                assert_eq!(init.processing_status, GoatTxProcessingStatus::Processed.to_string());
             });
             Ok(())
         })
@@ -472,7 +458,8 @@ fn prop_withdraw_paths_update_graph_reward_and_messages() {
                 let graph_state = new_graph_mock_state();
                 clear_graph_mock_state(&graph_state);
                 let temp_db = NamedTempFile::new().unwrap();
-                let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
+                let local_db =
+                    create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, _btc_mock) = BTCClient::new_mock_client();
                 let (goat_client, _goat_mock) = GOATClient::new_mock_client();
 
@@ -518,14 +505,14 @@ fn prop_withdraw_paths_update_graph_reward_and_messages() {
                 set_graph_mock_state(
                     &graph_state,
                     GraphMockState {
-                    withdraw_happy_paths: Some(happy_events),
-                    withdraw_unhappy_paths: Some(unhappy_events),
-                    withdraw_disproveds: Some(serde_json::json!([])),
-                    init_withdraws: Some(serde_json::json!([])),
-                    cancel_withdraws: Some(serde_json::json!([])),
-                    proceed_withdraws: Some(serde_json::json!([])),
-                    ..Default::default()
-                },
+                        withdraw_happy_paths: Some(happy_events),
+                        withdraw_unhappy_paths: Some(unhappy_events),
+                        withdraw_disproveds: Some(serde_json::json!([])),
+                        init_withdraws: Some(serde_json::json!([])),
+                        cancel_withdraws: Some(serde_json::json!([])),
+                        proceed_withdraws: Some(serde_json::json!([])),
+                        ..Default::default()
+                    },
                 );
 
                 let graph_url = start_mock_graph_server_with_state(graph_state.clone()).await;
@@ -587,7 +574,8 @@ fn prop_withdraw_disproved_updates_graph_reward_and_messages() {
                 let graph_state = new_graph_mock_state();
                 clear_graph_mock_state(&graph_state);
                 let temp_db = NamedTempFile::new().unwrap();
-                let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
+                let local_db =
+                    create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, _btc_mock) = BTCClient::new_mock_client();
                 let (goat_client, _goat_mock) = GOATClient::new_mock_client();
 
@@ -607,36 +595,34 @@ fn prop_withdraw_disproved_updates_graph_reward_and_messages() {
                 set_graph_mock_state(
                     &graph_state,
                     GraphMockState {
-                    withdraw_disproveds: Some(serde_json::json!([{
-                        "id": "disprove_1",
-                        "transactionHash": "0xdisprove",
-                        "blockNumber": "20",
-                        "blockTimestamp": "1600000100",
-                        "instanceId": test_support::test_fixtures::instance_id_hex(),
-                        "graphId": test_support::test_fixtures::graph_id_hex(),
-                        "disproveTxType": 1,
-                        "txnIndex": "0",
-                        "challengeStartTxid": "0xstart",
-                        "challengeFinishTxid": "0xfinish",
-                        "challengerAddress": challenger_addr,
-                        "disproverAddress": disprover_addr,
-                        "challengerRewardAmount": "500",
-                        "disproverRewardAmount": "700"
-                    }])),
-                    init_withdraws: Some(serde_json::json!([])),
-                    cancel_withdraws: Some(serde_json::json!([])),
-                    proceed_withdraws: Some(serde_json::json!([])),
-                    withdraw_happy_paths: Some(serde_json::json!([])),
-                    withdraw_unhappy_paths: Some(serde_json::json!([])),
-                    ..Default::default()
-                },
+                        withdraw_disproveds: Some(serde_json::json!([{
+                            "id": "disprove_1",
+                            "transactionHash": "0xdisprove",
+                            "blockNumber": "20",
+                            "blockTimestamp": "1600000100",
+                            "instanceId": test_support::test_fixtures::instance_id_hex(),
+                            "graphId": test_support::test_fixtures::graph_id_hex(),
+                            "disproveTxType": 1,
+                            "txnIndex": "0",
+                            "challengeStartTxid": "0xstart",
+                            "challengeFinishTxid": "0xfinish",
+                            "challengerAddress": challenger_addr,
+                            "disproverAddress": disprover_addr,
+                            "challengerRewardAmount": "500",
+                            "disproverRewardAmount": "700"
+                        }])),
+                        init_withdraws: Some(serde_json::json!([])),
+                        cancel_withdraws: Some(serde_json::json!([])),
+                        proceed_withdraws: Some(serde_json::json!([])),
+                        withdraw_happy_paths: Some(serde_json::json!([])),
+                        withdraw_unhappy_paths: Some(serde_json::json!([])),
+                        ..Default::default()
+                    },
                 );
 
                 let graph_url = start_mock_graph_server_with_state(graph_state.clone()).await;
-                let config = gateway_config(
-                    &graph_url,
-                    vec![GatewayEventEntity::WithdrawDisproveds],
-                );
+                let config =
+                    gateway_config(&graph_url, vec![GatewayEventEntity::WithdrawDisproveds]);
                 let client = GraphQueryClient::new();
 
                 event_watch_task::fetch_and_handle_block_range_events(
@@ -690,7 +676,8 @@ fn prop_withdraw_invalid_address_skips_updates() {
                 let graph_state = new_graph_mock_state();
                 clear_graph_mock_state(&graph_state);
                 let temp_db = NamedTempFile::new().unwrap();
-                let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
+                let local_db =
+                    create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, _btc_mock) = BTCClient::new_mock_client();
                 let (goat_client, _goat_mock) = GOATClient::new_mock_client();
 
@@ -737,14 +724,22 @@ fn prop_withdraw_invalid_address_skips_updates() {
                 set_graph_mock_state(
                     &graph_state,
                     GraphMockState {
-                    withdraw_happy_paths: Some(if is_happy { events.clone() } else { serde_json::json!([]) }),
-                    withdraw_unhappy_paths: Some(serde_json::json!([])),
-                    withdraw_disproveds: Some(if is_happy { serde_json::json!([]) } else { events }),
-                    init_withdraws: Some(serde_json::json!([])),
-                    cancel_withdraws: Some(serde_json::json!([])),
-                    proceed_withdraws: Some(serde_json::json!([])),
-                    ..Default::default()
-                },
+                        withdraw_happy_paths: Some(if is_happy {
+                            events.clone()
+                        } else {
+                            serde_json::json!([])
+                        }),
+                        withdraw_unhappy_paths: Some(serde_json::json!([])),
+                        withdraw_disproveds: Some(if is_happy {
+                            serde_json::json!([])
+                        } else {
+                            events
+                        }),
+                        init_withdraws: Some(serde_json::json!([])),
+                        cancel_withdraws: Some(serde_json::json!([])),
+                        proceed_withdraws: Some(serde_json::json!([])),
+                        ..Default::default()
+                    },
                 );
 
                 let graph_url = start_mock_graph_server_with_state(graph_state.clone()).await;
@@ -801,7 +796,8 @@ fn prop_withdraw_init_cancel_out_of_order() {
                 let graph_state = new_graph_mock_state();
                 clear_graph_mock_state(&graph_state);
                 let temp_db = NamedTempFile::new().unwrap();
-                let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
+                let local_db =
+                    create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, _btc_mock) = BTCClient::new_mock_client();
                 let (goat_client, _goat_mock) = GOATClient::new_mock_client();
 
@@ -817,26 +813,26 @@ fn prop_withdraw_init_cancel_out_of_order() {
                 set_graph_mock_state(
                     &graph_state,
                     GraphMockState {
-                    init_withdraws: Some(serde_json::json!([{
-                        "id": "init_1",
-                        "transactionHash": "0xinit",
-                        "blockNumber": "10",
-                        "instanceId": instance_id_hex,
-                        "graphId": graph_id_hex
-                    }])),
-                    cancel_withdraws: Some(serde_json::json!([{
-                        "id": "cancel_1",
-                        "transactionHash": "0xcancel",
-                        "blockNumber": "9",
-                        "instanceId": instance_id_hex,
-                        "graphId": graph_id_hex
-                    }])),
-                    proceed_withdraws: Some(serde_json::json!([])),
-                    withdraw_happy_paths: Some(serde_json::json!([])),
-                    withdraw_unhappy_paths: Some(serde_json::json!([])),
-                    withdraw_disproveds: Some(serde_json::json!([])),
-                    ..Default::default()
-                },
+                        init_withdraws: Some(serde_json::json!([{
+                            "id": "init_1",
+                            "transactionHash": "0xinit",
+                            "blockNumber": "10",
+                            "instanceId": instance_id_hex,
+                            "graphId": graph_id_hex
+                        }])),
+                        cancel_withdraws: Some(serde_json::json!([{
+                            "id": "cancel_1",
+                            "transactionHash": "0xcancel",
+                            "blockNumber": "9",
+                            "instanceId": instance_id_hex,
+                            "graphId": graph_id_hex
+                        }])),
+                        proceed_withdraws: Some(serde_json::json!([])),
+                        withdraw_happy_paths: Some(serde_json::json!([])),
+                        withdraw_unhappy_paths: Some(serde_json::json!([])),
+                        withdraw_disproveds: Some(serde_json::json!([])),
+                        ..Default::default()
+                    },
                 );
 
                 let graph_url = start_mock_graph_server_with_state(graph_state.clone()).await;
@@ -870,10 +866,7 @@ fn prop_withdraw_init_cancel_out_of_order() {
                 )
                 .await
                 .unwrap();
-                assert_eq!(
-                    init.processing_status,
-                    GoatTxProcessingStatus::Pending.to_string()
-                );
+                assert_eq!(init.processing_status, GoatTxProcessingStatus::Pending.to_string());
                 let cancel = test_support::get_goat_tx(
                     &mut storage,
                     &instance_id,
@@ -882,10 +875,7 @@ fn prop_withdraw_init_cancel_out_of_order() {
                 )
                 .await
                 .unwrap();
-                assert_eq!(
-                    cancel.processing_status,
-                    GoatTxProcessingStatus::Skipped.to_string()
-                );
+                assert_eq!(cancel.processing_status, GoatTxProcessingStatus::Skipped.to_string());
             });
             Ok(())
         })

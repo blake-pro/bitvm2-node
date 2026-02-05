@@ -12,21 +12,19 @@ use proptest::test_runner::{RngAlgorithm, TestRng, TestRunner};
 use serial_test::serial;
 use std::env;
 use std::sync::{Arc, Mutex};
-use store::{InstanceBridgeInStatus, InstanceBridgeOutStatus};
 use store::create_local_db;
+use store::{InstanceBridgeInStatus, InstanceBridgeOutStatus};
 use tempfile::NamedTempFile;
 use tokio::runtime::Runtime;
 
 mod test_support;
 
 fn test_config() -> ProptestConfig {
-    let mut config = ProptestConfig::default();
-    config.cases = env::var("PROPTEST_CASES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100);
-    config.failure_persistence = None;
-    config
+    ProptestConfig {
+        cases: env::var("PROPTEST_CASES").ok().and_then(|s| s.parse().ok()).unwrap_or(100),
+        failure_persistence: None,
+        ..Default::default()
+    }
 }
 
 fn build_test_runner() -> TestRunner {
@@ -98,24 +96,19 @@ fn prop_bridge_in_request_tag_creates_instance() {
                     to_addr: "0x0000000000000000000000000000000000000001".to_string(),
                     bridge_request_tx_hash: "0xbridge_req".to_string(),
                 };
-                let _ = bridge_in_request_tag(
-                    State(app_state.clone()),
-                    Json(payload),
-                )
-                .await
-                .unwrap();
+                let _ =
+                    bridge_in_request_tag(State(app_state.clone()), Json(payload)).await.unwrap();
 
                 let mut storage = app_state.local_db.acquire().await.unwrap();
                 let instances = storage
-                    .find_instances(store::localdb::InstanceQuery::default().with_is_bridge_in(true))
+                    .find_instances(
+                        store::localdb::InstanceQuery::default().with_is_bridge_in(true),
+                    )
                     .await
                     .unwrap()
                     .0;
                 assert_eq!(instances.len(), 1);
-                assert_eq!(
-                    instances[0].status,
-                    InstanceBridgeInStatus::UserIniting.to_string()
-                );
+                assert_eq!(instances[0].status, InstanceBridgeInStatus::UserIniting.to_string());
             });
             Ok(())
         })
@@ -141,24 +134,18 @@ fn prop_bridge_out_init_tag_creates_instance() {
                     to_addr: test_support::valid_btc_address(),
                     escrow_hash: format!("0x{}", "11".repeat(32)),
                 };
-                let _ = bridge_out_init_tag(
-                    State(app_state.clone()),
-                    Json(payload),
-                )
-                .await
-                .unwrap();
+                let _ = bridge_out_init_tag(State(app_state.clone()), Json(payload)).await.unwrap();
 
                 let mut storage = app_state.local_db.acquire().await.unwrap();
                 let instances = storage
-                    .find_instances(store::localdb::InstanceQuery::default().with_is_bridge_in(false))
+                    .find_instances(
+                        store::localdb::InstanceQuery::default().with_is_bridge_in(false),
+                    )
                     .await
                     .unwrap()
                     .0;
                 assert_eq!(instances.len(), 1);
-                assert_eq!(
-                    instances[0].status,
-                    InstanceBridgeOutStatus::Initialize.to_string()
-                );
+                assert_eq!(instances[0].status, InstanceBridgeOutStatus::Initialize.to_string());
             });
             Ok(())
         })

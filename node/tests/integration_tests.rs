@@ -1596,11 +1596,12 @@ async fn test_bridge_out_take2() {
     let take2_txid = SerializableTxid(BitcoinTxid::from_byte_array([4u8; 32]));
 
     // Setup ChallengeSubStatus as Normal Finished
-    let mut sub_status = ChallengeSubStatus::default();
-    sub_status.watchtower_challenge_status =
-        WatchtowerChallengeStatus::WatchtowerChallengeNormalFinished;
-    sub_status.assert_commit_status = AssertCommitStatus::OperatorCommit;
-    sub_status.commit_blockhash_status = CommitBlockHashStatus::OperatorCommit;
+    let sub_status = ChallengeSubStatus {
+        watchtower_challenge_status: WatchtowerChallengeStatus::WatchtowerChallengeNormalFinished,
+        assert_commit_status: AssertCommitStatus::OperatorCommit,
+        commit_blockhash_status: CommitBlockHashStatus::OperatorCommit,
+        ..Default::default()
+    };
 
     let graph = Graph {
         graph_id,
@@ -2596,7 +2597,7 @@ mod bridge_out_escrow_boundary_tests {
         // Verify instance created with zero amount
         let found = storage_processor.find_instance(&instance_id).await.unwrap().unwrap();
         assert_eq!(found.bridge_out_amount, "0");
-        assert_eq!(found.is_bridge_in, false);
+        assert!(!found.is_bridge_in);
     }
 
     /// Test that escrow_amount exceeding stake_amount still creates valid instance

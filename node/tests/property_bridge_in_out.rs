@@ -5,12 +5,12 @@ use bitvm2_lib::actors::Actor;
 use bitvm2_noded::scheduled_tasks::event_watch_task;
 use bitvm2_noded::utils::evm_swap_utils::IEscrowManager;
 use client::btc_chain::{BTCClient, mock_bitcoin_adaptor::MockBitcoinAdaptor};
-use client::goat_chain::{GOATClient, PeginData, PeginStatus, Utxo as GoatUtxo};
 use client::goat_chain::mock_goat_adaptor::MockAdaptor;
+use client::goat_chain::{GOATClient, PeginData, PeginStatus, Utxo as GoatUtxo};
 use client::graphs::GraphQueryClient;
 use client::graphs::graph_query::{
-    BridgeInEvent, BridgeInRequestEvent, SwapClaimEvent, SwapInitializeEvent, SwapRefundEvent,
-    GatewayEventEntity, SwapEventEntity, TheGraphConfig, WatchEventConfig,
+    BridgeInEvent, BridgeInRequestEvent, GatewayEventEntity, SwapClaimEvent, SwapEventEntity,
+    SwapInitializeEvent, SwapRefundEvent, TheGraphConfig, WatchEventConfig,
 };
 use proptest::prelude::*;
 use proptest::test_runner::{RngAlgorithm, TestRng, TestRunner};
@@ -29,13 +29,11 @@ use test_support::{
 };
 
 fn test_config() -> ProptestConfig {
-    let mut config = ProptestConfig::default();
-    config.cases = env::var("PROPTEST_CASES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100);
-    config.failure_persistence = None;
-    config
+    ProptestConfig {
+        cases: env::var("PROPTEST_CASES").ok().and_then(|s| s.parse().ok()).unwrap_or(100),
+        failure_persistence: None,
+        ..Default::default()
+    }
 }
 
 fn build_test_runner() -> TestRunner {
@@ -132,7 +130,7 @@ fn setup_clients() -> (Arc<BTCClient>, MockBitcoinAdaptor, Arc<GOATClient>, Mock
 }
 
 fn setup_goat_pegin_data(goat_mock: &MockAdaptor, instance_id_hex: &str) {
-    let instance_id = uuid::Uuid::from_str(&instance_id_hex.trim_start_matches("0x")).unwrap();
+    let instance_id = uuid::Uuid::from_str(instance_id_hex.trim_start_matches("0x")).unwrap();
     let btc_addr = valid_btc_address();
     let input_txid = [1u8; 32];
     let pegin_data = PeginData {
@@ -142,11 +140,7 @@ fn setup_goat_pegin_data(goat_mock: &MockAdaptor, instance_id_hex: &str) {
         pegin_amount_sats: 100000,
         created_at: 1,
         pegin_txid: [0u8; 32],
-        user_inputs: vec![GoatUtxo {
-            txid: input_txid,
-            vout: 0,
-            amount_sats: 100000,
-        }],
+        user_inputs: vec![GoatUtxo { txid: input_txid, vout: 0, amount_sats: 100000 }],
         committee_addresses: vec![[4u8; 20].into()],
         committee_pubkeys: vec![vec![2u8; 33]],
         user_xonly_pubkey: [2u8; 32],
@@ -157,7 +151,11 @@ fn setup_goat_pegin_data(goat_mock: &MockAdaptor, instance_id_hex: &str) {
     goat_mock.set_pegin_data(*instance_id.as_bytes(), pegin_data);
 }
 
-fn setup_swap_traces(goat_mock: &MockAdaptor, swap_contract: Address, escrow_data: IEscrowManager::EscrowData) {
+fn setup_swap_traces(
+    goat_mock: &MockAdaptor,
+    swap_contract: Address,
+    escrow_data: IEscrowManager::EscrowData,
+) {
     let init_call = IEscrowManager::initializeCall {
         escrow: escrow_data.clone(),
         signature: Bytes::new(),
@@ -188,9 +186,9 @@ fn setup_swap_traces(goat_mock: &MockAdaptor, swap_contract: Address, escrow_dat
     witness.extend_from_slice(&[0u8; 160]);
     witness.extend_from_slice(&0u32.to_be_bytes());
     let compressed = bitcoin::CompressedPublicKey::from_slice(&[
-        0x02, 0x50, 0x86, 0x3a, 0xd6, 0x4a, 0x87, 0xae, 0x8a, 0x2f, 0xe8, 0x3c, 0x1a, 0xf1,
-        0xa8, 0x40, 0x3c, 0xb5, 0x3f, 0x53, 0xe4, 0x86, 0xd8, 0x51, 0x1d, 0xad, 0x8a, 0x04,
-        0x88, 0x7e, 0x5b, 0x23, 0x52,
+        0x02, 0x50, 0x86, 0x3a, 0xd6, 0x4a, 0x87, 0xae, 0x8a, 0x2f, 0xe8, 0x3c, 0x1a, 0xf1, 0xa8,
+        0x40, 0x3c, 0xb5, 0x3f, 0x53, 0xe4, 0x86, 0xd8, 0x51, 0x1d, 0xad, 0x8a, 0x04, 0x88, 0x7e,
+        0x5b, 0x23, 0x52,
     ])
     .unwrap();
     let to_addr = bitcoin::Address::p2wpkh(&compressed, bitvm2_noded::env::get_network());
@@ -228,9 +226,9 @@ fn setup_swap_traces(goat_mock: &MockAdaptor, swap_contract: Address, escrow_dat
 
 fn valid_btc_address() -> String {
     let compressed = bitcoin::CompressedPublicKey::from_slice(&[
-        0x02, 0x50, 0x86, 0x3a, 0xd6, 0x4a, 0x87, 0xae, 0x8a, 0x2f, 0xe8, 0x3c, 0x1a, 0xf1,
-        0xa8, 0x40, 0x3c, 0xb5, 0x3f, 0x53, 0xe4, 0x86, 0xd8, 0x51, 0x1d, 0xad, 0x8a, 0x04,
-        0x88, 0x7e, 0x5b, 0x23, 0x52,
+        0x02, 0x50, 0x86, 0x3a, 0xd6, 0x4a, 0x87, 0xae, 0x8a, 0x2f, 0xe8, 0x3c, 0x1a, 0xf1, 0xa8,
+        0x40, 0x3c, 0xb5, 0x3f, 0x53, 0xe4, 0x86, 0xd8, 0x51, 0x1d, 0xad, 0x8a, 0x04, 0x88, 0x7e,
+        0x5b, 0x23, 0x52,
     ])
     .unwrap();
     bitcoin::Address::p2wpkh(&compressed, bitvm2_noded::env::get_network()).to_string()
@@ -254,11 +252,7 @@ fn setup_env() {
 #[serial]
 fn property_bridge_out_stats_conservation() {
     let mut runner = build_test_runner();
-    let strat = prop_oneof![
-        Just((0u8, 0u8)),
-        Just((1u8, 0u8)),
-        Just((0u8, 1u8)),
-    ];
+    let strat = prop_oneof![Just((0u8, 0u8)), Just((1u8, 0u8)), Just((0u8, 1u8)),];
 
     runner
         .run(&strat, |(claim_count, refund_count)| {
@@ -267,10 +261,12 @@ fn property_bridge_out_stats_conservation() {
                 let graph_state = new_graph_mock_state();
                 clear_graph_mock_state(&graph_state);
                 let temp_db = NamedTempFile::new().unwrap();
-                let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
+                let local_db =
+                    create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, _btc_mock, goat_client, goat_mock) = setup_clients();
 
-                let swap_contract = Address::from_str("0x0000000000000000000000000000000000000000").unwrap();
+                let swap_contract =
+                    Address::from_str("0x0000000000000000000000000000000000000000").unwrap();
                 let escrow_data = IEscrowManager::EscrowData {
                     offerer: Address::ZERO,
                     claimer: Address::ZERO,
@@ -301,14 +297,17 @@ fn property_bridge_out_stats_conservation() {
                     refunds.push(build_swap_refund_event(&escrow_hash_hex));
                 }
 
-                set_graph_mock_state(&graph_state, GraphMockState {
-                    initializes: Some(serde_json::to_value(initializes).unwrap()),
-                    claims: Some(serde_json::to_value(claims).unwrap()),
-                    refunds: Some(serde_json::to_value(refunds).unwrap()),
-                    bridge_in_requests: None,
-                    bridge_ins: None,
-                    ..Default::default()
-                });
+                set_graph_mock_state(
+                    &graph_state,
+                    GraphMockState {
+                        initializes: Some(serde_json::to_value(initializes).unwrap()),
+                        claims: Some(serde_json::to_value(claims).unwrap()),
+                        refunds: Some(serde_json::to_value(refunds).unwrap()),
+                        bridge_in_requests: None,
+                        bridge_ins: None,
+                        ..Default::default()
+                    },
+                );
 
                 let graph_url = start_mock_graph_server_with_state(graph_state.clone()).await;
 
@@ -368,21 +367,20 @@ fn property_bridge_out_stats_conservation() {
                 .unwrap();
 
                 let mut storage = local_db.acquire().await.unwrap();
-                let stats = storage
-                    .find_bridge_out_global_stats_by_id(1)
-                    .await
-                    .unwrap()
-                    .unwrap_or_else(|| store::BridgeOutGlobalStats {
-                        id: 1,
-                        initial_txn: 0,
-                        initial_amount: "0".to_string(),
-                        claim_txn: 0,
-                        claim_amount: "0".to_string(),
-                        refund_txn: 0,
-                        refund_amount: "0".to_string(),
-                        created_at: 0,
-                        updated_at: 0,
-                    });
+                let stats =
+                    storage.find_bridge_out_global_stats_by_id(1).await.unwrap().unwrap_or_else(
+                        || store::BridgeOutGlobalStats {
+                            id: 1,
+                            initial_txn: 0,
+                            initial_amount: "0".to_string(),
+                            claim_txn: 0,
+                            claim_amount: "0".to_string(),
+                            refund_txn: 0,
+                            refund_amount: "0".to_string(),
+                            created_at: 0,
+                            updated_at: 0,
+                        },
+                    );
                 let initial = U256::from_str(&stats.initial_amount).unwrap_or_default();
                 let claim = U256::from_str(&stats.claim_amount).unwrap_or_default();
                 let refund = U256::from_str(&stats.refund_amount).unwrap_or_default();
@@ -406,7 +404,8 @@ fn property_bridge_in_idempotency() {
                 let graph_state = new_graph_mock_state();
                 clear_graph_mock_state(&graph_state);
                 let temp_db = NamedTempFile::new().unwrap();
-                let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
+                let local_db =
+                    create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, _btc_mock, goat_client, goat_mock) = setup_clients();
 
                 let instance_id_hex = test_support::test_fixtures::instance_id_hex();
@@ -415,22 +414,31 @@ fn property_bridge_in_idempotency() {
                 let bridge_in_req = build_bridge_in_request_event(&instance_id_hex);
                 let bridge_in = build_bridge_in_event(&instance_id_hex);
 
-                set_graph_mock_state(&graph_state, GraphMockState {
-                    initializes: None,
-                    claims: None,
-                    refunds: None,
-                    bridge_in_requests: Some(serde_json::to_value(vec![bridge_in_req]).unwrap()),
-                    bridge_ins: Some(serde_json::to_value(vec![bridge_in]).unwrap()),
-                    ..Default::default()
-                });
+                set_graph_mock_state(
+                    &graph_state,
+                    GraphMockState {
+                        initializes: None,
+                        claims: None,
+                        refunds: None,
+                        bridge_in_requests: Some(
+                            serde_json::to_value(vec![bridge_in_req]).unwrap(),
+                        ),
+                        bridge_ins: Some(serde_json::to_value(vec![bridge_in]).unwrap()),
+                        ..Default::default()
+                    },
+                );
 
                 let graph_url = start_mock_graph_server_with_state(graph_state.clone()).await;
 
                 let client = GraphQueryClient::new();
                 let config_gateway = WatchEventConfig::Gateway(TheGraphConfig {
-                    address: Address::from_str("0x0000000000000000000000000000000000000000").unwrap(),
+                    address: Address::from_str("0x0000000000000000000000000000000000000000")
+                        .unwrap(),
                     the_graph_url: graph_url.clone(),
-                    event_entities: vec![GatewayEventEntity::BridgeInRequests, GatewayEventEntity::BridgeIns],
+                    event_entities: vec![
+                        GatewayEventEntity::BridgeInRequests,
+                        GatewayEventEntity::BridgeIns,
+                    ],
                 });
 
                 for _ in 0..=repeat_times {
@@ -450,7 +458,8 @@ fn property_bridge_in_idempotency() {
                 }
 
                 let mut storage = local_db.acquire().await.unwrap();
-                let instance_id = uuid::Uuid::from_str(&instance_id_hex.trim_start_matches("0x")).unwrap();
+                let instance_id =
+                    uuid::Uuid::from_str(instance_id_hex.trim_start_matches("0x")).unwrap();
                 let instance = storage.find_instance(&instance_id).await.unwrap();
                 assert!(instance.is_some());
                 assert_eq!(

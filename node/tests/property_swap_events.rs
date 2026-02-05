@@ -7,7 +7,7 @@ use client::btc_chain::BTCClient;
 use client::goat_chain::GOATClient;
 use client::graphs::GraphQueryClient;
 use client::graphs::graph_query::{
-    SwapEventEntity, SwapInitializeEvent, SwapClaimEvent, SwapRefundEvent, TheGraphConfig,
+    SwapClaimEvent, SwapEventEntity, SwapInitializeEvent, SwapRefundEvent, TheGraphConfig,
     WatchEventConfig,
 };
 use proptest::prelude::*;
@@ -17,8 +17,8 @@ use std::env;
 use std::str::FromStr;
 use std::sync::Arc;
 use store::InstanceBridgeOutStatus;
-use store::localdb::InstanceQuery;
 use store::create_local_db;
+use store::localdb::InstanceQuery;
 use tempfile::NamedTempFile;
 use tokio::runtime::Runtime;
 
@@ -29,13 +29,11 @@ use test_support::{
 };
 
 fn test_config() -> ProptestConfig {
-    let mut config = ProptestConfig::default();
-    config.cases = env::var("PROPTEST_CASES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100);
-    config.failure_persistence = None;
-    config
+    ProptestConfig {
+        cases: env::var("PROPTEST_CASES").ok().and_then(|s| s.parse().ok()).unwrap_or(100),
+        failure_persistence: None,
+        ..Default::default()
+    }
 }
 
 fn build_test_runner() -> TestRunner {
@@ -109,7 +107,11 @@ fn build_refund_event(escrow_hash: &str) -> SwapRefundEvent {
     }
 }
 
-fn setup_swap_traces(goat_client: &client::goat_chain::mock_goat_adaptor::MockAdaptor, swap_contract: Address, escrow_data: IEscrowManager::EscrowData) {
+fn setup_swap_traces(
+    goat_client: &client::goat_chain::mock_goat_adaptor::MockAdaptor,
+    swap_contract: Address,
+    escrow_data: IEscrowManager::EscrowData,
+) {
     let init_call = IEscrowManager::initializeCall {
         escrow: escrow_data.clone(),
         signature: alloy::primitives::Bytes::new(),
@@ -142,9 +144,9 @@ fn setup_swap_traces(goat_client: &client::goat_chain::mock_goat_adaptor::MockAd
     witness.extend_from_slice(&[0u8; 160]);
     witness.extend_from_slice(&0u32.to_be_bytes());
     let compressed = bitcoin::CompressedPublicKey::from_slice(&[
-        0x02, 0x50, 0x86, 0x3a, 0xd6, 0x4a, 0x87, 0xae, 0x8a, 0x2f, 0xe8, 0x3c, 0x1a, 0xf1,
-        0xa8, 0x40, 0x3c, 0xb5, 0x3f, 0x53, 0xe4, 0x86, 0xd8, 0x51, 0x1d, 0xad, 0x8a, 0x04,
-        0x88, 0x7e, 0x5b, 0x23, 0x52,
+        0x02, 0x50, 0x86, 0x3a, 0xd6, 0x4a, 0x87, 0xae, 0x8a, 0x2f, 0xe8, 0x3c, 0x1a, 0xf1, 0xa8,
+        0x40, 0x3c, 0xb5, 0x3f, 0x53, 0xe4, 0x86, 0xd8, 0x51, 0x1d, 0xad, 0x8a, 0x04, 0x88, 0x7e,
+        0x5b, 0x23, 0x52,
     ])
     .unwrap();
     let to_addr = bitcoin::Address::p2wpkh(&compressed, bitvm2_noded::env::get_network());
@@ -186,11 +188,7 @@ fn setup_swap_traces(goat_client: &client::goat_chain::mock_goat_adaptor::MockAd
 #[serial]
 fn prop_swap_initialize_claim_refund() {
     let mut runner = build_test_runner();
-    let strat = prop_oneof![
-        Just((false, false)),
-        Just((true, false)),
-        Just((false, true)),
-    ];
+    let strat = prop_oneof![Just((false, false)), Just((true, false)), Just((false, true)),];
 
     runner
         .run(&strat, |(do_claim, do_refund)| {
@@ -199,13 +197,15 @@ fn prop_swap_initialize_claim_refund() {
                 let graph_state = new_graph_mock_state();
                 clear_graph_mock_state(&graph_state);
                 let temp_db = NamedTempFile::new().unwrap();
-                let local_db = create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
+                let local_db =
+                    create_local_db(&format!("sqlite:{}", temp_db.path().display())).await;
                 let (btc_client, _btc_mock) = BTCClient::new_mock_client();
                 let (goat_client, goat_mock) = GOATClient::new_mock_client();
                 let btc_client = Arc::new(btc_client);
                 let goat_client = Arc::new(goat_client);
 
-                let swap_contract = Address::from_str("0x0000000000000000000000000000000000000000").unwrap();
+                let swap_contract =
+                    Address::from_str("0x0000000000000000000000000000000000000000").unwrap();
                 let escrow_data = IEscrowManager::EscrowData {
                     offerer: Address::ZERO,
                     claimer: Address::ZERO,
@@ -227,15 +227,20 @@ fn prop_swap_initialize_claim_refund() {
                 setup_swap_traces(&goat_mock, swap_contract, escrow_data.clone());
 
                 let initializes = vec![build_initialize_event(&escrow_hash_hex)];
-                let claims = if do_claim { vec![build_claim_event(&escrow_hash_hex)] } else { vec![] };
-                let refunds = if do_refund { vec![build_refund_event(&escrow_hash_hex)] } else { vec![] };
+                let claims =
+                    if do_claim { vec![build_claim_event(&escrow_hash_hex)] } else { vec![] };
+                let refunds =
+                    if do_refund { vec![build_refund_event(&escrow_hash_hex)] } else { vec![] };
 
-                set_graph_mock_state(&graph_state, GraphMockState {
-                    initializes: Some(serde_json::to_value(initializes).unwrap()),
-                    claims: Some(serde_json::to_value(claims).unwrap()),
-                    refunds: Some(serde_json::to_value(refunds).unwrap()),
-                    ..Default::default()
-                });
+                set_graph_mock_state(
+                    &graph_state,
+                    GraphMockState {
+                        initializes: Some(serde_json::to_value(initializes).unwrap()),
+                        claims: Some(serde_json::to_value(claims).unwrap()),
+                        refunds: Some(serde_json::to_value(refunds).unwrap()),
+                        ..Default::default()
+                    },
+                );
 
                 let graph_url = start_mock_graph_server_with_state(graph_state.clone()).await;
                 let config_init = WatchEventConfig::Swap(TheGraphConfig {

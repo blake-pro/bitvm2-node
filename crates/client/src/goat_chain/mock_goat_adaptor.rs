@@ -36,6 +36,7 @@ pub struct MockAdaptor {
     gateway_contract_config: Arc<Mutex<GatewayContractConfig>>,
     pegin_data_store: Arc<Mutex<HashMap<[u8; 16], PeginData>>>,
     graph_data_store: Arc<Mutex<HashMap<[u8; 16], GraphData>>>,
+    withdraw_data_store: Arc<Mutex<HashMap<[u8; 16], WithdrawData>>>,
     traces: Arc<Mutex<HashMap<String, GethTrace>>>,
     quorum_size: Arc<Mutex<u64>>,
     gateway_answer_pegin_request_calls: Arc<AtomicUsize>,
@@ -83,6 +84,12 @@ impl MockAdaptor {
 
     pub fn set_graph_data(&self, graph_id: [u8; 16], data: GraphData) {
         if let Ok(mut h) = self.graph_data_store.lock() {
+            h.insert(graph_id, data);
+        }
+    }
+
+    pub fn set_withdraw_data(&self, graph_id: [u8; 16], data: WithdrawData) {
+        if let Ok(mut h) = self.withdraw_data_store.lock() {
             h.insert(graph_id, data);
         }
     }
@@ -234,21 +241,25 @@ impl ChainAdaptor for MockAdaptor {
         bail!("not find pegin data")
     }
 
-    async fn gateway_get_withdraw_data(
-        &self,
-        _graph_id: &[u8; 16],
-    ) -> anyhow::Result<WithdrawData> {
+    async fn gateway_get_withdraw_data(&self, graph_id: &[u8; 16]) -> anyhow::Result<WithdrawData> {
         info!("call get_withdraw_data");
+        if let Ok(store) = self.withdraw_data_store.lock()
+            && let Some(data) = store.get(graph_id)
+        {
+            return Ok(data.clone());
+        }
+
         bail!("not find withdraw data")
     }
 
     async fn gateway_get_graph_data(&self, graph_id: &[u8; 16]) -> anyhow::Result<GraphData> {
         info!("call get_operator_data");
-        if let Ok(store) = self.graph_data_store.lock() {
-            if let Some(data) = store.get(graph_id) {
-                return Ok(data.clone());
-            }
+        if let Ok(store) = self.graph_data_store.lock()
+            && let Some(data) = store.get(graph_id)
+        {
+            return Ok(data.clone());
         }
+
         bail!("not find operator data")
     }
 
@@ -557,6 +568,7 @@ impl MockAdaptor {
             gateway_contract_config: Arc::new(Mutex::new(Default::default())),
             pegin_data_store: Arc::new(Mutex::new(HashMap::new())),
             graph_data_store: Arc::new(Mutex::new(HashMap::new())),
+            withdraw_data_store: Arc::new(Mutex::new(HashMap::new())),
             traces: Arc::new(Mutex::new(HashMap::new())),
             quorum_size: Arc::new(Mutex::new(0)),
             gateway_answer_pegin_request_calls: Arc::new(AtomicUsize::new(0)),

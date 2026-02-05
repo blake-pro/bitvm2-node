@@ -16,14 +16,16 @@ use bitvm2_lib::types::{Bitvm2Graph, SimplifiedBitvm2Graph};
 use client::goat_chain::DisproveTxType;
 use client::http_client::async_client::HttpAsyncClient;
 use client::{btc_chain::BTCClient, goat_chain::GOATClient};
+#[cfg(not(test))]
+use libp2p::gossipsub;
 use libp2p::gossipsub::MessageId;
-use libp2p::{PeerId, Swarm, gossipsub};
+use libp2p::{PeerId, Swarm};
 use musig2::{PartialSignature, PubNonce};
-#[cfg(any(test, dispatch_test))]
+#[cfg(test)]
 use once_cell::sync::Lazy;
 use secp256k1::schnorr::Signature as SchnorrSignature;
 use serde::{Deserialize, Serialize};
-#[cfg(any(test, dispatch_test))]
+#[cfg(test)]
 use std::sync::{Arc, Mutex};
 use store::MessageState;
 use store::localdb::LocalDB;
@@ -458,7 +460,7 @@ pub async fn try_finalize_graph(
     Ok(())
 }
 
-#[cfg(not(any(test, dispatch_test)))]
+#[cfg(not(test))]
 pub async fn send_to_peer(
     swarm: &mut Swarm<AllBehaviours>,
     message: GOATMessage,
@@ -470,30 +472,6 @@ pub async fn send_to_peer(
         .behaviour_mut()
         .gossipsub
         .publish(gossipsub_topic, message.serialize_message().await?)?)
-}
-
-#[cfg(any(test, dispatch_test))]
-static TEST_SEND_HOOK: Lazy<
-    Mutex<Option<Arc<dyn Fn(GOATMessage) -> Result<MessageId> + Send + Sync>>>,
-> = Lazy::new(|| Mutex::new(None));
-
-#[cfg(any(test, dispatch_test))]
-pub fn set_test_send_hook(
-    hook: Option<Arc<dyn Fn(GOATMessage) -> Result<MessageId> + Send + Sync>>,
-) {
-    let mut guard = TEST_SEND_HOOK.lock().expect("TEST_SEND_HOOK poisoned");
-    *guard = hook;
-}
-
-#[cfg(any(test, dispatch_test))]
-pub async fn send_to_peer(
-    _swarm: &mut Swarm<AllBehaviours>,
-    message: GOATMessage,
-) -> Result<MessageId> {
-    if let Some(hook) = TEST_SEND_HOOK.lock().expect("TEST_SEND_HOOK poisoned").as_ref() {
-        return hook(message);
-    }
-    Ok(GOATMessage::default_message_id())
 }
 
 pub async fn push_local_unhandled_messages(
@@ -565,4 +543,21 @@ pub async fn try_send_sync_graph_request(
     let message = GOATMessage::new(Actor::All, message_content);
     send_to_peer(swarm, message).await?;
     Ok(())
+}
+
+#[cfg(test)]
+type TestSendHook = Arc<dyn Fn(GOATMessage) -> Result<MessageId> + Send + Sync>;
+
+#[cfg(test)]
+static TEST_SEND_HOOK: Lazy<Mutex<Option<TestSendHook>>> = Lazy::new(|| Mutex::new(None));
+
+#[cfg(test)]
+pub async fn send_to_peer(
+    _swarm: &mut Swarm<AllBehaviours>,
+    message: GOATMessage,
+) -> Result<MessageId> {
+    if let Some(hook) = TEST_SEND_HOOK.lock().expect("TEST_SEND_HOOK poisoned").as_ref() {
+        return hook(message);
+    }
+    Ok(GOATMessage::default_message_id())
 }

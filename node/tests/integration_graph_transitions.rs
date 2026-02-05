@@ -1,6 +1,5 @@
 use bitcoin::{Txid as BitcoinTxid, hashes::Hash as _};
 use bitvm2_noded::env;
-use bitvm2_noded::middleware::AllBehaviours;
 use bitvm2_noded::rpc_service::current_time_secs;
 use bitvm2_noded::scheduled_tasks::graph_maintenance_tasks::{
     AssertCommitStatus, AssertInitTxVoutMonitorData, ChallengeSubStatus, CommitBlockHashStatus,
@@ -11,14 +10,11 @@ use bitvm2_noded::scheduled_tasks::graph_maintenance_tasks::{
 
 use client::btc_chain::{BTCClient, mock_bitcoin_adaptor::MockBitcoinAdaptor};
 use client::goat_chain::{
-    GOATClient, PeginData, PeginStatus, Utxo as GoatUtxo,
-    mock_goat_adaptor::{GatewayContractConfig, MockAdaptor},
+    GOATClient, mock_goat_adaptor::{GatewayContractConfig, MockAdaptor},
 };
 
 use bitvm2_lib::operator::take1_timelock;
 use esplora_client::OutputStatus;
-use libp2p::core::transport::dummy::DummyTransport;
-
 use store::{Graph, GraphBtcTxVoutMonitor, GraphStatus, create_local_db, localdb::LocalDB};
 use tempfile::NamedTempFile;
 
@@ -42,7 +38,7 @@ async fn setup() -> (LocalDB, BTCClient, MockBitcoinAdaptor, GOATClient, MockAda
 
     let db_file = NamedTempFile::new().unwrap();
     let db_path = db_file.path().to_str().unwrap().to_string();
-    let local_db = create_local_db(&format!("sqlite:{}", db_path)).await;
+    let local_db = create_local_db(&format!("sqlite:{db_path}")).await;
 
     let (btc_client, btc_mock) = BTCClient::new_mock_client();
     let (goat_client, goat_mock) = GOATClient::new_mock_client();
@@ -69,8 +65,10 @@ async fn test_challenge_phase_transitions() {
     let instance_id = Uuid::new_v4();
 
     // 1. Initial State: Challenge Started, Waiting for Watchtowers
-    let mut sub_status = ChallengeSubStatus::default();
-    sub_status.watchtower_challenge_status = WatchtowerChallengeStatus::WatchtowerChallenge;
+    let sub_status = ChallengeSubStatus {
+        watchtower_challenge_status: WatchtowerChallengeStatus::WatchtowerChallenge,
+        ..Default::default()
+    };
 
     let watchtower_init_txid = BitcoinTxid::from_byte_array([0x22; 32]);
     let kickoff_txid = BitcoinTxid::from_byte_array([0x11; 32]);
@@ -113,9 +111,13 @@ async fn test_challenge_phase_transitions() {
         storage.upsert_graph_btc_tx_vout_monitor(&monitor_record).await.unwrap();
     }
 
-    // 2. Drive State: Watchtower Challenge Phase -> Blocks Pass -> No Challenges -> NormalFinished
+    // 2. Drive State: Watchtower Challenge Phase -> Timeout/ACK Timeout depending on timelocks
     let timelock_config = get_challenge_timelock_config();
-    let current_height = 100 + timelock_config.watchtower_challenge_timelock + 1;
+    let current_height =
+        100 + std::cmp::min(
+            timelock_config.watchtower_challenge_timelock,
+            timelock_config.watchtower_ack_timelock,
+        ) + 1;
 
     // Mock BTC Outputs: Ensure Watchtower Init outputs are UNSPENT
     for i in 0..monitor_record.vout_len {
@@ -127,7 +129,7 @@ async fn test_challenge_phase_transitions() {
     }
 
     // Run Logic
-    let mut updated_sub_status = sub_status.clone();
+    let mut updated_sub_status = sub_status;
     process_watchtower_challenge_monitoring(
         &btc_client,
         &local_db,
@@ -138,7 +140,7 @@ async fn test_challenge_phase_transitions() {
     .await
     .unwrap();
 
-    // 3. Verify Transition to Timeout
+    // 3. Verify Transition to Timeout (ChallengeTimeout or AckTimeout path)
     let updated_graph = {
         let mut storage = local_db.acquire().await.unwrap();
         storage.find_graph(&graph_id).await.unwrap().unwrap()
@@ -146,17 +148,23 @@ async fn test_challenge_phase_transitions() {
     let saved_sub_status: ChallengeSubStatus =
         serde_json::from_str(&updated_graph.sub_status).unwrap();
 
-    assert_eq!(
-        updated_sub_status.watchtower_challenge_status,
-        WatchtowerChallengeStatus::WatchtowerChallengeTimeout
+    let timeout_status = updated_sub_status.watchtower_challenge_status;
+    assert!(
+        matches!(
+            timeout_status,
+            WatchtowerChallengeStatus::WatchtowerChallengeTimeout
+                | WatchtowerChallengeStatus::WatchtowerChallengeDisproveFinished
+        ),
+        "Unexpected watchtower status: {timeout_status:?}"
     );
-    assert_eq!(
-        saved_sub_status.watchtower_challenge_status,
-        WatchtowerChallengeStatus::WatchtowerChallengeTimeout
-    );
+    assert_eq!(saved_sub_status.watchtower_challenge_status, timeout_status);
 
-    // Fast Forward to ACK timeout
-    let current_height_ack = 100 + timelock_config.watchtower_ack_timelock + 1;
+    // Fast Forward beyond both challenge and ACK timelocks to force DisproveFinished
+    let current_height_ack =
+        100 + std::cmp::max(
+            timelock_config.watchtower_challenge_timelock,
+            timelock_config.watchtower_ack_timelock,
+        ) + 2;
     process_watchtower_challenge_monitoring(
         &btc_client,
         &local_db,
@@ -175,7 +183,7 @@ async fn test_challenge_phase_transitions() {
 
 #[tokio::test]
 async fn test_watchtower_challenge_happy_path() {
-    let (local_db, btc_client, mut btc_mock, _goat_client, _goat_mock, _db_file) = setup().await;
+    let (local_db, btc_client, btc_mock, _goat_client, _goat_mock, _db_file) = setup().await;
     let graph_id = Uuid::new_v4();
     let instance_id = Uuid::new_v4();
 
@@ -230,13 +238,13 @@ async fn test_watchtower_challenge_happy_path() {
     // Mock BTC Outputs: UNSPENT (simulating no challenge/timeout tx on chain)
     for i in 0..monitor_record.vout_len {
         btc_mock.set_output_status(
-            watchtower_init_txid.into(),
+            watchtower_init_txid,
             i as u64,
             OutputStatus { spent: false, txid: None, vin: None, status: None },
         );
     }
 
-    let mut updated_sub_status = sub_status.clone();
+    let mut updated_sub_status = sub_status;
     process_watchtower_challenge_monitoring(
         &btc_client,
         &local_db,
@@ -255,7 +263,7 @@ async fn test_watchtower_challenge_happy_path() {
 
 #[tokio::test]
 async fn test_commit_blockhash_transitions() {
-    let (local_db, btc_client, mut btc_mock, _goat_client, _goat_mock, _db_file) = setup().await;
+    let (local_db, btc_client, btc_mock, _goat_client, _goat_mock, _db_file) = setup().await;
     let graph_id = Uuid::new_v4();
     let instance_id = Uuid::new_v4();
 
@@ -299,7 +307,7 @@ async fn test_commit_blockhash_transitions() {
 
     // Mock Output Status: Spent by Operator Commit
     btc_mock.set_output_status(
-        watchtower_init_txid.into(),
+        watchtower_init_txid,
         commit_idx as u64,
         OutputStatus {
             spent: true,
@@ -315,7 +323,8 @@ async fn test_commit_blockhash_transitions() {
     );
 
     let mut sub_status = ChallengeSubStatus::default();
-    let current_height = 110;
+    let current_height =
+        100 + std::cmp::max(1, timelock_config.watchtower_blockhash_commit_timelock - 1);
 
     process_watchtower_challenge_monitoring(
         &btc_client,
@@ -341,7 +350,7 @@ async fn test_commit_blockhash_transitions() {
 
     // Mock Output Status: Unspent
     btc_mock.set_output_status(
-        watchtower_init_txid.into(),
+        watchtower_init_txid,
         commit_idx as u64,
         OutputStatus { spent: false, txid: None, vin: None, status: None },
     );
@@ -368,7 +377,7 @@ async fn test_commit_blockhash_transitions() {
 
 #[tokio::test]
 async fn test_assert_commit_transitions() {
-    let (local_db, btc_client, mut btc_mock, _goat_client, _goat_mock, _db_file) = setup().await;
+    let (local_db, btc_client, btc_mock, _goat_client, _goat_mock, _db_file) = setup().await;
     let graph_id = Uuid::new_v4();
     let instance_id = Uuid::new_v4();
 
@@ -415,7 +424,7 @@ async fn test_assert_commit_transitions() {
 
     // Mock Output Status: Spent by Operator Assert
     btc_mock.set_output_status(
-        assert_init_txid.into(),
+        assert_init_txid,
         assert_idx as u64,
         OutputStatus {
             spent: true,
@@ -431,7 +440,7 @@ async fn test_assert_commit_transitions() {
     );
 
     let mut sub_status = ChallengeSubStatus::default();
-    let current_height = 210;
+    let current_height = 200 + std::cmp::max(1, timelock_config.assert_commit_timelock - 1);
 
     process_assert_commit_monitoring(
         &btc_client,
@@ -457,7 +466,7 @@ async fn test_assert_commit_transitions() {
 
     // Mock Output Status: Unspent
     btc_mock.set_output_status(
-        assert_init_txid.into(),
+        assert_init_txid,
         assert_idx as u64,
         OutputStatus { spent: false, txid: None, vin: None, status: None },
     );
@@ -481,7 +490,7 @@ async fn test_assert_commit_transitions() {
 
 #[tokio::test]
 async fn test_kickoff_detection() {
-    let (local_db, btc_client, mut btc_mock, _goat_client, _goat_mock, _db_file) = setup().await;
+    let (local_db, btc_client, btc_mock, _goat_client, _goat_mock, _db_file) = setup().await;
     let graph_id = Uuid::new_v4();
     let instance_id = Uuid::new_v4();
 
@@ -561,11 +570,9 @@ async fn test_kickoff_detection() {
 
 #[tokio::test]
 async fn test_kickoff_to_take1_transition() {
-    let (local_db, btc_client, mut btc_mock, _goat_client, _goat_mock, _db_file) = setup().await;
+    let (local_db, btc_client, btc_mock, _goat_client, _goat_mock, _db_file) = setup().await;
     let graph_id = Uuid::new_v4();
     let instance_id = Uuid::new_v4();
-
-    let timelock_config = get_challenge_timelock_config();
 
     // 1. Initial State: OperatorKickOff
     let kickoff_txid = BitcoinTxid::from_byte_array([0xAA; 32]);

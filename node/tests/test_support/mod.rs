@@ -111,7 +111,7 @@ fn build_graph_mock_response(
     let hash_str = hex::encode(hash);
 
     let matches_query = |pattern: &str| -> bool {
-        Regex::new(&format!(r"\b{}\b", pattern)).map(|re| re.is_match(query)).unwrap_or(false)
+        Regex::new(&format!(r"\b{pattern}\b")).map(|re| re.is_match(query)).unwrap_or(false)
     };
 
     if matches_query("initializes") {
