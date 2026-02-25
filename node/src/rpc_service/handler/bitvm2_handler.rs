@@ -468,6 +468,7 @@ pub async fn get_instances(
     for instance in instances {
         let item = InstanceExtended::convert_from_instance(
             &app_state.btc_client,
+            &app_state.goat_client,
             btc_current_height,
             response_window_blocks as i64,
             instance,
@@ -582,6 +583,7 @@ pub async fn get_instance(
         let instance_wrap = Some(
             InstanceExtended::convert_from_instance(
                 &app_state.btc_client,
+                &app_state.goat_client,
                 btc_current_height,
                 response_window_blocks as i64,
                 instance,

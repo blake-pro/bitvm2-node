@@ -9,6 +9,7 @@ use alloy::primitives::U256;
 use bitcoin::Txid;
 use client::Utxo;
 use client::btc_chain::BTCClient;
+use client::goat_chain::GOATClient;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::default::Default;
@@ -226,16 +227,29 @@ pub struct InstanceExtended {
 impl InstanceExtended {
     pub async fn convert_from_instance(
         btc_client: &BTCClient,
+        goat_client: &GOATClient,
         btc_current_height: u32,
         response_window_blocks: i64,
         instance: Instance,
     ) -> anyhow::Result<Self> {
-        let utxos: Vec<Utxo> = serde_json::from_str(&instance.input_utxos).map_err(|e| {
+        let mut utxos: Vec<Utxo> = serde_json::from_str(&instance.input_utxos).map_err(|e| {
             anyhow::Error::msg(format!(
                 "convert input utxos:{} failed, error:{}",
                 instance.input_utxos, e
             ))
         })?;
+
+        // If utxos is empty (e.g., during UserIniting), try fetching from GOAT
+        if utxos.is_empty() && instance.is_bridge_in {
+            if let Ok(pegin_data) = goat_client.gateway_get_pegin_data(&instance.instance_id).await
+            {
+                utxos = pegin_data
+                    .user_inputs
+                    .into_iter()
+                    .map(|u| Utxo { txid: u.txid, vout: u.vout, amount_sats: u.amount_sats })
+                    .collect();
+            }
+        }
         let (confirmations, target_confirmations) = get_instance_block_confirm_progress(
             btc_client,
             btc_current_height,
