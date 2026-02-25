@@ -286,7 +286,7 @@ async fn get_instance_status_extra(
     let mut status_extra = StatusExtra::default();
     if is_bridge_in && let Ok(bridge_in_status) = InstanceBridgeInStatus::from_str(&status) {
         match bridge_in_status {
-            InstanceBridgeInStatus::UserInited => {
+            InstanceBridgeInStatus::UserInited | InstanceBridgeInStatus::UserIniting => {
                 if !check_bridge_in_uxto_available_or_self_spent(btc_client, target_txid, utxos)
                     .await?
                 {

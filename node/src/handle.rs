@@ -688,6 +688,16 @@ async fn handle_pegin_request_committee(
             Ok(v) => v,
             Err(e) => {
                 if should_ignore_invalid_pegin_request(&e, instance_id) {
+                    if let Ok(mut storage_processor) = ctx.local_db.acquire().await {
+                        let _ = storage_processor
+                            .update_instance(
+                                &store::localdb::InstanceUpdate::new_with_instance_id(instance_id)
+                                    .with_status(
+                                        store::InstanceBridgeInStatus::UserDiscarded.to_string(),
+                                    ),
+                            )
+                            .await;
+                    }
                     return Ok(());
                 }
                 bail!(e)
@@ -732,6 +742,16 @@ async fn handle_pegin_request_default(
             Ok(v) => v,
             Err(e) => {
                 if should_ignore_invalid_pegin_request(&e, instance_id) {
+                    if let Ok(mut storage_processor) = ctx.local_db.acquire().await {
+                        let _ = storage_processor
+                            .update_instance(
+                                &store::localdb::InstanceUpdate::new_with_instance_id(instance_id)
+                                    .with_status(
+                                        store::InstanceBridgeInStatus::UserDiscarded.to_string(),
+                                    ),
+                            )
+                            .await;
+                    }
                     return Ok(());
                 }
                 bail!(e)
