@@ -18,6 +18,14 @@ pub trait CosmosRpcProvider: Send + Sync {
         &self,
         cosmos_block_height: u64,
     ) -> Result<([u8; 32], Option<u64>)>;
+
+    /// Fetch validators hashes for a range of block heights [min_height, max_height].
+    /// The range size should be limited (20 blocks maximum per request).
+    async fn get_validators_hashes(
+        &self,
+        min_height: u64,
+        max_height: u64,
+    ) -> Result<Vec<(u64, [u8; 32])>>;
 }
 
 /// Default implementation that delegates to real Cosmos RPC endpoints.
@@ -39,6 +47,14 @@ impl CosmosRpcProvider for DefaultCosmosRpcProvider {
         fetch_cbft_block_validators_hash_and_goat_block(&self.cosmos_rpc_url, cosmos_block_height)
             .await
     }
+
+    async fn get_validators_hashes(
+        &self,
+        min_height: u64,
+        max_height: u64,
+    ) -> Result<Vec<(u64, [u8; 32])>> {
+        fetch_cbft_validators_hashes_batch(&self.cosmos_rpc_url, min_height, max_height).await
+    }
 }
 
 #[tracing::instrument(level = "info")]
@@ -56,6 +72,43 @@ pub async fn fetch_latest_cosmos_block_height(cosmos_rpc_url: &str) -> Result<u6
     let rpc = HttpClient::new(cosmos_rpc_url).unwrap();
     let status = rpc.status().await.map_err(|e| anyhow!("Error fetching status: {e:?}"))?;
     Ok(status.sync_info.latest_block_height.into())
+}
+
+#[tracing::instrument(level = "info")]
+pub async fn fetch_cbft_validators_hashes_batch(
+    cosmos_rpc_url: &str,
+    min_height: u64,
+    max_height: u64,
+) -> Result<Vec<(u64, [u8; 32])>> {
+    let rpc = HttpClient::new(cosmos_rpc_url).unwrap();
+    let min = Height::try_from(min_height).unwrap();
+    let max = Height::try_from(max_height).unwrap();
+
+    let response = rpc.blockchain(min, max).await.map_err(|e| {
+        anyhow!(
+            "Error fetching blockchain data for heights {} to {}: {:?}",
+            min_height,
+            max_height,
+            e
+        )
+    })?;
+
+    let mut result = Vec::with_capacity(response.block_metas.len());
+    for meta in response.block_metas {
+        let height: u64 = meta.header.height.into();
+        let validators_hash: [u8; 32] = meta
+            .header
+            .validators_hash
+            .as_bytes()
+            .try_into()
+            .map_err(|_| anyhow!("Invalid validators_hash length at height {}", height))?;
+        result.push((height, validators_hash));
+    }
+
+    // Sort the result by height ascending, as blockchain endpoint natively returns them descending.
+    result.sort_by_key(|&(h, _)| h);
+
+    Ok(result)
 }
 
 /// Fetch the validators_hash and goat block number for a given cosmos block.

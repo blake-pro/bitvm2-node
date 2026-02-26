@@ -103,88 +103,145 @@ pub(crate) async fn sync_sequencer_set_hash_changes(
 
     const SCAN_STATE_FLUSH_INTERVAL: i64 = 10;
     let mut blocks_since_last_flush: i64 = 0;
+    const BATCH_SIZE: u64 = 20;
 
     while state.next_cosmos_block_height <= latest_cosmos_block {
-        info!(
-            "Syncing sequencer_set_hash changes at cosmos block {}",
-            state.next_cosmos_block_height
+        let max_height = std::cmp::min(
+            latest_cosmos_block,
+            state.next_cosmos_block_height + BATCH_SIZE as i64 - 1,
         );
 
-        // Define a closure or block to handle the per-block logic so we can catch errors
-        let result: anyhow::Result<()> = async {
-            let cosmos_block_height = u64::try_from(state.next_cosmos_block_height)
-                .context("cosmos block height is negative")?;
-            let (validators_hash, goat_block_height) =
-                rpc.get_validators_hash_and_goat_block(cosmos_block_height).await?;
+        let min_height_u64 = u64::try_from(state.next_cosmos_block_height)
+            .context("cosmos block height is negative")?;
+        let max_height_u64 =
+            u64::try_from(max_height).context("cosmos block height is negative")?;
 
-            // Skip cosmos blocks without CBFT tx data (empty blocks or unparsable payload).
-            let goat_block_height = match goat_block_height {
-                Some(h) => h,
-                None => {
-                    return Ok(());
-                }
-            };
+        let batch_hashes = rpc.get_validators_hashes(min_height_u64, max_height_u64).await?;
+
+        let mut last_height_processed = min_height_u64.saturating_sub(1);
+
+        for (cosmos_block_height_u64, validators_hash) in batch_hashes {
+            let skipped =
+                cosmos_block_height_u64.saturating_sub(last_height_processed).saturating_sub(1);
+            blocks_since_last_flush += skipped as i64;
+
+            let cosmos_block_height = i64::try_from(cosmos_block_height_u64)
+                .context("cosmos block height exceeds i64")?;
+
+            info!("Syncing sequencer_set_hash changes at cosmos block {}", cosmos_block_height);
 
             let validators_hash_hex = hex::encode(validators_hash);
-            let goat_block_height =
-                i64::try_from(goat_block_height).context("goat block height exceeds i64")?;
 
-            if state.latest_validators_hash != validators_hash_hex {
+            let mut state_changed = false;
+            let result: anyhow::Result<()> = async {
+                if state.latest_validators_hash != validators_hash_hex {
+                    // Hash changed or we don't have goat_block_height for it yet, we need to fetch full block
+                    let (fetched_hash, goat_block_height) =
+                        rpc.get_validators_hash_and_goat_block(cosmos_block_height_u64).await?;
+
+                    // Sanity check
+                    let fetched_hash_hex = hex::encode(fetched_hash);
+                    if fetched_hash_hex != validators_hash_hex {
+                        warn!(
+                            "Hash mismatch between batch query and individual query at height {}",
+                            cosmos_block_height_u64
+                        );
+                    }
+
+                    // Skip cosmos blocks without CBFT tx data (empty blocks or unparsable payload).
+                    let goat_block_height = match goat_block_height {
+                        Some(h) => h,
+                        None => {
+                            return Ok(());
+                        }
+                    };
+
+                    let goat_block_height = i64::try_from(goat_block_height)
+                        .context("goat block height exceeds i64")?;
+
+                    let mut storage = local_db.acquire().await?;
+                    storage
+                        .upsert_sequencer_set_hash_change(
+                            cosmos_block_height,
+                            goat_block_height,
+                            &validators_hash_hex,
+                        )
+                        .await?;
+                    info!(
+                        "Detected validators_hash change at cosmos block {} (goat block {}): {}",
+                        cosmos_block_height, goat_block_height, validators_hash_hex
+                    );
+
+                    state.latest_validators_hash = validators_hash_hex;
+                    state.latest_goat_block_height = goat_block_height;
+                    state_changed = true;
+                }
+
+                Ok(())
+            }
+            .await;
+
+            if let Err(e) = result {
+                // Attempt to save state before returning the error
                 let mut storage = local_db.acquire().await?;
                 storage
-                    .upsert_sequencer_set_hash_change(
+                    .upsert_sequencer_set_scan_state(
                         state.next_cosmos_block_height,
-                        goat_block_height,
-                        &validators_hash_hex,
+                        state.latest_goat_block_height,
+                        &state.latest_validators_hash,
                     )
                     .await?;
-                info!(
-                    "Detected validators_hash change at cosmos block {} (goat block {}): {}",
-                    state.next_cosmos_block_height, goat_block_height, validators_hash_hex
-                );
-                state.latest_validators_hash = validators_hash_hex;
+                return Err(e);
             }
 
-            state.latest_goat_block_height = goat_block_height;
+            // Advance state
+            state.next_cosmos_block_height = cosmos_block_height.saturating_add(1);
+            blocks_since_last_flush += 1;
+            last_height_processed = cosmos_block_height_u64;
 
-            Ok(())
+            if blocks_since_last_flush >= SCAN_STATE_FLUSH_INTERVAL
+                || state_changed
+                || state.next_cosmos_block_height > latest_cosmos_block
+            {
+                let mut storage = local_db.acquire().await?;
+                storage
+                    .upsert_sequencer_set_scan_state(
+                        state.next_cosmos_block_height,
+                        state.latest_goat_block_height,
+                        &state.latest_validators_hash,
+                    )
+                    .await?;
+                blocks_since_last_flush = 0;
+                info!(
+                    "Scan progress: cosmos block {}/{}",
+                    state.next_cosmos_block_height, latest_cosmos_block
+                );
+            }
         }
-        .await;
 
-        if let Err(e) = result {
-            // Attempt to save state before returning the error
-            let mut storage = local_db.acquire().await?;
-            storage
-                .upsert_sequencer_set_scan_state(
-                    state.next_cosmos_block_height,
-                    state.latest_goat_block_height,
-                    &state.latest_validators_hash,
-                )
-                .await?;
-            return Err(e);
-        }
+        // Advance over any remaining blocks in the batch range that were missed and ensure flush
+        if state.next_cosmos_block_height <= max_height {
+            let skipped = max_height_u64.saturating_sub(last_height_processed);
+            blocks_since_last_flush += skipped as i64;
+            state.next_cosmos_block_height = max_height + 1;
 
-        // Advance state on success (or empty block)
-        state.next_cosmos_block_height = state.next_cosmos_block_height.saturating_add(1);
-        blocks_since_last_flush += 1;
-
-        // Flush scan state periodically to reduce DB writes during catch-up.
-        if blocks_since_last_flush >= SCAN_STATE_FLUSH_INTERVAL
-            || state.next_cosmos_block_height > latest_cosmos_block
-        {
-            let mut storage = local_db.acquire().await?;
-            storage
-                .upsert_sequencer_set_scan_state(
-                    state.next_cosmos_block_height,
-                    state.latest_goat_block_height,
-                    &state.latest_validators_hash,
-                )
-                .await?;
-            blocks_since_last_flush = 0;
-            info!(
-                "Scan progress: cosmos block {}/{}",
-                state.next_cosmos_block_height, latest_cosmos_block
-            );
+            if blocks_since_last_flush >= SCAN_STATE_FLUSH_INTERVAL
+                || state.next_cosmos_block_height > latest_cosmos_block
+            {
+                let mut storage = local_db.acquire().await?;
+                storage
+                    .upsert_sequencer_set_scan_state(
+                        state.next_cosmos_block_height,
+                        state.latest_goat_block_height,
+                        &state.latest_validators_hash,
+                    )
+                    .await?;
+                blocks_since_last_flush = 0;
+                info!(
+                    "Scan progress: cosmos block {}/{} (skipped missing blocks)",
+                    state.next_cosmos_block_height, latest_cosmos_block
+                );
+            }
         }
     }
     info!(finish_info);
@@ -249,6 +306,21 @@ mod tests {
                 .get(&cosmos_block_height)
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("block {} not found in mock", cosmos_block_height))
+        }
+
+        async fn get_validators_hashes(
+            &self,
+            min_height: u64,
+            max_height: u64,
+        ) -> Result<Vec<(u64, [u8; 32])>> {
+            let mut result = Vec::new();
+            for height in min_height..=max_height {
+                if let Some((hash, _)) = self.blocks.get(&height) {
+                    result.push((height, *hash));
+                }
+            }
+            result.sort_by_key(|&(h, _)| h);
+            Ok(result)
         }
     }
 
@@ -329,7 +401,8 @@ mod tests {
         let mut s = db.acquire().await.unwrap();
         let state = s.get_sequencer_set_scan_state().await.unwrap().unwrap();
         assert_eq!(state.next_cosmos_block_height, 14);
-        assert_eq!(state.latest_goat_block_height, 1003);
+        // Goat block height should not update because validators hash hasn't changed (optimization)
+        assert_eq!(state.latest_goat_block_height, 1000);
     }
 
     #[tokio::test]
