@@ -42,6 +42,9 @@ pub enum ProofRequest {
         header_chain_input_proof: String,
         commit_chain_input_proof: String,
         state_chain_input_proof: String,
+        header_chain_zkm_version: String,
+        commit_chain_zkm_version: String,
+        state_chain_zkm_version: String,
         output: String,
         target_block: Block,
         block_pos: u32,
@@ -54,6 +57,10 @@ pub enum ProofRequest {
         header_chain_input_proof: String,
         commit_chain_input_proof: String,
         state_chain_input_proof: String,
+        header_chain_zkm_version: String,
+        commit_chain_zkm_version: String,
+        state_chain_zkm_version: String,
+        operator_target_zkm_version: String,
         execution_layer_block_number: u64,
         output: String,
 
@@ -112,6 +119,10 @@ pub struct OnDemandTask {
     pub header_chain_input_proof: String,
     pub commit_chain_input_proof: String,
     pub state_chain_input_proof: String,
+    pub header_chain_zkm_version: String,
+    pub commit_chain_zkm_version: String,
+    pub state_chain_zkm_version: String,
+    pub operator_target_zkm_version: String,
 
     pub watchtower_challenge_init_txid: Option<String>,
     pub watchtower_challenge_txids: Vec<String>,
@@ -198,6 +209,14 @@ pub struct OperatorProofRequest {
     pub included_watchtowers: Vec<bool>,
     pub watchtower_challenge_init_txid: String,
     pub watchtower_challenge_pubkeys: Vec<String>,
+    #[serde(default)]
+    pub header_chain_zkm_version: Option<String>,
+    #[serde(default)]
+    pub commit_chain_zkm_version: Option<String>,
+    #[serde(default)]
+    pub state_chain_zkm_version: Option<String>,
+    #[serde(default)]
+    pub operator_target_zkm_version: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -241,6 +260,12 @@ pub struct WatchtowerProofRequest {
     pub public_key: String,
     pub challenge_init_txid: String,
     pub execution_layer_block_number: i64,
+    #[serde(default)]
+    pub header_chain_zkm_version: Option<String>,
+    #[serde(default)]
+    pub commit_chain_zkm_version: Option<String>,
+    #[serde(default)]
+    pub state_chain_zkm_version: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

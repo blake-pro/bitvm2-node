@@ -35,6 +35,12 @@ pub(crate) fn spawn_operator_proof_task(
                 _ = tokio::time::sleep(Duration::from_secs(interval)) => {
                     // fetch args from the database.
                     let task_index;
+                    let (
+                        header_chain_zkm_version,
+                        commit_chain_zkm_version,
+                        state_chain_zkm_version,
+                        operator_target_zkm_version,
+                    );
                     match fetch_on_demand_task(
                         &local_db, false, args.bitcoin_network, &args.esplora_url,
                     ).await {
@@ -55,6 +61,10 @@ pub(crate) fn spawn_operator_proof_task(
                             // LE array to string, e.g. [1, 1, 1, 0] => 7
                             args.included_watchtowers = le_bits_to_u256(&next_task.included_watchtowers).to_string();
                             task_index = next_task.task_index;
+                            header_chain_zkm_version = next_task.header_chain_zkm_version;
+                            commit_chain_zkm_version = next_task.commit_chain_zkm_version;
+                            state_chain_zkm_version = next_task.state_chain_zkm_version;
+                            operator_target_zkm_version = next_task.operator_target_zkm_version;
                         }
                         Ok(None) => {
                             tracing::warn!("No on demand task found for operator proof, wait for the next round");
@@ -103,6 +113,10 @@ pub(crate) fn spawn_operator_proof_task(
                         header_chain_input_proof: args.header_chain_input_proof.clone(),
                         commit_chain_input_proof: args.commit_chain_input_proof.clone(),
                         state_chain_input_proof: args.state_chain_input_proof.clone(),
+                        header_chain_zkm_version,
+                        commit_chain_zkm_version,
+                        state_chain_zkm_version,
+                        operator_target_zkm_version,
                         execution_layer_block_number: args.execution_layer_block_number,
 
                         output: args.output.clone(),

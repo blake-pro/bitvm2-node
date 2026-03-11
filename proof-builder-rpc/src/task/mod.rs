@@ -15,6 +15,7 @@ use ::state_chain_proof::StateChainProofBuilder;
 use bitcoin::{BlockHash, Network, Txid};
 use client::btc_chain::BTCClient;
 use commit_chain::CircuitCommit;
+use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::time::UNIX_EPOCH;
 use uuid::Uuid;
@@ -25,6 +26,86 @@ use store::localdb::LocalDB;
 use store::{LongRunningTaskProof, OperatorProof, ProofState, WatchtowerProof};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct ProofVersionSelector {
+    pub(crate) header_chain_zkm_version: Option<String>,
+    pub(crate) commit_chain_zkm_version: Option<String>,
+    pub(crate) state_chain_zkm_version: Option<String>,
+    pub(crate) operator_target_zkm_version: Option<String>,
+}
+
+impl ProofVersionSelector {
+    fn normalize_version(version: Option<String>) -> Option<String> {
+        version.and_then(|v| {
+            let normalized = v.trim().to_string();
+            if normalized.is_empty() { None } else { Some(normalized) }
+        })
+    }
+
+    fn normalize(self) -> Self {
+        Self {
+            header_chain_zkm_version: Self::normalize_version(self.header_chain_zkm_version),
+            commit_chain_zkm_version: Self::normalize_version(self.commit_chain_zkm_version),
+            state_chain_zkm_version: Self::normalize_version(self.state_chain_zkm_version),
+            operator_target_zkm_version: Self::normalize_version(self.operator_target_zkm_version),
+        }
+    }
+
+    fn from_extra(extra: Option<&str>) -> Self {
+        extra.and_then(|raw| serde_json::from_str::<Self>(raw).ok()).unwrap_or_default().normalize()
+    }
+
+    fn as_extra_json(&self) -> Option<String> {
+        serde_json::to_string(self).ok()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectiveZkmVersions {
+    operator_target_zkm_version: String,
+    header_chain_zkm_version: String,
+    commit_chain_zkm_version: String,
+    state_chain_zkm_version: String,
+}
+
+fn resolve_effective_zkm_versions(
+    is_watchtower: bool,
+    version_selector: &ProofVersionSelector,
+    graph_target_zkm_version: String,
+    latest_header_chain_zkm_version: String,
+    latest_commit_chain_zkm_version: String,
+    latest_state_chain_zkm_version: String,
+) -> EffectiveZkmVersions {
+    let operator_target_zkm_version =
+        version_selector.operator_target_zkm_version.clone().unwrap_or(graph_target_zkm_version);
+    let operator_chain_default_zkm_version = if is_watchtower {
+        None
+    } else {
+        ProofVersionSelector::normalize_version(Some(operator_target_zkm_version.clone()))
+    };
+    let header_chain_zkm_version = version_selector
+        .header_chain_zkm_version
+        .clone()
+        .or_else(|| operator_chain_default_zkm_version.clone())
+        .unwrap_or(latest_header_chain_zkm_version);
+    let commit_chain_zkm_version = version_selector
+        .commit_chain_zkm_version
+        .clone()
+        .or_else(|| operator_chain_default_zkm_version.clone())
+        .unwrap_or(latest_commit_chain_zkm_version);
+    let state_chain_zkm_version = version_selector
+        .state_chain_zkm_version
+        .clone()
+        .or_else(|| operator_chain_default_zkm_version)
+        .unwrap_or(latest_state_chain_zkm_version);
+    EffectiveZkmVersions {
+        operator_target_zkm_version,
+        header_chain_zkm_version,
+        commit_chain_zkm_version,
+        state_chain_zkm_version,
+    }
+}
 
 pub(crate) fn is_start_generate_proof_tasks(cfg: &ProofBuilderConfig) -> bool {
     cfg.header_chain.enable
@@ -220,6 +301,7 @@ async fn read_watchtower_challenge_details<'a>(
     Vec<String>,
     Option<String>,
     Option<String>,
+    ProofVersionSelector,
 )> {
     let (
         task_index,
@@ -230,6 +312,7 @@ async fn read_watchtower_challenge_details<'a>(
         watchtower_public_keys,
         graph_id,
         operator_committed_blockhash,
+        version_selector,
     ) = if is_watchtower {
         match storage_processor.find_next_watchtower_proof().await? {
             Some(task) => {
@@ -247,6 +330,7 @@ async fn read_watchtower_challenge_details<'a>(
                     pubkeys,
                     Some(task.graph_id.as_simple().to_string()),
                     None,
+                    ProofVersionSelector::from_extra(task.extra.as_deref()),
                 )
             }
             None => {
@@ -297,6 +381,7 @@ async fn read_watchtower_challenge_details<'a>(
             challenge_public_keys,
             Some(task.graph_id.as_simple().to_string()),
             Some(task.operator_committed_blockhash),
+            ProofVersionSelector::from_extra(task.extra.as_deref()),
         )
     };
 
@@ -312,7 +397,22 @@ async fn read_watchtower_challenge_details<'a>(
         watchtower_public_keys,
         graph_id,
         operator_committed_blockhash,
+        version_selector,
     ))
+}
+
+async fn resolve_chain_target_zkm_version<'a>(
+    storage_processor: &mut store::localdb::StorageProcessor<'a>,
+    chain_name: String,
+) -> anyhow::Result<String> {
+    Ok(storage_processor
+        .find_latest_long_running_task_proof_by_name_and_state(
+            chain_name,
+            ProofState::Proven.to_i64(),
+        )
+        .await?
+        .map(|p| p.zkm_version)
+        .unwrap_or_default())
 }
 
 // fetch next task from watchtower or operator.
@@ -334,6 +434,7 @@ pub(crate) async fn fetch_on_demand_task(
         watchtower_public_keys,
         graph_id,
         operator_committed_blockhash,
+        version_selector,
     ) = match read_watchtower_challenge_details(&mut storage_processor, is_watchtower).await {
         Ok(d) => d,
         Err(e) => {
@@ -341,6 +442,46 @@ pub(crate) async fn fetch_on_demand_task(
             return Ok(None);
         }
     };
+
+    let graph_target_zkm_version = if is_watchtower {
+        String::new()
+    } else if let Some(graph_id) = &graph_id {
+        storage_processor
+            .find_graph(&Uuid::from_str(graph_id)?)
+            .await?
+            .map(|graph| graph.zkm_version)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let latest_header_chain_zkm_version =
+        resolve_chain_target_zkm_version(&mut storage_processor, HeaderChainProofBuilder::name())
+            .await?;
+    let latest_commit_chain_zkm_version =
+        resolve_chain_target_zkm_version(&mut storage_processor, CommitChainProofBuilder::name())
+            .await?;
+    let latest_state_chain_zkm_version =
+        resolve_chain_target_zkm_version(&mut storage_processor, StateChainProofBuilder::name())
+            .await?;
+    let effective_versions = resolve_effective_zkm_versions(
+        is_watchtower,
+        &version_selector,
+        graph_target_zkm_version,
+        latest_header_chain_zkm_version,
+        latest_commit_chain_zkm_version,
+        latest_state_chain_zkm_version,
+    );
+    let operator_target_zkm_version = effective_versions.operator_target_zkm_version;
+    let default_header_chain_zkm_version = effective_versions.header_chain_zkm_version;
+    let default_commit_chain_zkm_version = effective_versions.commit_chain_zkm_version;
+    let default_state_chain_zkm_version = effective_versions.state_chain_zkm_version;
+    tracing::info!(
+        "on-demand task target versions => operator: {}, header: {}, commit: {}, state: {}",
+        operator_target_zkm_version,
+        default_header_chain_zkm_version,
+        default_commit_chain_zkm_version,
+        default_state_chain_zkm_version
+    );
 
     if !is_watchtower && operator_committed_blockhash.is_none() {
         tracing::warn!("Watchtower challenge tx is not confirmed yet.");
@@ -402,13 +543,38 @@ pub(crate) async fn fetch_on_demand_task(
         None => {} // skip for watchtowers
     };
 
-    let header_chain_input_proof = match storage_processor
-        .find_long_running_task_proof_including_block_number(
-            largest_btc_block_height as i64,
-            HeaderChainProofBuilder::name(),
-        )
-        .await?
-    {
+    let header_chain_input_proof = if default_header_chain_zkm_version.is_empty() {
+        storage_processor
+            .find_long_running_task_proof_including_block_number(
+                largest_btc_block_height as i64,
+                HeaderChainProofBuilder::name(),
+            )
+            .await?
+    } else {
+        match storage_processor
+            .find_long_running_task_proof_including_block_number_and_version(
+                largest_btc_block_height as i64,
+                HeaderChainProofBuilder::name(),
+                default_header_chain_zkm_version.clone(),
+            )
+            .await?
+        {
+            Some(proof) => Some(proof),
+            None => {
+                tracing::warn!(
+                    "Header chain proof not found for version {}, fallback to latest by height",
+                    default_header_chain_zkm_version
+                );
+                storage_processor
+                    .find_long_running_task_proof_including_block_number(
+                        largest_btc_block_height as i64,
+                        HeaderChainProofBuilder::name(),
+                    )
+                    .await?
+            }
+        }
+    };
+    let header_chain_input_proof = match header_chain_input_proof {
         Some(d) => d,
         None => {
             tracing::warn!(
@@ -419,6 +585,7 @@ pub(crate) async fn fetch_on_demand_task(
         }
     };
     tracing::info!("header_chain_input_proof: {header_chain_input_proof:?}");
+    let header_chain_zkm_version = header_chain_input_proof.zkm_version.clone();
     let header_chain_input_proof = header_chain_input_proof.path_to_proof.unwrap();
 
     // state chain: find the proof that includes the execution_layer_block_number
@@ -426,19 +593,67 @@ pub(crate) async fn fetch_on_demand_task(
     // * Operator must use the height at which it's proceedWithdraw is confirmed.
     tracing::info!("execution_layer_block_number: {execution_layer_block_number}");
     let state_chain_input_proof_result = if execution_layer_block_number > 0 {
-        storage_processor
-            .find_long_running_task_proof_including_block_number(
-                execution_layer_block_number,
-                StateChainProofBuilder::name(),
-            )
-            .await?
-    } else {
+        if default_state_chain_zkm_version.is_empty() {
+            storage_processor
+                .find_long_running_task_proof_including_block_number(
+                    execution_layer_block_number,
+                    StateChainProofBuilder::name(),
+                )
+                .await?
+        } else {
+            match storage_processor
+                .find_long_running_task_proof_including_block_number_and_version(
+                    execution_layer_block_number,
+                    StateChainProofBuilder::name(),
+                    default_state_chain_zkm_version.clone(),
+                )
+                .await?
+            {
+                Some(proof) => Some(proof),
+                None => {
+                    tracing::warn!(
+                        "State chain proof not found for version {}, fallback to latest by height",
+                        default_state_chain_zkm_version
+                    );
+                    storage_processor
+                        .find_long_running_task_proof_including_block_number(
+                            execution_layer_block_number,
+                            StateChainProofBuilder::name(),
+                        )
+                        .await?
+                }
+            }
+        }
+    } else if default_state_chain_zkm_version.is_empty() {
         storage_processor
             .find_latest_long_running_task_proof_by_name_and_state(
                 StateChainProofBuilder::name(),
                 ProofState::Proven.to_i64(),
             )
             .await?
+    } else {
+        match storage_processor
+            .find_latest_long_running_task_proof_by_name_and_state_and_version(
+                StateChainProofBuilder::name(),
+                ProofState::Proven.to_i64(),
+                default_state_chain_zkm_version.clone(),
+            )
+            .await?
+        {
+            Some(proof) => Some(proof),
+            None => {
+                tracing::warn!(
+                    "State chain latest proof not found for version {}, fallback to latest proven",
+                    default_state_chain_zkm_version
+                );
+                storage_processor
+                    .find_latest_long_running_task_proof_by_name_and_state(
+                        StateChainProofBuilder::name(),
+                        ProofState::Proven.to_i64(),
+                    )
+                    .await?
+            }
+        }
     };
 
     let state_chain_input_proof = match state_chain_input_proof_result {
@@ -459,16 +674,42 @@ pub(crate) async fn fetch_on_demand_task(
             return Ok(None);
         }
     };
+    let state_chain_zkm_version = state_chain_input_proof.zkm_version.clone();
     let state_chain_input_proof = state_chain_input_proof.path_to_proof.unwrap();
 
     // commit chain
-    let commit_chain_input_proof = match storage_processor
-        .find_long_running_task_proof_including_block_number(
-            largest_btc_block_height as i64,
-            CommitChainProofBuilder::name(),
-        )
-        .await?
-    {
+    let commit_chain_input_proof = if default_commit_chain_zkm_version.is_empty() {
+        storage_processor
+            .find_long_running_task_proof_including_block_number(
+                largest_btc_block_height as i64,
+                CommitChainProofBuilder::name(),
+            )
+            .await?
+    } else {
+        match storage_processor
+            .find_long_running_task_proof_including_block_number_and_version(
+                largest_btc_block_height as i64,
+                CommitChainProofBuilder::name(),
+                default_commit_chain_zkm_version.clone(),
+            )
+            .await?
+        {
+            Some(proof) => Some(proof),
+            None => {
+                tracing::warn!(
+                    "Commit chain proof not found for version {}, fallback to latest by height",
+                    default_commit_chain_zkm_version
+                );
+                storage_processor
+                    .find_long_running_task_proof_including_block_number(
+                        largest_btc_block_height as i64,
+                        CommitChainProofBuilder::name(),
+                    )
+                    .await?
+            }
+        }
+    };
+    let commit_chain_input_proof = match commit_chain_input_proof {
         Some(d) => d,
         None => {
             tracing::error!("Commit chain input proof is not ready");
@@ -476,6 +717,7 @@ pub(crate) async fn fetch_on_demand_task(
         }
     };
     tracing::info!("commit_chain_input_proof: {commit_chain_input_proof:?}");
+    let commit_chain_zkm_version = commit_chain_input_proof.zkm_version.clone();
     let commit_chain_input_proof = commit_chain_input_proof.path_to_proof.unwrap();
     let file = format!("{commit_chain_input_proof}.commits");
     let content = match std::fs::read_to_string(&file) {
@@ -494,6 +736,10 @@ pub(crate) async fn fetch_on_demand_task(
         header_chain_input_proof,
         commit_chain_input_proof,
         state_chain_input_proof,
+        header_chain_zkm_version,
+        commit_chain_zkm_version,
+        state_chain_zkm_version,
+        operator_target_zkm_version,
         watchtower_challenge_init_txid,
         watchtower_challenge_txids,
         included_watchtowers,
@@ -646,8 +892,18 @@ pub(crate) async fn add_watchtower_task(
     public_key: String,
     challenge_init_txid: String,
     execution_layer_block_number: i64,
+    header_chain_zkm_version: Option<String>,
+    commit_chain_zkm_version: Option<String>,
+    state_chain_zkm_version: Option<String>,
 ) -> anyhow::Result<u64> {
     let mut storage_processor = local_db.acquire().await?;
+    let version_selector = ProofVersionSelector {
+        header_chain_zkm_version,
+        commit_chain_zkm_version,
+        state_chain_zkm_version,
+        operator_target_zkm_version: None,
+    }
+    .normalize();
     Ok(storage_processor
         .create_watchtower_proof(&WatchtowerProof {
             id: 1,
@@ -660,6 +916,7 @@ pub(crate) async fn add_watchtower_task(
             updated_at: current_time_secs(),
             execution_layer_block_number,
             included: true,
+            extra: version_selector.as_extra_json(),
             ..Default::default()
         })
         .await?)
@@ -741,8 +998,19 @@ pub(crate) async fn add_operator_task(
     included_watchtowers: Vec<bool>,
     watchtower_challenge_init_txid: String,
     watchtower_challenge_pubkeys: Vec<String>,
+    header_chain_zkm_version: Option<String>,
+    commit_chain_zkm_version: Option<String>,
+    state_chain_zkm_version: Option<String>,
+    operator_target_zkm_version: Option<String>,
 ) -> anyhow::Result<u64> {
     let mut storage_processor = local_db.start_transaction().await?;
+    let version_selector = ProofVersionSelector {
+        header_chain_zkm_version,
+        commit_chain_zkm_version,
+        state_chain_zkm_version,
+        operator_target_zkm_version,
+    }
+    .normalize();
 
     let existing_watchtower_proof_task = storage_processor
         .find_watchtower_proof_by_instance_and_graph(&instance_id, &graph_id)
@@ -806,6 +1074,7 @@ pub(crate) async fn add_operator_task(
             created_at: current_time_secs(),
             updated_at: current_time_secs(),
             cycles: 0,
+            extra: version_selector.as_extra_json(),
             operator_committed_blockhash,
             ..Default::default()
         })
@@ -881,6 +1150,88 @@ mod tests {
     use store::create_local_db;
     use uuid::Uuid;
 
+    #[test]
+    fn test_proof_version_selector_from_extra_normalizes() {
+        let selector = ProofVersionSelector::from_extra(Some(
+            r#"{
+                "header_chain_zkm_version": " v1.2.5 ",
+                "commit_chain_zkm_version": "",
+                "state_chain_zkm_version": "  ",
+                "operator_target_zkm_version": "v1.2.4"
+            }"#,
+        ));
+        assert_eq!(selector.header_chain_zkm_version, Some("v1.2.5".to_string()));
+        assert_eq!(selector.commit_chain_zkm_version, None);
+        assert_eq!(selector.state_chain_zkm_version, None);
+        assert_eq!(selector.operator_target_zkm_version, Some("v1.2.4".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_effective_zkm_versions_operator_prefers_explicit_versions() {
+        let selector = ProofVersionSelector {
+            header_chain_zkm_version: Some("v1.2.4".to_string()),
+            commit_chain_zkm_version: Some("v1.2.3".to_string()),
+            state_chain_zkm_version: Some("v1.2.2".to_string()),
+            operator_target_zkm_version: Some("v1.2.5".to_string()),
+        };
+        let resolved = resolve_effective_zkm_versions(
+            false,
+            &selector,
+            "v1.2.5".to_string(),
+            "latest-header".to_string(),
+            "latest-commit".to_string(),
+            "latest-state".to_string(),
+        );
+        assert_eq!(resolved.operator_target_zkm_version, "v1.2.5");
+        assert_eq!(resolved.header_chain_zkm_version, "v1.2.4");
+        assert_eq!(resolved.commit_chain_zkm_version, "v1.2.3");
+        assert_eq!(resolved.state_chain_zkm_version, "v1.2.2");
+    }
+
+    #[test]
+    fn test_resolve_effective_zkm_versions_operator_uses_operator_target_by_default() {
+        let selector = ProofVersionSelector {
+            header_chain_zkm_version: None,
+            commit_chain_zkm_version: None,
+            state_chain_zkm_version: None,
+            operator_target_zkm_version: Some("v1.2.4".to_string()),
+        };
+        let resolved = resolve_effective_zkm_versions(
+            false,
+            &selector,
+            "v1.2.5".to_string(),
+            "latest-header".to_string(),
+            "latest-commit".to_string(),
+            "latest-state".to_string(),
+        );
+        assert_eq!(resolved.operator_target_zkm_version, "v1.2.4");
+        assert_eq!(resolved.header_chain_zkm_version, "v1.2.4");
+        assert_eq!(resolved.commit_chain_zkm_version, "v1.2.4");
+        assert_eq!(resolved.state_chain_zkm_version, "v1.2.4");
+    }
+
+    #[test]
+    fn test_resolve_effective_zkm_versions_watchtower_uses_latest_by_default() {
+        let selector = ProofVersionSelector {
+            header_chain_zkm_version: None,
+            commit_chain_zkm_version: None,
+            state_chain_zkm_version: None,
+            operator_target_zkm_version: Some("v1.2.4".to_string()),
+        };
+        let resolved = resolve_effective_zkm_versions(
+            true,
+            &selector,
+            "v1.2.5".to_string(),
+            "latest-header".to_string(),
+            "latest-commit".to_string(),
+            "latest-state".to_string(),
+        );
+        assert_eq!(resolved.operator_target_zkm_version, "v1.2.4");
+        assert_eq!(resolved.header_chain_zkm_version, "latest-header");
+        assert_eq!(resolved.commit_chain_zkm_version, "latest-commit");
+        assert_eq!(resolved.state_chain_zkm_version, "latest-state");
+    }
+
     #[tokio::test]
     async fn test_add_watchtower_task() {
         let db_path = std::env::var("TEST_DB")
@@ -900,6 +1251,9 @@ mod tests {
             public_key,
             challenge_init_txid,
             number,
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -939,6 +1293,10 @@ mod tests {
             included_watchtowers,
             watchtower_challenge_init_txid,
             watchtower_challenge_pubkeys,
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();

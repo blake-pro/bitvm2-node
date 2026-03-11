@@ -31,6 +31,11 @@ pub(crate) fn spawn_watchtower_proof_task(
                 _ = tokio::time::sleep(Duration::from_secs(interval)) => {
                     // fetch args from the database by instance id and graph id.
                     let task_index;
+                    let (
+                        header_chain_zkm_version,
+                        commit_chain_zkm_version,
+                        state_chain_zkm_version,
+                    );
                     match fetch_on_demand_task(
                         &local_db,
                         true,
@@ -47,6 +52,9 @@ pub(crate) fn spawn_watchtower_proof_task(
                                 next_task.task_index,
                             );
                             task_index = next_task.task_index;
+                            header_chain_zkm_version = next_task.header_chain_zkm_version;
+                            commit_chain_zkm_version = next_task.commit_chain_zkm_version;
+                            state_chain_zkm_version = next_task.state_chain_zkm_version;
                         },
                         Ok(None) => {
                             tracing::warn!("No on demand task found for watchtower proof, wait for the next round");
@@ -76,6 +84,9 @@ pub(crate) fn spawn_watchtower_proof_task(
                             header_chain_input_proof: args.header_chain_input_proof.clone(),
                             commit_chain_input_proof: args.commit_chain_input_proof.clone(),
                             state_chain_input_proof: args.state_chain_input_proof.clone(),
+                            header_chain_zkm_version,
+                            commit_chain_zkm_version,
+                            state_chain_zkm_version,
                             output: args.output.clone(),
                             target_block,
                             block_pos,

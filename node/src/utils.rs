@@ -5,7 +5,7 @@ use crate::env::*;
 use crate::error::SpecialError;
 use crate::middleware::AllBehaviours;
 use crate::rpc_service::current_time_secs;
-use crate::vk::get_vk;
+use crate::vk::{get_vk, get_vk_bytes};
 use alloy::primitives::{Address as EvmAddress, Signature as EvmSignature};
 use alloy::signers::Signer;
 use alloy::signers::local::PrivateKeySigner;
@@ -71,7 +71,7 @@ use store::{
 };
 use stun_client::{Attribute, Class, Client};
 use zkm_sdk::{ZKM_CIRCUIT_VERSION, ZKMProofWithPublicValues};
-use zkm_verifier::{GROTH16_VK_BYTES, convert_ark};
+use zkm_verifier::convert_ark;
 
 use crate::env;
 use crate::rpc_service::routes::v1::{
@@ -1754,6 +1754,9 @@ pub async fn get_watchtower_commitment(
                     public_key: env::get_node_pubkey()?.to_string(),
                     challenge_init_txid: challenge_init_txid.0.to_string(),
                     execution_layer_block_number: graph.proceed_withdraw_height, // NOTE: this number may be zero
+                    header_chain_zkm_version: None,
+                    commit_chain_zkm_version: None,
+                    state_chain_zkm_version: None,
                 },
             )
             .await?;
@@ -1819,6 +1822,16 @@ pub async fn get_watchtower_challenge_info(
 /// Returns:
 /// - `Ok(Some(OperatorProof), _)` if operator proof is available
 /// - `Ok(None, wait_secs)` if operator proof is not yet available, with suggested wait time
+fn load_operator_proof_groth16_vk_bytes<F>(
+    proof_zkm_version: &str,
+    mut vk_loader: F,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(&str) -> Result<Vec<u8>>,
+{
+    vk_loader(proof_zkm_version)
+}
+
 pub async fn get_operator_proof(
     local_db: &LocalDB,
     http_client: &HttpAsyncClient,
@@ -1876,6 +1889,10 @@ pub async fn get_operator_proof(
                         .iter()
                         .map(|pk| pk.public_key(secp256k1::Parity::Even).to_string())
                         .collect(),
+                    header_chain_zkm_version: None,
+                    commit_chain_zkm_version: None,
+                    state_chain_zkm_version: None,
+                    operator_target_zkm_version: Some(bitvm_graph.parameters.zkm_version.clone()),
                 },
             )
             .await?;
@@ -1900,8 +1917,9 @@ pub async fn get_operator_proof(
                 // TODO: additionally check constant and included_watchtower with included_watchtowers.
                 //proof.public_values.head();
                 info!("get_operator_proof parse proof successfully");
-                let groth16_vk = &GROTH16_VK_BYTES;
-                let ark_proof = convert_ark(&proof, &proof_data.vk, groth16_vk).unwrap();
+                let groth16_vk =
+                    load_operator_proof_groth16_vk_bytes(&proof.zkm_version, get_vk_bytes)?;
+                let ark_proof = convert_ark(&proof, &proof_data.vk, &groth16_vk)?;
                 info!("get_operator_proof parse proof successfully");
 
                 Ok((
@@ -4672,5 +4690,26 @@ mod tests {
         let url = base_url.join(NODES_OPERATOR_BASE).unwrap();
 
         assert_eq!(url.as_str(), "http://127.0.0.1:8900/v1/proofs/operator_proofs");
+    }
+
+    #[test]
+    fn test_load_operator_proof_groth16_vk_bytes_uses_proof_version() {
+        let mut called_with = String::new();
+        let bytes = load_operator_proof_groth16_vk_bytes("v1.2.4", |version| {
+            called_with = version.to_string();
+            Ok(vec![0x11, 0x22])
+        })
+        .unwrap();
+        assert_eq!(called_with, "v1.2.4");
+        assert_eq!(bytes, vec![0x11, 0x22]);
+    }
+
+    #[test]
+    fn test_load_operator_proof_groth16_vk_bytes_propagates_error() {
+        let err = load_operator_proof_groth16_vk_bytes("v1.2.5", |_version| {
+            anyhow::bail!("mock loader error")
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("mock loader error"));
     }
 }

@@ -42,6 +42,10 @@ async fn main() {
         header_chain_input_proof: args.header_chain_input_proof.clone(),
         commit_chain_input_proof: args.commit_chain_input_proof.clone(),
         state_chain_input_proof: args.state_chain_input_proof.clone(),
+        header_chain_zkm_version: String::new(),
+        commit_chain_zkm_version: String::new(),
+        state_chain_zkm_version: String::new(),
+        operator_target_zkm_version: String::new(),
         execution_layer_block_number: args.execution_layer_block_number,
 
         output: args.output.clone(),

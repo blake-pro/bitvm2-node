@@ -175,6 +175,10 @@ pub(super) async fn post_operator_proof_task(
                 payload.included_watchtowers.clone(),
                 payload.watchtower_challenge_init_txid.clone(),
                 payload.watchtower_challenge_pubkeys.clone(),
+                payload.header_chain_zkm_version.clone(),
+                payload.commit_chain_zkm_version.clone(),
+                payload.state_chain_zkm_version.clone(),
+                payload.operator_target_zkm_version.clone(),
             )
             .await
             .api_error("POST_OPERATOR_PROOF_TASK_ERROR")?;
@@ -261,6 +265,9 @@ pub(super) async fn post_watchtower_proof_task(
                 payload.public_key,
                 challenge_init_txid,
                 payload.execution_layer_block_number,
+                payload.header_chain_zkm_version.clone(),
+                payload.commit_chain_zkm_version.clone(),
+                payload.state_chain_zkm_version.clone(),
             )
             .await
             .api_error("POST_WATCHTOWER_PROOF_TASK_ERROR")?;

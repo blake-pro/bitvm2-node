@@ -31,6 +31,12 @@ pub async fn get_vk(zkm_version: &str) -> Result<VerifyingKey> {
     Ok(load_ark_groth16_verifying_key_from_bytes(&content)?)
 }
 
+pub fn get_vk_bytes(zkm_version: &str) -> Result<Vec<u8>> {
+    let build_dir = try_install_circuit_artifacts(zkm_version);
+    let vk_file = build_dir.join("groth16_vk.bin");
+    Ok(fs::read(vk_file)?)
+}
+
 #[must_use]
 pub fn groth16_circuit_artifacts_dir(zkm_version: &str) -> PathBuf {
     dirs::home_dir().unwrap().join(".zkm").join("circuits/groth16").join(zkm_version)
