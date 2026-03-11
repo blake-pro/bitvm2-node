@@ -47,7 +47,8 @@ use bitvm2_noded::env::{
     get_node_goat_address, goat_config_from_env,
 };
 use bitvm2_noded::utils::{
-    broadcast_tx, get_fee_rate, get_proper_utxo_set, node_p2wsh_address, node_sign,
+    broadcast_tx, fetch_prevouts_for_inputs, get_fee_rate, get_proper_node_utxo_set,
+    node_input_source_from_prevout, node_primary_address, node_sign_by_source,
 };
 
 const PEGIN_PREPARE_BASE_VBYTES: u64 = 200;
@@ -86,10 +87,10 @@ enum Commands {
         /// Optional fees rate in sat/vbyte to compute deposit/confirm/refund fees, otherwise get from api
         #[arg(long)]
         fee_rate: Option<f64>,
-        /// Optional explicit change address; default derived from user key (p2wsh)
+        /// Optional explicit change address; default derived from user key (configured address type)
         #[arg(long)]
         user_change_address: Option<String>,
-        /// Optional explicit refund address; default derived from user key (p2wsh)
+        /// Optional explicit refund address; default derived from user key (configured address type)
         #[arg(long)]
         user_refund_address: Option<String>,
         /// Optional explicit EVM receiver (0x...), otherwise read from env
@@ -119,10 +120,10 @@ enum Commands {
         /// Optional fees rate in sat/vbyte to compute deposit/confirm/refund fees, otherwise get from api
         #[arg(long)]
         fee_rate: Option<f64>,
-        /// Optional explicit change address; default derived from user key (p2wsh)
+        /// Optional explicit change address; default derived from user key (configured address type)
         #[arg(long)]
         user_change_address: Option<String>,
-        /// Optional explicit refund address; default derived from user key (p2wsh)
+        /// Optional explicit refund address; default derived from user key (configured address type)
         #[arg(long)]
         user_refund_address: Option<String>,
         /// Optional explicit EVM receiver (0x...), otherwise read from env
@@ -263,7 +264,7 @@ async fn action_request(
     };
     let user_keypair = Keypair::from_seckey_str_global(user_btc_secret)?;
     let user_xonly = user_keypair.public_key().x_only_public_key().0;
-    let user_address = node_p2wsh_address(network, &user_keypair.public_key().into());
+    let user_address = node_primary_address(network, &user_keypair.public_key().into());
 
     let change_addr = match user_change_address {
         Some(s) => Address::from_str(s)?.require_network(network)?,
@@ -284,24 +285,26 @@ async fn action_request(
     let pegin_confirm_fee = (PEGIN_CONFIRM_EST_VBYTES as f64 * fee_rate).ceil() as u64;
     let pegin_refund_fee = (PEGIN_REFUND_EST_VBYTES as f64 * fee_rate).ceil() as u64;
     let target = Amount::from_sat(pegin_amount_sats + pegin_confirm_fee);
-    let (utxos, pegin_prepare_fee, _) = get_proper_utxo_set(
+    let (utxos, pegin_prepare_fee, _) = get_proper_node_utxo_set(
         btc_client,
         PEGIN_PREPARE_BASE_VBYTES,
-        user_address.clone(),
+        &user_keypair,
         target,
         fee_rate,
     )
     .await?
-    .ok_or_else(|| anyhow!("insufficient funds in address {user_address}"))?;
+    .ok_or_else(|| {
+        anyhow!("insufficient funds in configured/legacy addresses for {user_address}")
+    })?;
     let fees = [pegin_prepare_fee.to_sat(), pegin_confirm_fee, pegin_refund_fee];
 
     // Convert to client Utxo
     let user_inputs: Vec<ClientUtxo> = utxos
         .iter()
         .map(|i| ClientUtxo {
-            txid: i.outpoint.txid.to_byte_array(),
-            vout: i.outpoint.vout,
-            amount_sats: i.amount.to_sat(),
+            txid: i.input.outpoint.txid.to_byte_array(),
+            vout: i.input.outpoint.vout,
+            amount_sats: i.input.amount.to_sat(),
         })
         .collect();
 
@@ -361,9 +364,21 @@ async fn action_prepare(
     // Build pegin deposit/confirm/refund transactions
     let (mut pegin_deposit, _confirm, _refund) = instance_params.build_pegin_tx()?;
 
+    let prevouts = fetch_prevouts_for_inputs(btc_client, &pegin_deposit.tx().input).await?;
     for i in 0..pegin_deposit.tx().input.len() {
-        let input_value = pegin_deposit.input_amounts[i];
-        node_sign(pegin_deposit.tx_mut(), i, input_value, EcdsaSighashType::All, &user_keypair)?;
+        let prevout =
+            prevouts.get(i).ok_or_else(|| anyhow!("missing prevout for pegin input index {i}"))?;
+        let source = node_input_source_from_prevout(btc_client.network(), &user_keypair, prevout)
+            .ok_or_else(|| anyhow!("unsupported pegin input script at index {i}"))?;
+        node_sign_by_source(
+            pegin_deposit.tx_mut(),
+            i,
+            prevout,
+            &prevouts,
+            EcdsaSighashType::All,
+            &user_keypair,
+            source,
+        )?;
     }
 
     // Broadcast deposit

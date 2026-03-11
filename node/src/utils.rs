@@ -13,7 +13,8 @@ use anyhow::{Result, anyhow, bail};
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::Hash;
-use bitcoin::key::Keypair;
+use bitcoin::key::{Keypair, TapTweak};
+use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
 use bitcoin::{
     Address, Amount, BlockHash, CompressedPublicKey, EcdsaSighashType, Network, OutPoint,
     PrivateKey, PublicKey, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
@@ -51,7 +52,7 @@ use libp2p::{PeerId, Swarm};
 use musig2::{PartialSignature, PubNonce};
 use rand::Rng;
 use reqwest::Url;
-use secp256k1::Secp256k1;
+use secp256k1::{Message as SecpMessage, Secp256k1};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
@@ -96,6 +97,30 @@ use proof_builder::{
 use tracing::{error, info, warn};
 use uuid::Uuid;
 pub(crate) const BRIDGE_OUT_GLOBAL_STATS_ID: i64 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeInputSource {
+    Primary(NodeBtcAddrType),
+    LegacyP2wsh,
+}
+
+#[derive(Clone)]
+pub struct NodeSpendInput {
+    pub input: Input,
+    pub prevout: TxOut,
+    pub source: NodeInputSource,
+}
+
+impl NodeInputSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            NodeInputSource::Primary(NodeBtcAddrType::P2wpkh) => "p2wpkh",
+            NodeInputSource::Primary(NodeBtcAddrType::P2tr) => "p2tr",
+            NodeInputSource::LegacyP2wsh => "legacy-p2wsh",
+        }
+    }
+}
+
 pub mod todo_funcs {
     #![allow(dead_code, unreachable_code, unused_variables)]
 
@@ -2029,7 +2054,7 @@ pub async fn challenger_force_skip_kickoff(
     let challenger_master_key = ChallengerMasterKey::new(get_bitvm_key()?);
     let challenger_master_keypair = challenger_master_key.master_keypair();
     let challenger_receive_address =
-        node_p2wsh_address(get_network(), &challenger_master_keypair.public_key().into());
+        node_primary_address(get_network(), &challenger_master_keypair.public_key().into());
     let fee_rate = get_fee_rate(client).await?;
     let (force_skip_kickoff_tx, anchor_added) =
         build_force_skip_kickoff_tx(graph, challenger_receive_address, fee_rate)?;
@@ -2060,7 +2085,7 @@ pub async fn challenger_quick_challenge(client: &BTCClient, graph: &Bitvm2Graph)
     let challenger_master_key = ChallengerMasterKey::new(get_bitvm_key()?);
     let challenger_master_keypair = challenger_master_key.master_keypair();
     let challenger_receive_address =
-        node_p2wsh_address(get_network(), &challenger_master_keypair.public_key().into());
+        node_primary_address(get_network(), &challenger_master_keypair.public_key().into());
     let fee_rate = get_fee_rate(client).await?;
     let (quick_challenge_tx, anchor_added) =
         build_quick_challenge_tx(graph, challenger_receive_address, fee_rate)?;
@@ -2118,15 +2143,16 @@ pub async fn build_sign_and_broadcast_tx(
         output: txouts,
     };
     let fixed_inputs_num = tx.input.len();
+    let fixed_prevouts = fetch_prevouts_for_inputs(client, &tx.input).await?;
     let total_output_amount: Amount = tx.output.iter().map(|o| o.value).sum();
     let fee_rate = get_fee_rate(client).await?;
-    let node_address = node_p2wsh_address(get_network(), &node_keypair.public_key().into());
+    let node_address = node_primary_address(get_network(), &node_keypair.public_key().into());
     let shortfall =
         Amount::from_sat(total_output_amount.to_sat().saturating_sub(total_input_amount.to_sat()));
-    match get_proper_utxo_set(
+    match get_proper_node_utxo_set(
         client,
         tx.weight().to_vbytes_ceil(),
-        node_address.clone(),
+        &node_keypair,
         shortfall,
         fee_rate,
     )
@@ -2135,7 +2161,7 @@ pub async fn build_sign_and_broadcast_tx(
         Some((inputs, _, change_amount)) => {
             for input in &inputs {
                 tx.input.push(TxIn {
-                    previous_output: input.outpoint,
+                    previous_output: input.input.outpoint,
                     script_sig: ScriptBuf::new(),
                     sequence: Sequence::MAX,
                     witness: Witness::default(),
@@ -2147,25 +2173,24 @@ pub async fn build_sign_and_broadcast_tx(
                     value: change_amount,
                 });
             }
+            let mut all_prevouts = fixed_prevouts;
+            all_prevouts.extend(inputs.iter().map(|i| i.prevout.clone()));
             for (i, input) in inputs.iter().enumerate() {
-                node_sign(
+                node_sign_by_source(
                     &mut tx,
                     i + fixed_inputs_num,
-                    input.amount,
+                    &input.prevout,
+                    &all_prevouts,
                     EcdsaSighashType::All,
                     &node_keypair,
+                    input.source,
                 )?;
             }
             broadcast_tx(client, &tx).await?;
             Ok(tx.compute_txid())
         }
         None => {
-            let current_balance = client
-                .get_address_utxo(node_address)
-                .await?
-                .iter()
-                .map(|u| u.value)
-                .sum::<Amount>();
+            let current_balance = get_node_known_balance(client, &node_keypair).await?;
             bail!(SpecialError::InsufficientBalance(format!(
                 "Not enough balance to complete the transaction, current_balance: {current_balance} < shortfall: {shortfall}"
             )));
@@ -2180,15 +2205,16 @@ pub async fn build_sign_and_broadcast_non_standard_tx(
     total_input_amount: Amount,
 ) -> Result<Txid> {
     let fixed_inputs_num = tx.input.len();
+    let fixed_prevouts = fetch_prevouts_for_inputs(client, &tx.input).await?;
     let total_output_amount: Amount = tx.output.iter().map(|o| o.value).sum();
     let fee_rate = get_fee_rate(client).await?;
-    let node_address = node_p2wsh_address(get_network(), &node_keypair.public_key().into());
+    let node_address = node_primary_address(get_network(), &node_keypair.public_key().into());
     let shortfall =
         Amount::from_sat(total_output_amount.to_sat().saturating_sub(total_input_amount.to_sat()));
-    match get_proper_utxo_set(
+    match get_proper_node_utxo_set(
         client,
         tx.weight().to_vbytes_ceil(),
-        node_address.clone(),
+        &node_keypair,
         shortfall,
         fee_rate,
     )
@@ -2197,7 +2223,7 @@ pub async fn build_sign_and_broadcast_non_standard_tx(
         Some((inputs, _, change_amount)) => {
             for input in &inputs {
                 tx.input.push(TxIn {
-                    previous_output: input.outpoint,
+                    previous_output: input.input.outpoint,
                     script_sig: ScriptBuf::new(),
                     sequence: Sequence::MAX,
                     witness: Witness::default(),
@@ -2209,25 +2235,24 @@ pub async fn build_sign_and_broadcast_non_standard_tx(
                     value: change_amount,
                 });
             }
+            let mut all_prevouts = fixed_prevouts;
+            all_prevouts.extend(inputs.iter().map(|i| i.prevout.clone()));
             for (i, input) in inputs.iter().enumerate() {
-                node_sign(
+                node_sign_by_source(
                     &mut tx,
                     i + fixed_inputs_num,
-                    input.amount,
+                    &input.prevout,
+                    &all_prevouts,
                     EcdsaSighashType::All,
                     &node_keypair,
+                    input.source,
                 )?;
             }
             todo_funcs::broadcast_nonstandard_tx(client, &tx).await?;
             Ok(tx.compute_txid())
         }
         None => {
-            let current_balance = client
-                .get_address_utxo(node_address)
-                .await?
-                .iter()
-                .map(|u| u.value)
-                .sum::<Amount>();
+            let current_balance = get_node_known_balance(client, &node_keypair).await?;
             bail!(SpecialError::InsufficientBalance(format!(
                 "Not enough balance to complete the transaction, current_balance: {current_balance} < shortfall: {shortfall}"
             )));
@@ -2247,7 +2272,7 @@ pub async fn build_cpfp_txns(
         return Ok(None);
     }
     let node_master_keypair = get_bitvm_key()?;
-    let node_address = node_p2wsh_address(network, &node_master_keypair.public_key().into());
+    let node_address = node_primary_address(network, &node_master_keypair.public_key().into());
     let total_output_amount: Amount = parent_tx.output.iter().map(|o| o.value).sum();
     let fee_rate = get_fee_rate(btc_client).await?;
     let fee_amount =
@@ -2256,10 +2281,10 @@ pub async fn build_cpfp_txns(
         return Ok(None);
     };
     let shortfall = total_output_amount + fee_amount - parent_tx_total_input_amount;
-    match get_proper_utxo_set(
+    match get_proper_node_utxo_set(
         btc_client,
         ANCHOR_CHILD_BASE_VBYTES,
-        node_address.clone(),
+        &node_master_keypair,
         shortfall,
         fee_rate,
     )
@@ -2286,7 +2311,7 @@ pub async fn build_cpfp_txns(
             }
             for input in &inputs {
                 child_tx.input.push(TxIn {
-                    previous_output: input.outpoint,
+                    previous_output: input.input.outpoint,
                     script_sig: ScriptBuf::new(),
                     sequence: Sequence::MAX,
                     witness: Witness::default(),
@@ -2301,24 +2326,23 @@ pub async fn build_cpfp_txns(
                 sequence: Sequence::MAX,
                 witness: Witness::default(),
             });
+            let mut all_prevouts: Vec<TxOut> = inputs.iter().map(|i| i.prevout.clone()).collect();
+            all_prevouts.push(parent_tx.output[anchor_vout as usize].clone());
             for (i, input) in inputs.iter().enumerate() {
-                node_sign(
+                node_sign_by_source(
                     &mut child_tx,
                     i,
-                    input.amount,
+                    &input.prevout,
+                    &all_prevouts,
                     EcdsaSighashType::All,
                     &node_master_keypair,
+                    input.source,
                 )?;
             }
             Ok(Some(child_tx))
         }
         None => {
-            let current_balance = btc_client
-                .get_address_utxo(node_address)
-                .await?
-                .iter()
-                .map(|u| u.value)
-                .sum::<Amount>();
+            let current_balance = get_node_known_balance(btc_client, &node_master_keypair).await?;
             bail!(SpecialError::InsufficientBalance(format!(
                 "Not enough balance to complete the transaction, current_balance: {current_balance}"
             )))
@@ -2376,6 +2400,170 @@ pub async fn get_proper_utxo_set(
     }
 
     Ok(None)
+}
+
+fn node_input_vbytes(source: NodeInputSource) -> u64 {
+    match source {
+        NodeInputSource::Primary(NodeBtcAddrType::P2tr) => CHEKSIG_P2TR_INPUT_VBYTES,
+        NodeInputSource::Primary(NodeBtcAddrType::P2wpkh) | NodeInputSource::LegacyP2wsh => {
+            CHEKSIG_P2WSH_INPUT_VBYTES
+        }
+    }
+}
+
+fn node_change_output_vbytes(addr_type: NodeBtcAddrType) -> u64 {
+    match addr_type {
+        NodeBtcAddrType::P2wpkh => P2WSH_OUTPUT_VBYTES,
+        NodeBtcAddrType::P2tr => P2TR_OUTPUT_VBYTES,
+    }
+}
+
+pub fn node_p2wpkh_address(network: Network, pubkey: &PublicKey) -> Address {
+    let compressed =
+        CompressedPublicKey::try_from(*pubkey).expect("node key must be compressed public key");
+    Address::p2wpkh(&compressed, network)
+}
+
+pub fn node_p2tr_address(network: Network, pubkey: &PublicKey) -> Address {
+    let secp = Secp256k1::new();
+    Address::p2tr(&secp, pubkey.inner.x_only_public_key().0, None, network)
+}
+
+pub fn node_primary_address(network: Network, pubkey: &PublicKey) -> Address {
+    match get_node_btc_addr_type() {
+        NodeBtcAddrType::P2wpkh => node_p2wpkh_address(network, pubkey),
+        NodeBtcAddrType::P2tr => node_p2tr_address(network, pubkey),
+    }
+}
+
+pub fn node_known_addresses(
+    network: Network,
+    pubkey: &PublicKey,
+) -> Vec<(Address, NodeInputSource)> {
+    let primary_type = get_node_btc_addr_type();
+    let primary = node_primary_address(network, pubkey);
+    let legacy = node_p2wsh_address(network, pubkey);
+    let mut ret = vec![(primary.clone(), NodeInputSource::Primary(primary_type))];
+    if primary.script_pubkey() != legacy.script_pubkey() {
+        ret.push((legacy, NodeInputSource::LegacyP2wsh));
+    }
+    ret
+}
+
+pub fn node_input_source_from_prevout(
+    network: Network,
+    keypair: &Keypair,
+    prevout: &TxOut,
+) -> Option<NodeInputSource> {
+    let pubkey: PublicKey = keypair.public_key().into();
+    for (address, source) in node_known_addresses(network, &pubkey) {
+        if address.script_pubkey() == prevout.script_pubkey {
+            return Some(source);
+        }
+    }
+    None
+}
+
+pub async fn get_proper_node_utxo_set(
+    client: &BTCClient,
+    base_vbytes: u64,
+    node_keypair: &Keypair,
+    target_amount: Amount,
+    fee_rate: f64,
+) -> Result<Option<(Vec<NodeSpendInput>, Amount, Amount)>> {
+    let network = client.network();
+    let node_pubkey: PublicKey = node_keypair.public_key().into();
+    let known_addresses = node_known_addresses(network, &node_pubkey);
+    let primary_source = known_addresses
+        .first()
+        .map(|(_, source)| *source)
+        .unwrap_or(NodeInputSource::Primary(get_node_btc_addr_type()));
+    let mut primary_utxos: Vec<NodeSpendInput> = vec![];
+    let mut legacy_utxos: Vec<NodeSpendInput> = vec![];
+
+    for (address, source) in &known_addresses {
+        tracing::debug!("get node utxos from {} ({})", address, source.label());
+        for utxo in client.get_address_utxo(address.clone()).await? {
+            let spend_input = NodeSpendInput {
+                input: Input {
+                    outpoint: OutPoint { txid: utxo.txid, vout: utxo.vout },
+                    amount: utxo.value,
+                },
+                prevout: TxOut { value: utxo.value, script_pubkey: address.script_pubkey() },
+                source: *source,
+            };
+            if *source == primary_source {
+                primary_utxos.push(spend_input);
+            } else {
+                legacy_utxos.push(spend_input);
+            }
+        }
+    }
+
+    let select_from = |mut candidates: Vec<NodeSpendInput>| {
+        candidates.sort_by(|a, b| b.input.amount.cmp(&a.input.amount));
+        let mut selected: Vec<NodeSpendInput> = vec![];
+        let mut total_value = Amount::ZERO;
+        for utxo in candidates.into_iter().take(MAX_CUSTOM_INPUTS) {
+            total_value += utxo.input.amount;
+            selected.push(utxo);
+
+            let input_vbytes: u64 = selected.iter().map(|i| node_input_vbytes(i.source)).sum();
+            let tx_vbytes = base_vbytes
+                .saturating_add(input_vbytes)
+                .saturating_add(node_change_output_vbytes(get_node_btc_addr_type()));
+            let fee = Amount::from_sat((tx_vbytes as f64 * fee_rate).ceil() as u64);
+            if total_value >= target_amount + fee {
+                let change = total_value - target_amount - fee;
+                return Some((selected, fee, change));
+            }
+        }
+        None
+    };
+
+    // Prefer spending from current configured address type first.
+    if let Some(ret) = select_from(primary_utxos.clone()) {
+        return Ok(Some(ret));
+    }
+
+    // Fallback to mixed selection with legacy p2wsh UTXOs.
+    primary_utxos.extend(legacy_utxos);
+    if let Some(ret) = select_from(primary_utxos) {
+        return Ok(Some(ret));
+    }
+
+    Ok(None)
+}
+
+pub async fn get_node_known_balance(client: &BTCClient, node_keypair: &Keypair) -> Result<Amount> {
+    let network = client.network();
+    let node_pubkey: PublicKey = node_keypair.public_key().into();
+    let mut total = Amount::ZERO;
+    for (address, _) in node_known_addresses(network, &node_pubkey) {
+        let balance: Amount = client.get_address_utxo(address).await?.iter().map(|u| u.value).sum();
+        total += balance;
+    }
+    Ok(total)
+}
+
+pub async fn fetch_prevouts_for_inputs(client: &BTCClient, inputs: &[TxIn]) -> Result<Vec<TxOut>> {
+    let mut prevouts = Vec::with_capacity(inputs.len());
+    for txin in inputs {
+        let outpoint = txin.previous_output;
+        let prev_tx = client
+            .get_tx(&outpoint.txid)
+            .await?
+            .ok_or_else(|| anyhow!("missing prev tx {} for input", outpoint.txid))?;
+        let prevout = prev_tx
+            .output
+            .get(outpoint.vout as usize)
+            .ok_or_else(|| {
+                anyhow!("missing prevout {}:{} for input", outpoint.txid, outpoint.vout)
+            })?
+            .clone();
+        prevouts.push(prevout);
+    }
+    Ok(prevouts)
 }
 
 /// Returns:
@@ -2496,7 +2684,84 @@ pub fn node_p2wsh_address(network: Network, pubkey: &PublicKey) -> Address {
     Address::p2wsh(&node_p2wsh_script(pubkey), network)
 }
 
-pub fn node_sign(
+fn sign_input_as_p2wpkh(
+    tx: &mut Transaction,
+    input_index: usize,
+    input_prevout: &TxOut,
+    sighash_type: EcdsaSighashType,
+    node_keypair: &Keypair,
+) -> Result<()> {
+    let secp = Secp256k1::new();
+    let mut cache = SighashCache::new(&mut *tx);
+    let sighash = cache
+        .p2wpkh_signature_hash(
+            input_index,
+            &input_prevout.script_pubkey,
+            input_prevout.value,
+            sighash_type,
+        )
+        .map_err(|e| anyhow!("failed to build p2wpkh sighash: {e}"))?;
+    let msg = SecpMessage::from_digest_slice(&sighash[..])
+        .map_err(|e| anyhow!("failed to build p2wpkh message: {e}"))?;
+    let sig = secp.sign_ecdsa(&msg, &node_keypair.secret_key());
+    let mut sig_bytes = sig.serialize_der().to_vec();
+    sig_bytes.push(sighash_type.to_u32() as u8);
+    tx.input[input_index].witness =
+        Witness::from(vec![sig_bytes, node_keypair.public_key().serialize().to_vec()]);
+    Ok(())
+}
+
+fn sign_input_as_p2tr(
+    tx: &mut Transaction,
+    input_index: usize,
+    input_prevout: &TxOut,
+    node_keypair: &Keypair,
+) -> Result<()> {
+    let secp = Secp256k1::new();
+    let tweaked_keypair = node_keypair.tap_tweak(&secp, None).to_keypair();
+    let sighash_type = TapSighashType::AllPlusAnyoneCanPay;
+    let mut cache = SighashCache::new(&mut *tx);
+    let sighash = cache
+        .taproot_key_spend_signature_hash(
+            input_index,
+            &Prevouts::One(input_index, input_prevout),
+            sighash_type,
+        )
+        .map_err(|e| anyhow!("failed to build p2tr sighash: {e}"))?;
+    let msg = SecpMessage::from_digest_slice(&sighash[..])
+        .map_err(|e| anyhow!("failed to build p2tr message: {e}"))?;
+    let sig = secp.sign_schnorr_no_aux_rand(&msg, &tweaked_keypair);
+    let mut sig_bytes = sig.as_ref().to_vec();
+    sig_bytes.push(sighash_type as u8);
+    tx.input[input_index].witness = Witness::from(vec![sig_bytes]);
+    Ok(())
+}
+
+pub fn node_sign_by_source(
+    tx: &mut Transaction,
+    input_index: usize,
+    input_prevout: &TxOut,
+    all_prevouts: &[TxOut],
+    sighash_type: EcdsaSighashType,
+    node_keypair: &Keypair,
+    source: NodeInputSource,
+) -> Result<()> {
+    match source {
+        NodeInputSource::Primary(NodeBtcAddrType::P2wpkh) => {
+            sign_input_as_p2wpkh(tx, input_index, input_prevout, sighash_type, node_keypair)
+        }
+        NodeInputSource::Primary(NodeBtcAddrType::P2tr) => {
+            let _ = all_prevouts;
+            sign_input_as_p2tr(tx, input_index, input_prevout, node_keypair)
+        }
+        NodeInputSource::LegacyP2wsh => {
+            warn!("sign legacy p2wsh input, consider consolidating to current address type");
+            node_sign_legacy_p2wsh(tx, input_index, input_prevout.value, sighash_type, node_keypair)
+        }
+    }
+}
+
+pub fn node_sign_legacy_p2wsh(
     tx: &mut Transaction,
     input_index: usize,
     input_value: Amount,
@@ -2513,6 +2778,29 @@ pub fn node_sign(
         &vec![node_keypair],
     );
     Ok(())
+}
+
+pub fn node_sign(
+    tx: &mut Transaction,
+    input_index: usize,
+    input_value: Amount,
+    sighash_type: EcdsaSighashType,
+    node_keypair: &Keypair,
+) -> Result<()> {
+    let node_pubkey: PublicKey = node_keypair.public_key().into();
+    let prevout = TxOut {
+        value: input_value,
+        script_pubkey: node_primary_address(get_network(), &node_pubkey).script_pubkey(),
+    };
+    node_sign_by_source(
+        tx,
+        input_index,
+        &prevout,
+        &[],
+        sighash_type,
+        node_keypair,
+        NodeInputSource::Primary(get_node_btc_addr_type()),
+    )
 }
 
 pub async fn build_genesis_prekickoff_tx(
@@ -2572,7 +2860,7 @@ pub async fn build_prekickoff_params(
         let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
         let master_keypair = operator_master_key.master_keypair();
         let nonce_keypair = operator_master_key.keypair_for_nonce(graph_nonce);
-        let nonce_address = node_p2wsh_address(network, &nonce_keypair.public_key().into());
+        let nonce_address = node_primary_address(network, &nonce_keypair.public_key().into());
         let replenishment_amount = todo_funcs::prekickoff_replenishment_amount();
         let mut replenish_fee_inputs: Vec<Input> = btc_client
             .get_address_utxo(nonce_address.clone())
@@ -2623,7 +2911,7 @@ pub async fn build_graph_params(
     let operator_master_keypair = operator_master_key.master_keypair();
     let operator_pubkey = operator_master_keypair.public_key().into();
     let operator_receive_address =
-        node_p2wsh_address(instance_parameters.network, &operator_pubkey);
+        node_primary_address(instance_parameters.network, &operator_pubkey);
     let operator_wots_pubkeys = operator_master_key.wots_keypair_for_graph(graph_id).1;
     let watchtower_pubkeys = goat_client.committee_mana_get_watchtowers().await?;
     let mut hashlocks = vec![];
@@ -2654,7 +2942,7 @@ pub async fn operator_skip_graph(btc_client: &BTCClient, graph: &mut Bitvm2Graph
     let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
     let operator_master_keypair = operator_master_key.master_keypair();
     let operator_receive_address =
-        node_p2wsh_address(get_network(), &operator_master_keypair.public_key().into());
+        node_primary_address(get_network(), &operator_master_keypair.public_key().into());
     let operator_graph_keypair = operator_master_key.master_keypair();
     let mut prekickoff_tx = operator_sign_prekickoff_input_0(operator_graph_keypair, graph)?;
     if prekickoff_tx.input.len() != 1 {
@@ -2800,7 +3088,7 @@ pub async fn operator_send_assert_commit(
     let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
     let node_keypair = operator_master_key.master_keypair();
     let node_public_key: PublicKey = node_keypair.public_key().into();
-    let node_address = node_p2wsh_address(get_network(), &node_public_key);
+    let node_address = node_primary_address(get_network(), &node_public_key);
     let fee_rate = get_fee_rate(btc_client).await?;
 
     // Ensure assert-init is confirmed before sending commits
@@ -2891,26 +3179,54 @@ pub async fn operator_send_assert_commit(
         return Ok((None, false, None));
     }
 
-    // get available fee UTXOs from node address
-    let (utxo_sets, split_tx) =
+    // get available fee UTXOs from current address first, fallback to legacy p2wsh address
+    let mut fee_source = NodeInputSource::Primary(get_node_btc_addr_type());
+    let legacy_node_address = node_p2wsh_address(get_network(), &node_public_key);
+    let (mut utxo_sets, mut split_tx) =
         get_proper_utxo_sets(btc_client, node_address.clone(), required_fees.clone(), fee_rate)
             .await?;
+    if utxo_sets.is_empty()
+        && split_tx.is_none()
+        && legacy_node_address.script_pubkey() != node_address.script_pubkey()
+    {
+        let (legacy_sets, legacy_split) = get_proper_utxo_sets(
+            btc_client,
+            legacy_node_address.clone(),
+            required_fees.clone(),
+            fee_rate,
+        )
+        .await?;
+        if !legacy_sets.is_empty() || legacy_split.is_some() {
+            warn!("use legacy p2wsh fee utxos for assert-commit graph_id:{graph_id}");
+            utxo_sets = legacy_sets;
+            split_tx = legacy_split;
+            fee_source = NodeInputSource::LegacyP2wsh;
+        }
+    }
+    let fee_change_script = match fee_source {
+        NodeInputSource::Primary(_) => node_address.script_pubkey(),
+        NodeInputSource::LegacyP2wsh => legacy_node_address.script_pubkey(),
+    };
 
     // broadcast split tx if needed
     if let Some((mut split_tx, txin_amounts)) = split_tx {
         for (i, amount) in txin_amounts.iter().enumerate().take(split_tx.input.len()) {
-            node_sign(&mut split_tx, i, *amount, EcdsaSighashType::All, &node_keypair)?;
+            let prevout = TxOut { value: *amount, script_pubkey: fee_change_script.clone() };
+            node_sign_by_source(
+                &mut split_tx,
+                i,
+                &prevout,
+                &[],
+                EcdsaSighashType::All,
+                &node_keypair,
+                fee_source,
+            )?;
         }
         let split_txid = split_tx.compute_txid();
         broadcast_tx(btc_client, &split_tx).await?;
         return Ok((Some(split_txid), false, None));
     } else if utxo_sets.is_empty() {
-        let current_balance = btc_client
-            .get_address_utxo(node_address)
-            .await?
-            .iter()
-            .map(|u| u.value)
-            .sum::<Amount>();
+        let current_balance = get_node_known_balance(btc_client, &node_keypair).await?;
         let required_total_fee: Amount = required_fees.into_iter().sum();
         bail!(SpecialError::InsufficientBalance(format!(
             "Not enough balance to complete the transaction, current_balance: {current_balance}, required: {required_total_fee}"
@@ -2955,8 +3271,7 @@ pub async fn operator_send_assert_commit(
         let fee = required_fees[i];
         let change_value = fee_inputs_total - fee;
         if change_value > Amount::from_sat(DUST_AMOUNT) {
-            tx.output
-                .push(TxOut { value: change_value, script_pubkey: node_address.script_pubkey() });
+            tx.output.push(TxOut { value: change_value, script_pubkey: fee_change_script.clone() });
         } else {
             let op_return_script = generate_opreturn_script(
                 format!("assert-commit-{origin_index}").as_bytes().to_vec(),
@@ -2966,12 +3281,16 @@ pub async fn operator_send_assert_commit(
 
         for (fee_index, fee_input) in fee_inputs.iter().enumerate() {
             let input_index = 1 + fee_index;
-            node_sign(
+            let prevout =
+                TxOut { value: fee_input.amount, script_pubkey: fee_change_script.clone() };
+            node_sign_by_source(
                 &mut tx,
                 input_index,
-                fee_input.amount,
+                &prevout,
+                &[],
                 EcdsaSighashType::All,
                 &node_keypair,
+                fee_source,
             )?;
         }
 
@@ -3014,46 +3333,45 @@ pub async fn send_watchtower_challenge_tx(
     let fee_rate = get_fee_rate(btc_client).await?;
     let watchtower_challenge_tx_base_vbytes =
         estimate_watchtower_challenge_vbytes(commitment_data.len());
-    let node_address = node_p2wsh_address(get_network(), &watchtower_keypair.public_key().into());
-    match get_proper_utxo_set(
+    let node_address = node_primary_address(get_network(), &watchtower_keypair.public_key().into());
+    match get_proper_node_utxo_set(
         btc_client,
         watchtower_challenge_tx_base_vbytes as u64,
-        node_address.clone(),
+        &watchtower_keypair,
         Amount::ZERO,
         fee_rate,
     )
     .await?
     {
         Some((inputs, fee_amount, _)) => {
+            let plain_inputs: Vec<Input> = inputs.iter().map(|i| i.input.clone()).collect();
             let mut watchtower_challenge_tx = build_watchtower_challenge_tx(
                 graph,
                 &watchtower_keypair,
                 watchtower_index,
                 &commitment_data,
-                inputs.clone(),
+                plain_inputs,
                 &node_address,
                 fee_amount,
             )
             .unwrap();
+            let all_prevouts: Vec<TxOut> = inputs.iter().map(|i| i.prevout.clone()).collect();
             for (i, input) in inputs.iter().enumerate() {
-                node_sign(
+                node_sign_by_source(
                     &mut watchtower_challenge_tx,
                     i + 1,
-                    input.amount,
+                    &input.prevout,
+                    &all_prevouts,
                     EcdsaSighashType::All,
                     &watchtower_keypair,
+                    input.source,
                 )?;
             }
             broadcast_tx(btc_client, &watchtower_challenge_tx).await?;
             Ok(watchtower_challenge_tx.compute_txid())
         }
         None => {
-            let current_balance = btc_client
-                .get_address_utxo(node_address)
-                .await?
-                .iter()
-                .map(|u| u.value)
-                .sum::<Amount>();
+            let current_balance = get_node_known_balance(btc_client, &watchtower_keypair).await?;
             bail!(SpecialError::InsufficientBalance(format!(
                 "Not enough balance to complete the transaction, current_balance: {current_balance}"
             )));
@@ -3616,6 +3934,7 @@ pub async fn get_current_prekickoff_tx(
     // return (latest_graph.nonce + 1 , latest_graph.next_prekickoff_tx)
     // return None if no graph yet
     let mut storage_processor = local_db.acquire().await?;
+    // todo: get latest graph
     let graphs = storage_processor
         .get_operator_graphs(
             GraphQuery::default()
@@ -3830,7 +4149,8 @@ pub async fn store_graph(local_db: &LocalDB, simple_graph: &SimplifiedBitvm2Grap
     {
         graph.from_addr = node_info.goat_addr.clone();
         graph.to_addr =
-            node_p2wsh_address(get_network(), &bitvm2_graph.parameters.operator_pubkey).to_string();
+            node_primary_address(get_network(), &bitvm2_graph.parameters.operator_pubkey)
+                .to_string();
     }
 
     tx.upsert_graph(&graph).await?;
@@ -4637,6 +4957,13 @@ pub async fn get_largest_watchtower_challenge_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[tokio::test]
     #[ignore = "test on regtest"]
@@ -4672,5 +4999,130 @@ mod tests {
         let url = base_url.join(NODES_OPERATOR_BASE).unwrap();
 
         assert_eq!(url.as_str(), "http://127.0.0.1:8900/v1/proofs/operator_proofs");
+    }
+
+    #[test]
+    fn test_node_primary_address_derivation() {
+        let _guard = env_lock().lock().expect("env lock");
+        let network = Network::Testnet4;
+        let keypair = Keypair::from_seckey_str_global(
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .expect("keypair");
+        let pubkey: PublicKey = keypair.public_key().into();
+
+        unsafe {
+            std::env::set_var(ENV_BITVM_BTC_ADDR_TYPE, "p2wpkh");
+        }
+        let p2wpkh = node_primary_address(network, &pubkey);
+        let known = node_known_addresses(network, &pubkey);
+        assert_eq!(known[0].0, p2wpkh);
+        assert!(known.iter().any(|(_, s)| *s == NodeInputSource::LegacyP2wsh));
+
+        unsafe {
+            std::env::set_var(ENV_BITVM_BTC_ADDR_TYPE, "p2tr");
+        }
+        let p2tr = node_primary_address(network, &pubkey);
+        assert_ne!(p2wpkh, p2tr);
+        assert!(p2wpkh.to_string().starts_with("tb1"));
+        assert!(p2tr.to_string().starts_with("tb1p"));
+
+        unsafe {
+            std::env::remove_var(ENV_BITVM_BTC_ADDR_TYPE);
+        }
+    }
+
+    #[test]
+    fn test_node_sign_dispatch_witness_shape() {
+        let _guard = env_lock().lock().expect("env lock");
+        let keypair = Keypair::from_seckey_str_global(
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .expect("keypair");
+        let pubkey: PublicKey = keypair.public_key().into();
+        let input_amount = Amount::from_sat(50_000);
+
+        let build_tx = || Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_str(
+                        "0202020202020202020202020202020202020202020202020202020202020202",
+                    )
+                    .expect("txid"),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(10_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        unsafe {
+            std::env::set_var(ENV_BITVM_BTC_ADDR_TYPE, "p2wpkh");
+        }
+        let mut tx_p2wpkh = build_tx();
+        let prevout_p2wpkh = TxOut {
+            value: input_amount,
+            script_pubkey: node_p2wpkh_address(Network::Testnet4, &pubkey).script_pubkey(),
+        };
+        node_sign_by_source(
+            &mut tx_p2wpkh,
+            0,
+            &prevout_p2wpkh,
+            &[],
+            EcdsaSighashType::All,
+            &keypair,
+            NodeInputSource::Primary(NodeBtcAddrType::P2wpkh),
+        )
+        .expect("sign p2wpkh");
+        assert_eq!(tx_p2wpkh.input[0].witness.len(), 2);
+
+        unsafe {
+            std::env::set_var(ENV_BITVM_BTC_ADDR_TYPE, "p2tr");
+        }
+        let mut tx_p2tr = build_tx();
+        let prevout_p2tr = TxOut {
+            value: input_amount,
+            script_pubkey: node_p2tr_address(Network::Testnet4, &pubkey).script_pubkey(),
+        };
+        node_sign_by_source(
+            &mut tx_p2tr,
+            0,
+            &prevout_p2tr,
+            &[],
+            EcdsaSighashType::All,
+            &keypair,
+            NodeInputSource::Primary(NodeBtcAddrType::P2tr),
+        )
+        .expect("sign p2tr");
+        assert_eq!(tx_p2tr.input[0].witness.len(), 1);
+        assert_eq!(tx_p2tr.input[0].witness.iter().next().expect("witness").len(), 65);
+
+        let mut tx_legacy = build_tx();
+        let prevout_legacy = TxOut {
+            value: input_amount,
+            script_pubkey: node_p2wsh_address(Network::Testnet4, &pubkey).script_pubkey(),
+        };
+        node_sign_by_source(
+            &mut tx_legacy,
+            0,
+            &prevout_legacy,
+            &[],
+            EcdsaSighashType::All,
+            &keypair,
+            NodeInputSource::LegacyP2wsh,
+        )
+        .expect("sign legacy p2wsh");
+        assert_eq!(tx_legacy.input[0].witness.len(), 2);
+
+        unsafe {
+            std::env::remove_var(ENV_BITVM_BTC_ADDR_TYPE);
+        }
     }
 }

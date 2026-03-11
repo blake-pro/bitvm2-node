@@ -52,6 +52,7 @@ pub const DEFAULT_OPERATOR_NODE_SERVICE_FEE_RATE: f64 = 0.001;
 pub const ENV_GOAT_ADDRESS: &str = "GOAT_ADDRESS";
 /// Operator(private key), Relayer(private key),  Committee(seed)
 pub const ENV_BITVM_SECRET: &str = "BITVM_SECRET";
+pub const ENV_BITVM_BTC_ADDR_TYPE: &str = "BITVM_BTC_ADDR_TYPE";
 /// All actors
 pub const ENV_PEER_KEY: &str = "PEER_KEY";
 pub const ENV_PROOF_SEVER_URL: &str = "PROOF_SEVER_URL";
@@ -81,6 +82,21 @@ pub const ENV_SEQUENCER_SET_MONITOR_START_COSMOS_BLOCK: &str =
     "SEQUENCER_SET_MONITOR_START_COSMOS_BLOCK";
 pub const ENV_COSMOS_RPC_URL: &str = "COSMOS_RPC_URL";
 pub const DEFAULT_COSMOS_RPC_URL: &str = "https://rpc.testnet3.goat.network/goat-rpc";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeBtcAddrType {
+    P2wpkh,
+    P2tr,
+}
+
+impl NodeBtcAddrType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::P2wpkh => "p2wpkh",
+            Self::P2tr => "p2tr",
+        }
+    }
+}
 
 // fee estimate
 // TODO: more precise fee estimation
@@ -156,6 +172,20 @@ pub fn get_goat_network() -> GoatNetwork {
         _ => {
             warn!("Unknown GOAT network: {network}, expect main, or test, return test by default");
             GoatNetwork::Test
+        }
+    }
+}
+
+pub fn get_node_btc_addr_type() -> NodeBtcAddrType {
+    let raw = std::env::var(ENV_BITVM_BTC_ADDR_TYPE).unwrap_or_else(|_| "p2wpkh".to_string());
+    match raw.to_lowercase().as_str() {
+        "p2wpkh" => NodeBtcAddrType::P2wpkh,
+        "p2tr" => NodeBtcAddrType::P2tr,
+        _ => {
+            warn!(
+                "Unknown BITVM BTC addr type: {raw}, expect p2wpkh or p2tr, use p2wpkh by default"
+            );
+            NodeBtcAddrType::P2wpkh
         }
     }
 }

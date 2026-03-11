@@ -804,7 +804,7 @@ bitvm2-noded key peer
 # Generate funding address (for Operator/Challenger)
 bitvm2-noded key funding-address
 # Output:
-# Funding P2WSH address: bc1q...
+# Funding address type=p2wpkh, address=bc1q...
 ```
 
 ### Start Node
@@ -842,6 +842,7 @@ bitvm2-noded \
 | `GOAT_CHAIN_URL` | Yes | GOAT L2 RPC endpoint | - |
 | `GOAT_GATEWAY_CONTRACT_ADDRESS` | Yes | Gateway contract address | - |
 | `BITVM_SECRET` | Yes | Node private key or seed (`seed:xxx` format) | - |
+| `BITVM_BTC_ADDR_TYPE` | No | Node BTC address type: `p2wpkh` or `p2tr` | `p2wpkh` |
 | `PEER_KEY` | Yes | libp2p node key (Base64 encoded) | - |
 | `GOAT_PRIVATE_KEY` | Conditional | GOAT chain private key (required for Committee) | - |
 | `GOAT_ADDRESS` | Conditional | GOAT address (required for Operator/Challenger) | - |

@@ -2,7 +2,7 @@
 //!
 //! Purpose:
 //! - Rebuild a stuck transaction using the same inputs (`--vin txid:vout`) and
-//!   bump the absolute fee. Inputs must belong to the node's P2WSH address
+//!   bump the absolute fee. Inputs must belong to the node's known address set
 //!   derived from `BITVM_SECRET`. Outputs are consolidated to a single address.
 //!
 //! Env:
@@ -32,7 +32,10 @@ use goat::transactions::base::Input;
 use tracing_subscriber::EnvFilter;
 
 use bitvm2_noded::env::{DUST_AMOUNT, get_bitvm_key, get_network};
-use bitvm2_noded::utils::{broadcast_tx, node_p2wsh_address, node_sign};
+use bitvm2_noded::utils::{
+    NodeSpendInput, broadcast_tx, node_input_source_from_prevout, node_known_addresses,
+    node_primary_address, node_sign_by_source,
+};
 
 const DEFAULT_RBF_SEQUENCE: u32 = 0xFFFF_FFFD;
 
@@ -47,7 +50,7 @@ struct Args {
     #[arg(long = "vin", required = true)]
     vins: Vec<VinArg>,
 
-    /// Optional destination address (defaults to node's P2WSH address)
+    /// Optional destination address (defaults to node's configured funding address)
     #[arg(long = "to-address")]
     to_address: Option<String>,
 
@@ -97,7 +100,8 @@ async fn main() -> Result<()> {
     let btc_client = BTCClient::new(network, Some(&args.esplora_url));
 
     let node_keypair = get_bitvm_key()?;
-    let node_address = node_p2wsh_address(network, &node_keypair.public_key().into());
+    let node_pubkey = node_keypair.public_key().into();
+    let node_address = node_primary_address(network, &node_pubkey);
     let destination_address = match &args.to_address {
         Some(addr) => Address::from_str(addr)
             .context("failed to parse destination address")?
@@ -106,13 +110,12 @@ async fn main() -> Result<()> {
         None => node_address.clone(),
     };
 
-    let expected_script = node_address.script_pubkey();
-    let inputs = resolve_inputs(&btc_client, &args.vins, &expected_script, network).await?;
+    let inputs = resolve_inputs(&btc_client, &args.vins, &node_keypair, network).await?;
 
     let mut tx = build_skeleton_tx(&inputs, &destination_address)?;
 
     let fee_sat = args.fee_amount;
-    let total_input = inputs.iter().map(|i| i.amount).sum::<Amount>();
+    let total_input = inputs.iter().map(|i| i.input.amount).sum::<Amount>();
     let total_input_sat = total_input.to_sat();
     if fee_sat >= total_input_sat {
         bail!(
@@ -127,8 +130,17 @@ async fn main() -> Result<()> {
     }
     tx.output[0].value = Amount::from_sat(output_value_sat);
 
+    let all_prevouts: Vec<TxOut> = inputs.iter().map(|i| i.prevout.clone()).collect();
     for (idx, input) in inputs.iter().enumerate() {
-        node_sign(&mut tx, idx, input.amount, EcdsaSighashType::All, &node_keypair)?;
+        node_sign_by_source(
+            &mut tx,
+            idx,
+            &input.prevout,
+            &all_prevouts,
+            EcdsaSighashType::All,
+            &node_keypair,
+            input.source,
+        )?;
     }
 
     let txid = tx.compute_txid();
@@ -144,9 +156,14 @@ async fn main() -> Result<()> {
 async fn resolve_inputs(
     btc_client: &BTCClient,
     vins: &[VinArg],
-    expected_script: &ScriptBuf,
+    node_keypair: &bitcoin::key::Keypair,
     network: Network,
-) -> Result<Vec<Input>> {
+) -> Result<Vec<NodeSpendInput>> {
+    let known_scripts: Vec<ScriptBuf> =
+        node_known_addresses(network, &node_keypair.public_key().into())
+            .into_iter()
+            .map(|(addr, _)| addr.script_pubkey())
+            .collect();
     let mut resolved = Vec::with_capacity(vins.len());
     for vin in vins {
         let tx = btc_client
@@ -157,25 +174,32 @@ async fn resolve_inputs(
             .output
             .get(vin.vout as usize)
             .ok_or_else(|| anyhow!("tx {} has no vout {}", vin.txid, vin.vout))?;
-        if &txout.script_pubkey != expected_script {
+        if !known_scripts.contains(&txout.script_pubkey) {
             bail!(
-                "input {vin} does not belong to the node P2WSH address; unsupported script {:#?}",
+                "input {vin} does not belong to node known addresses; unsupported script {:#?}",
                 txout.script_pubkey
             );
         }
-        resolved.push(Input {
-            outpoint: OutPoint { txid: vin.txid, vout: vin.vout },
-            amount: txout.value,
+        let prevout = txout.clone();
+        let source = node_input_source_from_prevout(network, node_keypair, &prevout)
+            .ok_or_else(|| anyhow!("failed to map input {vin} to node input source"))?;
+        resolved.push(NodeSpendInput {
+            input: Input {
+                outpoint: OutPoint { txid: vin.txid, vout: vin.vout },
+                amount: txout.value,
+            },
+            prevout,
+            source,
         });
     }
     Ok(resolved)
 }
 
-fn build_skeleton_tx(inputs: &[Input], destination: &Address) -> Result<Transaction> {
+fn build_skeleton_tx(inputs: &[NodeSpendInput], destination: &Address) -> Result<Transaction> {
     let mut txins = Vec::with_capacity(inputs.len());
     for input in inputs {
         txins.push(TxIn {
-            previous_output: input.outpoint,
+            previous_output: input.input.outpoint,
             script_sig: ScriptBuf::new(),
             sequence: Sequence::from_consensus(DEFAULT_RBF_SEQUENCE),
             witness: Witness::default(),

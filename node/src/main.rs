@@ -3,7 +3,7 @@ use base64::Engine;
 use bitvm2_lib::actors::Actor;
 use bitvm2_noded::env::{
     self, ENV_PEER_KEY, SEQUENCER_SET_MONITOR_INTERVAL_SECS, check_node_info, get_btc_url_from_env,
-    get_goat_network, get_network, get_node_pubkey, goat_config_from_env,
+    get_goat_network, get_network, get_node_btc_addr_type, get_node_pubkey, goat_config_from_env,
 };
 use clap::{Parser, Subcommand};
 use client::{btc_chain::BTCClient, goat_chain::GOATClient};
@@ -28,6 +28,7 @@ use futures::future;
 use tokio::signal;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
@@ -113,13 +114,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             KeyCommands::FundingAddress => {
                 let public_key = get_node_pubkey()?;
-                let p2wsh_addr = utils::node_p2wsh_address(get_network(), &public_key);
-                println!("Funding P2WSH address (for operator and challenger): {p2wsh_addr}");
+                let funding_addr = utils::node_primary_address(get_network(), &public_key);
+                let addr_type = get_node_btc_addr_type().as_str();
+                println!(
+                    "Funding address type={addr_type}, address={funding_addr} (legacy P2WSH is read-only compatible)"
+                );
             }
         }
         return Ok(());
     }
     let _ = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).try_init();
+    info!(
+        "Node BTC address mode: {} (legacy p2wsh read-only compatible)",
+        get_node_btc_addr_type().as_str()
+    );
 
     let is_publisher = actor == Actor::Publisher || actor == Actor::All;
     let sequencer_set_monitor_start_cosmos_block =
