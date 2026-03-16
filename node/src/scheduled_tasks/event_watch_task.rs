@@ -15,6 +15,7 @@ use crate::utils::{
     get_bridge_out_global_stats, outpoint_available, reflect_goat_address, strip_hex_prefix_owned,
 };
 use alloy::primitives::{Address as EvmAddress, U256};
+use alloy::providers::ProviderBuilder;
 use alloy::sol_types::{SolType, SolValue};
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::hashes::Hash;
@@ -22,6 +23,7 @@ use bitcoin::{Address, Amount, OutPoint, Txid};
 use bitvm2_lib::actors::Actor;
 use bitvm2_lib::types::UserInfo;
 use client::btc_chain::BTCClient;
+use client::goat_chain::utils::get_peg_btc_contract;
 use client::goat_chain::GOATClient;
 use client::graphs::GraphQueryClient;
 use client::graphs::graph_query::{
@@ -45,10 +47,13 @@ use store::{
     InstanceBridgeInStatus, InstanceBridgeOutStatus, MessageState, WatchContract,
     WatchContractStatus,
 };
+use tokio::sync::OnceCell;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use uuid::Uuid;
+
+static GATEWAY_PEG_BTC_ADDRESS: OnceCell<EvmAddress> = OnceCell::const_new();
 
 #[allow(clippy::too_many_arguments)]
 pub async fn fetch_and_handle_block_range_events<'a>(
@@ -847,10 +852,27 @@ async fn handle_swap_refund_events<'a>(
 }
 
 async fn get_gateway_peg_btc_address() -> anyhow::Result<EvmAddress> {
-    env::goat_config_from_env()
-        .await
-        .peg_btc_address
-        .ok_or(anyhow::anyhow!("failed to get gateway pegBTC contract address"))
+    let address = GATEWAY_PEG_BTC_ADDRESS
+        .get_or_try_init(|| async {
+            let rpc_url = env::get_goat_url_from_env();
+            let gateway_address = get_goat_address_from_env(ENV_GOAT_GATEWAY_CONTRACT_ADDRESS)
+                .ok_or(anyhow::anyhow!("need to set gateway contract address"))?;
+            let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
+            let peg_btc_address = get_peg_btc_contract(&provider, gateway_address)
+                .await
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "failed to query gateway pegBTC contract address from rpc_url={rpc_url}, gateway_address={gateway_address}: {err}"
+                    )
+                })?;
+            info!(
+                "gateway pegBTC contract address initialized from chain: {}",
+                peg_btc_address
+            );
+            Ok::<EvmAddress, anyhow::Error>(peg_btc_address)
+        })
+        .await?;
+    Ok(*address)
 }
 
 async fn is_gateway_peg_btc_swap_instance(
@@ -964,7 +986,6 @@ pub async fn fetch_history_events(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let task_name = watch_events_config.get_watch_contract_type().to_string();
     info!("Start into fetch_history_events from:{} for {task_name}", watch_contract.from_height);
-    // let goat_client = GOATClient::new(env::goat_config_from_env().await, env::get_goat_network());
     let mut watch_contract = watch_contract.clone();
     let local_db_clone = local_db.clone();
     let contract_addr = watch_contract.contract_addr.clone();

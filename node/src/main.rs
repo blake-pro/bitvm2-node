@@ -130,6 +130,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
+    let goat_network = get_goat_network();
+    let goat_init_config = goat_config_from_env().await;
     let mut metric_registry = Registry::default();
 
     // Create cancellation token for graceful shutdown
@@ -158,7 +160,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let handler = BitvmNodeProcessor {
         local_db: local_db.clone(),
         btc_client: BTCClient::new(get_network(), get_btc_url_from_env().as_deref()),
-        goat_client: GOATClient::new(env::goat_config_from_env().await, env::get_goat_network()),
+        goat_client: GOATClient::new(goat_init_config.clone(), goat_network.clone()),
         http_client: HttpAsyncClient::new(None),
     };
 
@@ -172,6 +174,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let opt_rpc_addr = opt.rpc_addr.clone();
     let peer_id_string_clone = peer_id_string.clone();
     let metric_registry_clone = Arc::new(Mutex::new(metric_registry));
+    let goat_client = Arc::new(GOATClient::new(goat_init_config, goat_network.clone()));
 
     tracing::debug!("RPC service listening on {}", &opt.rpc_addr);
     if actor == Actor::Operator {
@@ -183,6 +186,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Spawn RPC service task with cancellation support
     let cancel_token_clone = cancellation_token.clone();
+    let rpc_goat_client = goat_client.clone();
     task_handles.push(tokio::spawn(async move {
         match rpc_service::serve(
             opt_rpc_addr,
@@ -190,6 +194,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             actor_clone1,
             peer_id_string_clone,
             metric_registry_clone,
+            rpc_goat_client,
             cancel_token_clone,
         )
         .await
@@ -201,17 +206,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     }));
-    // if actor == Actor::Committee || actor == Actor::Operator {
+
+    let goat_client_clone = goat_client.clone();
     let cancel_token_clone = cancellation_token.clone();
     task_handles.push(tokio::spawn(async move {
-        let goat_client =
-            Arc::new(GOATClient::new(goat_config_from_env().await, get_goat_network()));
         let btc_client = Arc::new(BTCClient::new(get_network(), get_btc_url_from_env().as_deref()));
         match run_watch_event_task(
             actor_clone2,
             local_db_clone2,
             btc_client,
-            goat_client,
+            goat_client_clone,
             5,
             cancel_token_clone,
         )
@@ -229,12 +233,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let start_cosmos_block = sequencer_set_monitor_start_cosmos_block.unwrap();
         let cosmos_rpc_url = env::get_cosmos_rpc_url_from_env();
         let cancel_token_clone = cancellation_token.clone();
+        let goat_client_clone = goat_client.clone();
         task_handles.push(tokio::spawn(async move {
-            let goat_client =
-                Arc::new(GOATClient::new(goat_config_from_env().await, get_goat_network()));
             match run_sequencer_set_hash_monitor_task(
                 local_db_clone4,
-                goat_client,
+                goat_client_clone,
                 cosmos_rpc_url,
                 start_cosmos_block,
                 SEQUENCER_SET_MONITOR_INTERVAL_SECS,
@@ -250,18 +253,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }));
     }
-    // }
-
     let cancel_token_clone = cancellation_token.clone();
+    let goat_client_clone = goat_client.clone();
     task_handles.push(tokio::spawn(async move {
-        let goat_client =
-            Arc::new(GOATClient::new(goat_config_from_env().await, get_goat_network()));
         let btc_client = Arc::new(BTCClient::new(get_network(), get_btc_url_from_env().as_deref()));
         match run_maintenance_tasks(
             actor_clone3,
             local_db_clone3,
             btc_client,
-            goat_client,
+            goat_client_clone,
             10,
             cancel_token_clone,
         )

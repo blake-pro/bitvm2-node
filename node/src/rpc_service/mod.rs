@@ -8,7 +8,7 @@ pub mod routes;
 pub(super) mod utils;
 pub mod validation;
 
-use crate::env::{get_btc_url_from_env, get_goat_network, get_network, goat_config_from_env};
+use crate::env::{get_btc_url_from_env, get_network};
 use crate::metrics_service::{MetricsState, metrics_handler, metrics_middleware};
 use crate::rpc_service::cors_config::CorsConfig;
 use crate::rpc_service::handler::{
@@ -65,7 +65,7 @@ pub fn create_secure_cors_layer() -> CorsLayer {
 pub struct AppState {
     pub local_db: LocalDB,
     pub btc_client: BTCClient,
-    pub goat_client: GOATClient,
+    pub goat_client: Arc<GOATClient>,
     pub http_client: HttpAsyncClient,
     pub metrics_state: MetricsState,
     pub actor: Actor,
@@ -78,9 +78,9 @@ impl AppState {
         actor: Actor,
         peer_id: String,
         registry: Arc<Mutex<Registry>>,
+        goat_client: Arc<GOATClient>,
     ) -> anyhow::Result<Arc<AppState>> {
         let btc_client = BTCClient::new(get_network(), get_btc_url_from_env().as_deref());
-        let goat_client = GOATClient::new(goat_config_from_env().await, get_goat_network());
         let metrics_state = MetricsState::new(registry);
         let http_client = HttpAsyncClient::new(None);
         Ok(Arc::new(AppState {
@@ -121,9 +121,11 @@ pub async fn serve(
     actor: Actor,
     peer_id: String,
     registry: Arc<Mutex<Registry>>,
+    goat_client: Arc<GOATClient>,
     cancellation_token: CancellationToken,
 ) -> anyhow::Result<String> {
-    let app_state = AppState::create_arc_app_state(local_db, actor, peer_id, registry).await?;
+    let app_state =
+        AppState::create_arc_app_state(local_db, actor, peer_id, registry, goat_client).await?;
     let server = Router::new()
         .route(routes::ROOT, get(root))
         .route(routes::v1::NODES_BASE, get(get_nodes))
@@ -237,7 +239,8 @@ async fn print_req_and_resp_detail(
 #[cfg(test)]
 mod tests {
     use crate::env::{
-        ENV_GOAT_CHAIN_URL, ENV_GOAT_GATEWAY_CONTRACT_ADDRESS, ENV_PROOF_SEVER_URL, get_network,
+        ENV_GOAT_CHAIN_URL, ENV_GOAT_GATEWAY_CONTRACT_ADDRESS, ENV_PROOF_SEVER_URL,
+        get_goat_network, get_network, goat_config_from_env,
     };
     use crate::rpc_service::bitvm2::{
         BRIDGE_IN_AMOUNTS, GraphGetResponse, GraphListResponse, InstanceGetResponse,
@@ -251,6 +254,7 @@ mod tests {
     };
     use alloy::primitives::U256;
     use client::Utxo;
+    use client::goat_chain::GOATClient;
     use http::Method;
     use prometheus_client::registry::Registry;
     use reqwest::Client;
@@ -424,12 +428,14 @@ mod tests {
 
         let local_db = create_local_db(&temp_sqlite_db_path()).await;
         init_nodes_data(&local_db, &nodes).await?;
+        let goat_client = Arc::new(GOATClient::new(goat_config_from_env().await, get_goat_network()));
         tokio::spawn(rpc_service::serve(
             addr.clone(),
             local_db,
             Actor::Challenger,
             generate_local_key().public().to_peer_id().to_string(),
             Arc::new(Mutex::new(Registry::default())),
+            goat_client,
             CancellationToken::new(),
         ));
         sleep(Duration::from_secs(3)).await;
@@ -625,6 +631,7 @@ mod tests {
         });
 
         init_instance_graph_data(&local_db, &instances, &graphs).await?;
+        let goat_client = Arc::new(GOATClient::new(goat_config_from_env().await, get_goat_network()));
 
         tokio::spawn(rpc_service::serve(
             addr.clone(),
@@ -632,6 +639,7 @@ mod tests {
             actor.clone(),
             peer_id.clone(),
             Arc::new(Mutex::new(Registry::default())),
+            goat_client,
             CancellationToken::new(),
         ));
         sleep(Duration::from_secs(3)).await;
@@ -779,12 +787,14 @@ mod tests {
         let committee = Actor::Committee;
         let committee_peer_id = generate_local_key().public().to_peer_id().to_string();
         let local_db = create_local_db(&temp_sqlite_db_path()).await;
+        let goat_client = Arc::new(GOATClient::new(goat_config_from_env().await, get_goat_network()));
         tokio::spawn(rpc_service::serve(
             addr.clone(),
             local_db,
             committee,
             committee_peer_id,
             Arc::new(Mutex::new(Registry::default())),
+            goat_client,
             CancellationToken::new(),
         ));
         sleep(Duration::from_secs(3)).await;
