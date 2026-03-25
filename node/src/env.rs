@@ -81,6 +81,7 @@ pub const ENV_SEQUENCER_SET_MONITOR_START_COSMOS_BLOCK: &str =
     "SEQUENCER_SET_MONITOR_START_COSMOS_BLOCK";
 pub const ENV_COSMOS_RPC_URL: &str = "COSMOS_RPC_URL";
 pub const DEFAULT_COSMOS_RPC_URL: &str = "https://rpc.testnet3.goat.network/goat-rpc";
+pub const ENV_ENABLE_PART_STARK_VK_ATTESTATION_GATE: &str = "ENABLE_PART_STARK_VK_ATTESTATION_GATE";
 
 // fee estimate
 // TODO: more precise fee estimation
@@ -221,6 +222,18 @@ pub fn get_btc_block_confirms(network: Network) -> u32 {
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(util::get_btc_block_confirms(network))
+}
+
+pub fn is_part_stark_vk_attestation_gate_enabled() -> bool {
+    matches!(
+        std::env::var(ENV_ENABLE_PART_STARK_VK_ATTESTATION_GATE)
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
 }
 
 pub fn get_node_goat_private_key() -> anyhow::Result<String> {

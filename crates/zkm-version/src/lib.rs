@@ -1,5 +1,8 @@
+use sha2::{Digest, Sha256};
+
 pub const ZKM_VERSION_BYTES_LEN: usize = 16;
 pub type ZkmVersionBytes = [u8; ZKM_VERSION_BYTES_LEN];
+pub const PART_STARK_VK_ATTESTATION_DOMAIN_TAG: &str = "bitvm2:part_stark_vk_attestation:v1";
 
 pub fn encode_zkm_version_fixed(version: &str) -> Result<ZkmVersionBytes, String> {
     let raw = version.as_bytes();
@@ -48,6 +51,34 @@ pub fn read_zkm_version_from_file(input_proof: &str) -> Result<String, String> {
 pub fn read_zkm_version_fixed_from_file(input_proof: &str) -> Result<ZkmVersionBytes, String> {
     let version = read_zkm_version_from_file(input_proof)?;
     encode_zkm_version_fixed(&version)
+}
+
+pub fn build_part_stark_vk_attestation_message(
+    domain_tag: &str,
+    zkm_version: &str,
+    part_stark_vk: &[u8],
+) -> Result<Vec<u8>, String> {
+    let normalized_version = parse_zkm_version(zkm_version)?;
+    if domain_tag.trim().is_empty() {
+        return Err("domain_tag is empty".to_string());
+    }
+
+    let mut message =
+        Vec::with_capacity(domain_tag.len() + normalized_version.len() + part_stark_vk.len() + 2);
+    message.extend_from_slice(domain_tag.as_bytes());
+    message.push(0);
+    message.extend_from_slice(normalized_version.as_bytes());
+    message.push(0);
+    message.extend_from_slice(part_stark_vk);
+    Ok(message)
+}
+
+pub fn hash_part_stark_vk(part_stark_vk: &[u8]) -> String {
+    hex::encode(Sha256::digest(part_stark_vk))
+}
+
+pub fn hash_attestation_bytes(attestation_bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(attestation_bytes))
 }
 
 #[cfg(test)]
@@ -102,5 +133,34 @@ mod tests {
         let result = read_zkm_version_from_file(&input_proof);
         assert!(result.is_err());
         let _ = fs::remove_file(format!("{input_proof}.zkm_version.bin"));
+    }
+
+    #[test]
+    fn build_attestation_message_contains_domain_version_and_vk() {
+        let msg = build_part_stark_vk_attestation_message(
+            PART_STARK_VK_ATTESTATION_DOMAIN_TAG,
+            " v1.2.4 ",
+            &[1u8, 2, 3],
+        )
+        .unwrap();
+        let expected = [
+            PART_STARK_VK_ATTESTATION_DOMAIN_TAG.as_bytes(),
+            &[0u8],
+            b"v1.2.4",
+            &[0u8],
+            &[1u8, 2, 3],
+        ]
+        .concat();
+        assert_eq!(msg, expected);
+    }
+
+    #[test]
+    fn hash_helpers_are_stable() {
+        let part_stark_vk = [9u8, 8, 7, 6];
+        let expected_part_hash = hex::encode(Sha256::digest(part_stark_vk));
+        assert_eq!(hash_part_stark_vk(&part_stark_vk), expected_part_hash);
+
+        let expected_attestation_hash = hex::encode(Sha256::digest(b"abc"));
+        assert_eq!(hash_attestation_bytes(b"abc"), expected_attestation_hash);
     }
 }

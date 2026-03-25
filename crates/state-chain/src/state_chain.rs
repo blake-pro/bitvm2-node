@@ -43,6 +43,7 @@ pub struct StateChainState {
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 pub struct StateChainCircuitOutput {
     pub chain_state: StateChainState,
+    pub prev_part_stark_vk_hash: [u8; 32],
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]

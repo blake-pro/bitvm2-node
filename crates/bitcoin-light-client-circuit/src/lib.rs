@@ -30,14 +30,103 @@ pub use guest_executor::io::EthClientExecutorInput;
 
 pub const GRAPH_ID_SIZE: usize = 16;
 pub const PROOF_SIZE: usize = 260;
-pub const PUBLIC_INPUTS_SIZE: usize = 36;
+pub const TOTAL_WORK_SIZE: usize = 32;
+pub const CONSENSUS_BLOCK_HEIGHT_SIZE: usize = 4;
+pub const PART_STARK_VK_HASH_SIZE: usize = 32;
+pub const PUBLIC_INPUTS_SIZE: usize =
+    TOTAL_WORK_SIZE + CONSENSUS_BLOCK_HEIGHT_SIZE + PART_STARK_VK_HASH_SIZE * 3;
+pub const OPERATOR_PUBLIC_INPUTS_SIZE: usize = 32 * 6;
 pub const VK_HASH_SIZE: usize = 66;
 pub const ZKM_VERSION_SIZE: usize = ZKM_VERSION_BYTES_LEN;
 pub const COMMITMENT_SIZE: usize =
     GRAPH_ID_SIZE + PROOF_SIZE + PUBLIC_INPUTS_SIZE + VK_HASH_SIZE + ZKM_VERSION_SIZE;
 
-pub const TOTAL_WORK_SIZE: usize = 32;
-pub const CONSENSUS_BLOCK_HEIGHT_SIZE: usize = 4;
+pub type RecursivePartStarkVkHashes = ([u8; 32], [u8; 32], [u8; 32]);
+pub type WatchtowerPublicInputs = ([u8; 32], u32, [u8; 32], [u8; 32], [u8; 32]);
+pub type OperatorPublicInputs = ([u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32]);
+
+fn extract_watchtower_public_value_fields(
+    zkm_public_values: &[u8; PUBLIC_INPUTS_SIZE],
+) -> ([u8; TOTAL_WORK_SIZE], [u8; CONSENSUS_BLOCK_HEIGHT_SIZE], RecursivePartStarkVkHashes) {
+    let mut watchtower_total_work = [0u8; TOTAL_WORK_SIZE];
+    watchtower_total_work.copy_from_slice(&zkm_public_values[0..TOTAL_WORK_SIZE]);
+
+    let mut watchtower_consensus_block_height = [0u8; CONSENSUS_BLOCK_HEIGHT_SIZE];
+    watchtower_consensus_block_height.copy_from_slice(
+        &zkm_public_values[TOTAL_WORK_SIZE..TOTAL_WORK_SIZE + CONSENSUS_BLOCK_HEIGHT_SIZE],
+    );
+
+    let mut header_prev_part_stark_vk_hash = [0u8; PART_STARK_VK_HASH_SIZE];
+    header_prev_part_stark_vk_hash.copy_from_slice(
+        &zkm_public_values[TOTAL_WORK_SIZE + CONSENSUS_BLOCK_HEIGHT_SIZE
+            ..TOTAL_WORK_SIZE + CONSENSUS_BLOCK_HEIGHT_SIZE + PART_STARK_VK_HASH_SIZE],
+    );
+
+    let mut commit_prev_part_stark_vk_hash = [0u8; PART_STARK_VK_HASH_SIZE];
+    commit_prev_part_stark_vk_hash.copy_from_slice(
+        &zkm_public_values[TOTAL_WORK_SIZE + CONSENSUS_BLOCK_HEIGHT_SIZE + PART_STARK_VK_HASH_SIZE
+            ..TOTAL_WORK_SIZE + CONSENSUS_BLOCK_HEIGHT_SIZE + PART_STARK_VK_HASH_SIZE * 2],
+    );
+
+    let mut state_prev_part_stark_vk_hash = [0u8; PART_STARK_VK_HASH_SIZE];
+    state_prev_part_stark_vk_hash.copy_from_slice(
+        &zkm_public_values[TOTAL_WORK_SIZE
+            + CONSENSUS_BLOCK_HEIGHT_SIZE
+            + PART_STARK_VK_HASH_SIZE * 2
+            ..TOTAL_WORK_SIZE + CONSENSUS_BLOCK_HEIGHT_SIZE + PART_STARK_VK_HASH_SIZE * 3],
+    );
+
+    (
+        watchtower_total_work,
+        watchtower_consensus_block_height,
+        (
+            header_prev_part_stark_vk_hash,
+            commit_prev_part_stark_vk_hash,
+            state_prev_part_stark_vk_hash,
+        ),
+    )
+}
+
+pub fn parse_watchtower_public_inputs(
+    zkm_public_values: &[u8],
+) -> Result<WatchtowerPublicInputs, String> {
+    let zkm_public_values: [u8; PUBLIC_INPUTS_SIZE] =
+        zkm_public_values.try_into().map_err(|_| {
+            format!("invalid watchtower public inputs size: {}", zkm_public_values.len())
+        })?;
+    let (total_work, consensus_block_height, hashes) =
+        extract_watchtower_public_value_fields(&zkm_public_values);
+    Ok((total_work, u32::from_le_bytes(consensus_block_height), hashes.0, hashes.1, hashes.2))
+}
+
+pub fn parse_operator_public_inputs(
+    zkm_public_values: &[u8],
+) -> Result<OperatorPublicInputs, String> {
+    let bytes: [u8; OPERATOR_PUBLIC_INPUTS_SIZE] = zkm_public_values
+        .try_into()
+        .map_err(|_| format!("invalid operator public inputs size: {}", zkm_public_values.len()))?;
+    let mut btc_best_block_hash = [0u8; 32];
+    btc_best_block_hash.copy_from_slice(&bytes[0..32]);
+    let mut constant = [0u8; 32];
+    constant.copy_from_slice(&bytes[32..64]);
+    let mut included_watchtowers = [0u8; 32];
+    included_watchtowers.copy_from_slice(&bytes[64..96]);
+    let mut header_prev_part_stark_vk_hash = [0u8; 32];
+    header_prev_part_stark_vk_hash.copy_from_slice(&bytes[96..128]);
+    let mut commit_prev_part_stark_vk_hash = [0u8; 32];
+    commit_prev_part_stark_vk_hash.copy_from_slice(&bytes[128..160]);
+    let mut state_prev_part_stark_vk_hash = [0u8; 32];
+    state_prev_part_stark_vk_hash.copy_from_slice(&bytes[160..192]);
+
+    Ok((
+        btc_best_block_hash,
+        constant,
+        included_watchtowers,
+        header_prev_part_stark_vk_hash,
+        commit_prev_part_stark_vk_hash,
+        state_prev_part_stark_vk_hash,
+    ))
+}
 
 pub fn watch_longest_chain(
     genesis_sequencer_commit_txid: [u8; 32],
@@ -46,7 +135,7 @@ pub fn watch_longest_chain(
     commit_chain: CommitChainCircuitInput,
     state_chain: StateChainCircuitInput,
     spv: SPV,
-) -> ([u8; 32], u32) {
+) -> ([u8; 32], u32, [u8; 32], [u8; 32], [u8; 32]) {
     println!("commit header, size: {}", commit_chain.commits.len());
     // verify latest_sequencer_commit is valid:
     //   * Check both latest_sequencer_commit_txid and genesis_sequencer_commit_txid are in all_sequencer_commit_txids (which is a private input)
@@ -126,7 +215,13 @@ pub fn watch_longest_chain(
 
     println!("commit public inputs");
     // commit public inputs
-    (btc_header_chain_output.chain_state.total_work, commit_chain_output.chain_state.block_height)
+    (
+        btc_header_chain_output.chain_state.total_work,
+        commit_chain_output.chain_state.block_height,
+        btc_header_chain_output.prev_part_stark_vk_hash,
+        commit_chain_output.prev_part_stark_vk_hash,
+        state_chain_output.prev_part_stark_vk_hash,
+    )
 }
 
 pub fn u256_to_le_bits(u: U256) -> [bool; 256] {
@@ -164,7 +259,7 @@ pub fn propose_longest_chain(
     state_chain: StateChainCircuitInput,
     spv_ss_commit: SPV,
     operator_committed_blockhash: [u8; 32],
-) -> ([u8; 32], [u8; 32], [u8; 32]) {
+) -> ([u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32]) {
     // verify operator_latest_sequencer_commit_txid is valid, and on operator head chain
     //   * Check operator_latest_sequencer_commit_txid is derived from genesis_sequencer_commit_txid
     verify_proof(
@@ -253,6 +348,9 @@ pub fn propose_longest_chain(
                 watchtower_zkm_version,
                 watchtower_total_work,
                 watchtower_consensus_block_height,
+                _header_prev_part_stark_vk_hash,
+                _commit_prev_part_stark_vk_hash,
+                _state_prev_part_stark_vk_hash,
             ) = match parse_watchtower_commitment(commitment) {
                 Ok(c) => c,
                 Err(err) => {
@@ -370,7 +468,14 @@ pub fn propose_longest_chain(
     );
 
     //operator_public_input
-    (operator_committed_blockhash, constant, included_watchtowers.to_le_bytes::<32>())
+    (
+        operator_committed_blockhash,
+        constant,
+        included_watchtowers.to_le_bytes::<32>(),
+        btc_header_chain_output.prev_part_stark_vk_hash,
+        commit_chain_output.prev_part_stark_vk_hash,
+        state_chain_output.prev_part_stark_vk_hash,
+    )
 }
 
 pub fn hash_operator_constant(
@@ -477,6 +582,9 @@ pub type WatchtowerCommitmentResult = (
     ZkmVersionBytes,
     [u8; TOTAL_WORK_SIZE],
     [u8; CONSENSUS_BLOCK_HEIGHT_SIZE],
+    [u8; PART_STARK_VK_HASH_SIZE],
+    [u8; PART_STARK_VK_HASH_SIZE],
+    [u8; PART_STARK_VK_HASH_SIZE],
 );
 
 pub fn parse_watchtower_commitment(
@@ -508,13 +616,15 @@ pub fn parse_watchtower_commitment(
     let mut zkm_version = [0u8; ZKM_VERSION_SIZE];
     zkm_version.copy_from_slice(&commitment[end..end + ZKM_VERSION_SIZE]);
 
-    // extract ChainState
-    let mut watchtower_total_work = [0u8; TOTAL_WORK_SIZE];
-    watchtower_total_work.copy_from_slice(&zkm_public_values[0..TOTAL_WORK_SIZE]);
-    let mut watchtower_consensus_block_height = [0u8; CONSENSUS_BLOCK_HEIGHT_SIZE];
-    watchtower_consensus_block_height.copy_from_slice(
-        &zkm_public_values[TOTAL_WORK_SIZE..TOTAL_WORK_SIZE + CONSENSUS_BLOCK_HEIGHT_SIZE],
-    );
+    let (
+        watchtower_total_work,
+        watchtower_consensus_block_height,
+        (
+            header_prev_part_stark_vk_hash,
+            commit_prev_part_stark_vk_hash,
+            state_prev_part_stark_vk_hash,
+        ),
+    ) = extract_watchtower_public_value_fields(&zkm_public_values);
 
     println!("watchtower total work: {watchtower_total_work:?}");
     println!("watchtower total work: {:?}", U256::from_be_bytes(watchtower_total_work));
@@ -532,6 +642,9 @@ pub fn parse_watchtower_commitment(
         zkm_version,
         watchtower_total_work,
         watchtower_consensus_block_height,
+        header_prev_part_stark_vk_hash,
+        commit_prev_part_stark_vk_hash,
+        state_prev_part_stark_vk_hash,
     ))
 }
 
@@ -540,7 +653,7 @@ fn groth16_verifier_keys(zkm_version: &str) -> Result<(&'static [u8], &'static [
     let imm_groth16_vk = *IMM_GROTH16_VK_BYTES;
     let part_stark_vk =
         catch_unwind(AssertUnwindSafe(|| Groth16Verifier::get_part_stark_vk(zkm_version)))
-        .map_err(|_| format!("failed to load part_stark_vk for zkm_version '{zkm_version}'"))?;
+            .map_err(|_| format!("failed to load part_stark_vk for zkm_version '{zkm_version}'"))?;
     Ok((imm_groth16_vk, part_stark_vk))
 }
 
@@ -579,8 +692,6 @@ mod tests {
     use super::*;
     use bitcoin::Transaction;
     const PROOF: &[u8] = include_bytes!("../../../circuits/data/watchtower/output3.bin.proof.bin");
-    const PUBLIC_INPUTS: &[u8] =
-        include_bytes!("../../../circuits/data/watchtower/output3.bin.public_inputs.bin");
     const VK_HASH: &str = include_str!("../../../circuits/data/watchtower/output3.bin.vk_hash.bin");
     const ZKM_VERSION: &str = "v1.2.4";
 
@@ -602,15 +713,32 @@ mod tests {
     #[test]
     fn test_build_watchtower_commitment() {
         let graph_id = hex::decode("00112233445566778899aabbccddeeff").unwrap().try_into().unwrap();
+        let mut public_inputs = [0u8; PUBLIC_INPUTS_SIZE];
+        let total_work = 1006120u64.to_be_bytes();
+        public_inputs[TOTAL_WORK_SIZE - total_work.len()..TOTAL_WORK_SIZE]
+            .copy_from_slice(&total_work);
+        let block_height = 503043u32.to_le_bytes();
+        public_inputs[TOTAL_WORK_SIZE..TOTAL_WORK_SIZE + CONSENSUS_BLOCK_HEIGHT_SIZE]
+            .copy_from_slice(&block_height);
+        let header_hash = [0x11u8; 32];
+        let commit_hash = [0x22u8; 32];
+        let state_hash = [0x33u8; 32];
+        public_inputs[TOTAL_WORK_SIZE + CONSENSUS_BLOCK_HEIGHT_SIZE
+            ..TOTAL_WORK_SIZE + CONSENSUS_BLOCK_HEIGHT_SIZE + PART_STARK_VK_HASH_SIZE]
+            .copy_from_slice(&header_hash);
+        public_inputs[TOTAL_WORK_SIZE + CONSENSUS_BLOCK_HEIGHT_SIZE + PART_STARK_VK_HASH_SIZE
+            ..TOTAL_WORK_SIZE + CONSENSUS_BLOCK_HEIGHT_SIZE + PART_STARK_VK_HASH_SIZE * 2]
+            .copy_from_slice(&commit_hash);
+        public_inputs[TOTAL_WORK_SIZE + CONSENSUS_BLOCK_HEIGHT_SIZE + PART_STARK_VK_HASH_SIZE * 2
+            ..TOTAL_WORK_SIZE + CONSENSUS_BLOCK_HEIGHT_SIZE + PART_STARK_VK_HASH_SIZE * 3]
+            .copy_from_slice(&state_hash);
 
-        let total_work = 1006120;
-        let block_height = 503043;
-        println!("public inputs: {:?}", PUBLIC_INPUTS.len());
+        println!("public inputs: {:?}", public_inputs.len());
         println!("vk hash: {:?}", VK_HASH.len());
         let comm = build_watchtower_commitment(
             &graph_id,
             &PROOF.try_into().unwrap(),
-            &PUBLIC_INPUTS.try_into().unwrap(),
+            &public_inputs,
             VK_HASH,
             ZKM_VERSION,
         )
@@ -623,11 +751,24 @@ mod tests {
 
         assert_eq!(expected.0, graph_id);
         assert_eq!(expected.1, PROOF);
-        assert_eq!(expected.2, PUBLIC_INPUTS);
+        assert_eq!(expected.2, public_inputs);
         assert_eq!(expected.3, VK_HASH.as_bytes());
         assert_eq!(expected.4, encode_zkm_version_fixed(ZKM_VERSION).unwrap());
-        assert_eq!(expected.5, U256::from(total_work).to_be_bytes());
-        assert_eq!(expected.6, U32::from(block_height).to_le_bytes());
+        assert_eq!(expected.5, U256::from(1006120u64).to_be_bytes());
+        assert_eq!(expected.6, U32::from(503043u32).to_le_bytes());
+        assert_eq!(expected.7, header_hash);
+        assert_eq!(expected.8, commit_hash);
+        assert_eq!(expected.9, state_hash);
+    }
+
+    #[test]
+    fn test_watchtower_public_inputs_size_binds_recursive_part_stark_hashes() {
+        assert_eq!(PUBLIC_INPUTS_SIZE, TOTAL_WORK_SIZE + CONSENSUS_BLOCK_HEIGHT_SIZE + 32 * 3);
+    }
+
+    #[test]
+    fn test_operator_public_inputs_size_has_named_constant() {
+        assert_eq!(OPERATOR_PUBLIC_INPUTS_SIZE, 32 * 6);
     }
 
     #[test]
@@ -677,12 +818,13 @@ mod tests {
     #[test]
     fn test_build_watchtower_commitment_rejects_long_version() {
         let graph_id = hex::decode("00112233445566778899aabbccddeeff").unwrap().try_into().unwrap();
+        let public_inputs = [0u8; PUBLIC_INPUTS_SIZE];
         let too_long_version = "v1234567890123456";
         assert_eq!(too_long_version.len(), ZKM_VERSION_SIZE + 1);
         let result = build_watchtower_commitment(
             &graph_id,
             &PROOF.try_into().unwrap(),
-            &PUBLIC_INPUTS.try_into().unwrap(),
+            &public_inputs,
             VK_HASH,
             too_long_version,
         );
@@ -692,11 +834,12 @@ mod tests {
     #[test]
     fn test_build_watchtower_commitment_accepts_rc_version() {
         let graph_id = hex::decode("00112233445566778899aabbccddeeff").unwrap().try_into().unwrap();
+        let public_inputs = [0u8; PUBLIC_INPUTS_SIZE];
         let rc_version = "v1.12.15-rc1";
         let commitment = build_watchtower_commitment(
             &graph_id,
             &PROOF.try_into().unwrap(),
-            &PUBLIC_INPUTS.try_into().unwrap(),
+            &public_inputs,
             VK_HASH,
             rc_version,
         )

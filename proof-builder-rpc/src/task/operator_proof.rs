@@ -1,6 +1,7 @@
 use crate::{
+    attestation::ensure_input_proof_part_stark_vk_attested,
     config::ProofBuilderConfig,
-    task::{ProofState, fetch_on_demand_task, update_operator_task},
+    task::{PROOF_TASK_RETRY_DELAY_SECS, ProofState, fetch_on_demand_task, update_operator_task},
 };
 use bitcoin_light_client_circuit::le_bits_to_u256;
 use operator_proof::{OperatorProofBuilder, fetch_target_block_and_watchtower_tx};
@@ -58,16 +59,37 @@ pub(crate) fn spawn_operator_proof_task(
                         }
                         Ok(None) => {
                             tracing::warn!("No on demand task found for operator proof, wait for the next round");
-                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            tokio::time::sleep(Duration::from_secs(PROOF_TASK_RETRY_DELAY_SECS)).await;
                             continue;
                         }
                         Err(e) => {
                             tracing::error!("Failed to fetch on demand task for operator proof, error: {e}");
-                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            tokio::time::sleep(Duration::from_secs(PROOF_TASK_RETRY_DELAY_SECS)).await;
                             continue;
                         }
                     };
                     info!("Operator proof generate task: generate proof, args: {args:?}");
+                    let mut attestation_failed = false;
+                    for input_proof in [
+                        args.header_chain_input_proof.as_str(),
+                        args.commit_chain_input_proof.as_str(),
+                        args.state_chain_input_proof.as_str(),
+                    ] {
+                        if let Err(err) =
+                            ensure_input_proof_part_stark_vk_attested(&local_db, input_proof).await
+                        {
+                            tracing::warn!(
+                                "Skip operator proof generation because part_stark_vk attestation check failed for {}: {err}",
+                                input_proof
+                            );
+                            attestation_failed = true;
+                            break;
+                        }
+                    }
+                    if attestation_failed {
+                        tokio::time::sleep(Duration::from_secs(PROOF_TASK_RETRY_DELAY_SECS)).await;
+                        continue;
+                    }
 
                     let (
                         block_pos_ss_commit,
@@ -91,7 +113,7 @@ pub(crate) fn spawn_operator_proof_task(
                         Ok(data) => data,
                         Err(err) => {
                             tracing::error!("Fetch target block and watchtower txns error, {err:?}");
-                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            tokio::time::sleep(Duration::from_secs(PROOF_TASK_RETRY_DELAY_SECS)).await;
                             continue;
                         }
                     };
@@ -133,7 +155,7 @@ pub(crate) fn spawn_operator_proof_task(
                         },
                         Err(err) => {
                             tracing::error!("Build proof error: {err}");
-                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            tokio::time::sleep(Duration::from_secs(PROOF_TASK_RETRY_DELAY_SECS)).await;
                             (0u64, 0.0, "".to_string(), 0usize, ProofState::Failed, "".to_string())
                         }
                     };

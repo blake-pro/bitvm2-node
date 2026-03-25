@@ -749,6 +749,44 @@ pub struct SequencerSetScanState {
     pub updated_at: i64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq, Display, EnumString)]
+pub enum AttestationBatchStatus {
+    #[default]
+    LocallyVerified,
+    BitcoinPending,
+    BitcoinConfirmed,
+    BitcoinReorged,
+}
+
+#[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
+pub struct PartStarkVkAttestationBatch {
+    pub id: i64,
+    pub domain_tag: String,
+    pub zkm_version: String,
+    pub part_stark_vk_hash: String,
+    pub sequencer_set_hash: String,
+    pub sequencer_set_cosmos_block_height: i64,
+    pub sequencer_set_goat_block_height: i64,
+    pub sequencer_set_size: i64,
+    pub threshold: i64,
+    pub attestation_hash: String,
+    pub status: String,
+    pub bitcoin_txid: Option<String>,
+    pub bitcoin_confirmed_height: Option<i64>,
+    pub locally_verified_at: i64,
+    pub bitcoin_confirmed_at: Option<i64>,
+    pub created_at: i64,
+}
+
+#[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
+pub struct PartStarkVkAttestationSignature {
+    pub id: i64,
+    pub batch_id: i64,
+    pub signer_pubkey: String,
+    pub signature: String,
+    pub created_at: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

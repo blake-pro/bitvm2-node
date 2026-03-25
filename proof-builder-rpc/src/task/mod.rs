@@ -26,6 +26,8 @@ use store::{LongRunningTaskProof, OperatorProof, ProofState, WatchtowerProof};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
+pub(crate) const PROOF_TASK_RETRY_DELAY_SECS: u64 = 5;
+
 pub(crate) fn is_start_generate_proof_tasks(cfg: &ProofBuilderConfig) -> bool {
     cfg.header_chain.enable
         || cfg.commit_chain.enable

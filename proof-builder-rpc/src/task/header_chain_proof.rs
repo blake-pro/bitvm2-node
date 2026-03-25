@@ -6,8 +6,11 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+use crate::attestation::ensure_input_proof_part_stark_vk_attested;
 use crate::config::ProofBuilderConfig;
-use crate::task::{create_long_running_task, fetch_latest_long_running_task};
+use crate::task::{
+    PROOF_TASK_RETRY_DELAY_SECS, create_long_running_task, fetch_latest_long_running_task,
+};
 
 #[tracing::instrument(level = "info", skip(local_db, cancellation_token))]
 pub(crate) fn spawn_header_chain_proof_task(
@@ -50,6 +53,17 @@ pub(crate) fn spawn_header_chain_proof_task(
                         args.init_input = false;
                     }
                     info!("Header chain proof generate task: generate proof, args: {args:?}");
+                    if !args.init_input
+                        && let Err(err) =
+                            ensure_input_proof_part_stark_vk_attested(&local_db, &args.input_proof)
+                                .await
+                    {
+                        tracing::warn!(
+                            "Skip header chain proof generation because part_stark_vk attestation check failed: {err}"
+                        );
+                        tokio::time::sleep(Duration::from_secs(PROOF_TASK_RETRY_DELAY_SECS)).await;
+                        continue;
+                    }
                     let total_block_headers = match fetch_header_chain(
                         &args.esplora_url,
                         args.start,

@@ -19,7 +19,9 @@ use bitcoin::{
     PrivateKey, PublicKey, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
     XOnlyPublicKey,
 };
-use bitcoin_light_client_circuit::{VK_HASH_SIZE, build_watchtower_commitment};
+use bitcoin_light_client_circuit::{
+    VK_HASH_SIZE, build_watchtower_commitment, parse_operator_public_inputs,
+};
 use bitvm::treepp::*;
 use bitvm2_lib::actors::Actor;
 use bitvm2_lib::challenger::*;
@@ -95,6 +97,7 @@ use proof_builder::{
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
+use zkm_version::{PART_STARK_VK_ATTESTATION_DOMAIN_TAG, hash_part_stark_vk};
 pub(crate) const BRIDGE_OUT_GLOBAL_STATS_ID: i64 = 1;
 pub mod todo_funcs {
     #![allow(dead_code, unreachable_code, unused_variables)]
@@ -1724,6 +1727,44 @@ fn gen_watchtower_commitment(graph_id: Uuid, proof_data: ProofData) -> Result<Ve
     .map_err(|e| anyhow!("failed to build watchtower commitment: {e}"))?)
 }
 
+async fn ensure_part_stark_vk_attested_for_node(
+    local_db: &LocalDB,
+    zkm_version: &str,
+) -> Result<String> {
+    if !is_part_stark_vk_attestation_gate_enabled() {
+        return Ok(String::new());
+    }
+
+    let part_stark_vk_hash = hash_part_stark_vk(&Groth16Verifier::get_part_stark_vk(zkm_version));
+    let mut storage = local_db.acquire().await?;
+    storage
+        .assert_confirmed_part_stark_vk_attestation_by_domain_version_and_hash(
+            PART_STARK_VK_ATTESTATION_DOMAIN_TAG,
+            zkm_version,
+            &part_stark_vk_hash,
+        )
+        .await?;
+    Ok(part_stark_vk_hash)
+}
+
+async fn ensure_part_stark_vk_hash_attested_for_node(
+    local_db: &LocalDB,
+    part_stark_vk_hash: &str,
+) -> Result<()> {
+    if !is_part_stark_vk_attestation_gate_enabled() {
+        return Ok(());
+    }
+
+    let mut storage = local_db.acquire().await?;
+    storage
+        .assert_confirmed_part_stark_vk_attestation_by_hash(
+            PART_STARK_VK_ATTESTATION_DOMAIN_TAG,
+            part_stark_vk_hash,
+        )
+        .await?;
+    Ok(())
+}
+
 // proof network
 /// Returns:
 /// - `Ok(Some(WatchtowerCommitment), _)` if watchtower proof is available
@@ -1899,23 +1940,41 @@ pub async fn get_operator_proof(
                         proof.zkm_version
                     );
                 }
-                let (_best_btc_block_hash, constant, included_watchtower): (
-                    [u8; 32],
-                    [u8; 32],
-                    [u8; 32],
-                ) = proof.public_values.clone().read();
+                ensure_part_stark_vk_attested_for_node(local_db, &proof.zkm_version).await?;
+                let (
+                    _best_btc_block_hash,
+                    constant,
+                    included_watchtower,
+                    header_prev_part_stark_vk_hash,
+                    commit_prev_part_stark_vk_hash,
+                    state_prev_part_stark_vk_hash,
+                ) = parse_operator_public_inputs(&proof.public_values.to_vec())
+                    .map_err(|e| anyhow!("failed to parse operator proof public inputs: {e}"))?;
+                ensure_part_stark_vk_hash_attested_for_node(
+                    local_db,
+                    &hex::encode(header_prev_part_stark_vk_hash),
+                )
+                .await?;
+                ensure_part_stark_vk_hash_attested_for_node(
+                    local_db,
+                    &hex::encode(commit_prev_part_stark_vk_hash),
+                )
+                .await?;
+                ensure_part_stark_vk_hash_attested_for_node(
+                    local_db,
+                    &hex::encode(state_prev_part_stark_vk_hash),
+                )
+                .await?;
                 // TODO: additionally check constant and included_watchtower with included_watchtowers.
                 //proof.public_values.head();
                 info!("get_operator_proof parse proof successfully");
                 let groth16_vk = &IMM_GROTH16_VK_BYTES;
                 let part_stark_vk = Groth16Verifier::get_part_stark_vk(&proof.zkm_version);
-                let ark_proof = convert_ark_imm_wrap_vk(
-                    &proof,
-                    &proof_data.vk,
-                    groth16_vk,
-                    part_stark_vk,
-                )
-                    .map_err(|e| anyhow!("failed to convert operator proof to ark format: {e}"))?;
+                let ark_proof =
+                    convert_ark_imm_wrap_vk(&proof, &proof_data.vk, groth16_vk, part_stark_vk)
+                        .map_err(|e| {
+                            anyhow!("failed to convert operator proof to ark format: {e}")
+                        })?;
                 info!("get_operator_proof parse proof successfully");
 
                 Ok((

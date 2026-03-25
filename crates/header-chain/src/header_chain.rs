@@ -365,6 +365,7 @@ fn calculate_work(target: &[u8; 32]) -> U256 {
 )]
 pub struct BlockHeaderCircuitOutput {
     pub chain_state: ChainState,
+    pub prev_part_stark_vk_hash: [u8; 32],
 }
 
 /// The input proof of the header chain circuit.

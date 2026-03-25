@@ -2664,6 +2664,7 @@ dependencies = [
  "zeroize",
  "zkm-sdk",
  "zkm-verifier",
+ "zkm-version",
 ]
 
 [[package]]
@@ -8991,6 +8992,7 @@ dependencies = [
  "axum 0.8.8",
  "bitcoin 0.32.8",
  "bitcoin-light-client-circuit",
+ "cbft-rpc",
  "clap",
  "client",
  "commit-chain",
@@ -8998,12 +9000,14 @@ dependencies = [
  "dotenv",
  "futures",
  "header-chain-proof",
+ "hex",
  "http-body-util",
  "operator-proof",
  "prometheus-client",
  "proof-builder",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "state-chain-proof",
  "store",
  "strum 0.26.3",
@@ -9016,6 +9020,8 @@ dependencies = [
  "util",
  "uuid 1.20.0",
  "watchtower-proof",
+ "zkm-verifier",
+ "zkm-version",
 ]
 
 [[package]]
@@ -14398,6 +14404,10 @@ dependencies = [
 [[package]]
 name = "zkm-version"
 version = "0.3.3"
+dependencies = [
+ "hex",
+ "sha2 0.10.9",
+]
 
 [[package]]
 name = "zkm-zkvm"

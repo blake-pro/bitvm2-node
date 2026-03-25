@@ -17,7 +17,13 @@ pub fn main() {
     let state_chain: StateChainCircuitInput = zkm_zkvm::io::read();
     let spv: SPV = zkm_zkvm::io::read();
 
-    let (total_work, btc_best_block_height) = bitcoin_light_client_circuit::watch_longest_chain(
+    let (
+        total_work,
+        btc_best_block_height,
+        header_prev_part_stark_vk_hash,
+        commit_prev_part_stark_vk_hash,
+        state_prev_part_stark_vk_hash,
+    ) = bitcoin_light_client_circuit::watch_longest_chain(
         genesis_sequencer_commit_txid,
         latest_sequencer_commit_txid,
         header_chain,
@@ -27,4 +33,7 @@ pub fn main() {
     );
     zkm_zkvm::io::commit(&total_work);
     zkm_zkvm::io::commit(&btc_best_block_height);
+    zkm_zkvm::io::commit(&header_prev_part_stark_vk_hash);
+    zkm_zkvm::io::commit(&commit_prev_part_stark_vk_hash);
+    zkm_zkvm::io::commit(&state_prev_part_stark_vk_hash);
 }

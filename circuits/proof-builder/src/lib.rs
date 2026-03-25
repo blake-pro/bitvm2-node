@@ -254,6 +254,44 @@ pub struct WatchtowerProofResponse {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct PartStarkVkAttestationSignature {
+    pub signer_pubkey: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PartStarkVkAttestationRequest {
+    pub zkm_version: String,
+    pub sequencer_set_cosmos_block_height: i64,
+    pub signatures: Vec<PartStarkVkAttestationSignature>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct PartStarkVkAttestationResponse {
+    pub batch_id: Option<i64>,
+    pub zkm_version: String,
+    pub part_stark_vk_hash: Option<String>,
+    pub attestation_hash: Option<String>,
+    pub verified_signers: usize,
+    pub required_signers: usize,
+    pub status: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PartStarkVkAttestationAnchorRequest {
+    pub bitcoin_txid: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct PartStarkVkAttestationAnchorResponse {
+    pub batch_id: i64,
+    pub bitcoin_txid: Option<String>,
+    pub status: Option<String>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OperatorProofTimeoutUpdateRequest {
     pub instance_id: String,

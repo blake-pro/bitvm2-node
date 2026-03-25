@@ -2,10 +2,12 @@ mod cbft;
 mod state_chain;
 
 pub use cbft::*;
+use sha2::{Digest, Sha256};
 pub use state_chain::*;
 use zkm_verifier::{Groth16Verifier, IMM_GROTH16_VK_BYTES};
 
 pub fn state_chain_circuit(input: StateChainCircuitInput) -> StateChainCircuitOutput {
+    let mut prev_part_stark_vk_hash = [0u8; 32];
     let mut chain_state = match input.prev_proof {
         StateChainPrevProofType::GenesisBlock => {
             let block_hash: [u8; 32] = input.blocks[0].evm_block.current_block.hash_slow().into();
@@ -17,6 +19,7 @@ pub fn state_chain_circuit(input: StateChainCircuitInput) -> StateChainCircuitOu
             println!("verify state chain of prev proof");
             let groth16_vk = *IMM_GROTH16_VK_BYTES;
             let part_stark_vk = Groth16Verifier::get_part_stark_vk(&input.zkm_version);
+            prev_part_stark_vk_hash = Sha256::digest(part_stark_vk).into();
             let zkm_vk_hash = String::from_utf8(input.zkm_vk_hash.to_vec()).unwrap();
             Groth16Verifier::verify_by_imm_groth16_vk(
                 &input.zkm_proof,
@@ -31,5 +34,5 @@ pub fn state_chain_circuit(input: StateChainCircuitInput) -> StateChainCircuitOu
     };
 
     chain_state.apply_blocks(input.blocks);
-    StateChainCircuitOutput { chain_state }
+    StateChainCircuitOutput { chain_state, prev_part_stark_vk_hash }
 }

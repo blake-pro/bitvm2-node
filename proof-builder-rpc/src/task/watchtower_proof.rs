@@ -1,5 +1,8 @@
 use crate::ProofBuilderConfig;
-use crate::task::{ProofState, fetch_on_demand_task, update_watchtower_task};
+use crate::attestation::ensure_input_proof_part_stark_vk_attested;
+use crate::task::{
+    PROOF_TASK_RETRY_DELAY_SECS, ProofState, fetch_on_demand_task, update_watchtower_task,
+};
 use proof_builder::{ProofBuilder, ProofRequest};
 use std::time::Duration;
 use store::localdb::LocalDB;
@@ -50,23 +53,44 @@ pub(crate) fn spawn_watchtower_proof_task(
                         },
                         Ok(None) => {
                             tracing::warn!("No on demand task found for watchtower proof, wait for the next round");
-                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            tokio::time::sleep(Duration::from_secs(PROOF_TASK_RETRY_DELAY_SECS)).await;
                             continue;
                         }
                         Err(e) => {
                             tracing::error!("Failed to fetch on demand task for watchtower proof, error: {e}");
-                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            tokio::time::sleep(Duration::from_secs(PROOF_TASK_RETRY_DELAY_SECS)).await;
                             continue;
                         }
                     }
                     info!("Watchtower proof generate task: generate proof, args: {args:?}");
+                    let mut attestation_failed = false;
+                    for input_proof in [
+                        args.header_chain_input_proof.as_str(),
+                        args.commit_chain_input_proof.as_str(),
+                        args.state_chain_input_proof.as_str(),
+                    ] {
+                        if let Err(err) =
+                            ensure_input_proof_part_stark_vk_attested(&local_db, input_proof).await
+                        {
+                            tracing::warn!(
+                                "Skip watchtower proof generation because part_stark_vk attestation check failed for {}: {err}",
+                                input_proof
+                            );
+                            attestation_failed = true;
+                            break;
+                        }
+                    }
+                    if attestation_failed {
+                        tokio::time::sleep(Duration::from_secs(PROOF_TASK_RETRY_DELAY_SECS)).await;
+                        continue;
+                    }
 
                     let (block_pos, target_block, latest_sequencer_commit_tx) =
                         match fetch_target_block(&args.esplora_url, &args.latest_sequencer_commit_txid, args.bitcoin_network).await {
                             Ok(data) => data,
                             Err(e) => {
                                 tracing::error!("Fetch target block error: {e}");
-                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                tokio::time::sleep(Duration::from_secs(PROOF_TASK_RETRY_DELAY_SECS)).await;
                                 continue;
                             }
                         };
@@ -96,7 +120,7 @@ pub(crate) fn spawn_watchtower_proof_task(
                         },
                         Err(err) => {
                             tracing::error!("Build proof error: {err}");
-                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            tokio::time::sleep(Duration::from_secs(PROOF_TASK_RETRY_DELAY_SECS)).await;
                             (0u64, 0.0, "".to_string(), 0usize, ProofState::Failed, "".to_string())
                         }
                     };

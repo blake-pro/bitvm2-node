@@ -107,6 +107,7 @@ dirs = "5.0.1"
 
 zkm-sdk = { workspace = true }
 zkm-verifier = { workspace = true }
+zkm-version = { workspace = true }
 borsh = {version = "1.5.3", features = ["derive"] }
 
 proof-builder = { workspace = true }

@@ -1,9 +1,10 @@
 use crate::utils::{QueryBuilder, QueryParam, create_place_holders};
 use crate::{
     BridgeOutGlobalStats, GoatTxRecord, Graph, GraphBtcTxVoutMonitor, GraphRawData, Instance,
-    LongRunningTaskProof, Message, Node, NodesOverview, OperatorProof, PeginGraphProcessData,
-    PeginInstanceProcessData, SequencerSetHashChange, SequencerSetScanState, SerializableTxid,
-    WatchContract, WatchtowerProof,
+    LongRunningTaskProof, Message, Node, NodesOverview, OperatorProof, PartStarkVkAttestationBatch,
+    PartStarkVkAttestationSignature, PeginGraphProcessData, PeginInstanceProcessData,
+    SequencerSetHashChange, SequencerSetScanState, SerializableTxid, WatchContract,
+    WatchtowerProof,
 };
 
 use indexmap::IndexMap;
@@ -2972,6 +2973,368 @@ impl<'a> StorageProcessor<'a> {
         Ok(res)
     }
 
+    pub async fn find_sequencer_set_hash_change_by_cosmos_block_height(
+        &mut self,
+        cosmos_block_height: i64,
+    ) -> anyhow::Result<Option<SequencerSetHashChange>> {
+        let res = sqlx::query_as::<_, SequencerSetHashChange>(
+            "SELECT * FROM sequencer_set_hash_changes WHERE cosmos_block_height = ? LIMIT 1",
+        )
+            .bind(cosmos_block_height)
+            .fetch_optional(self.conn())
+            .await?;
+        Ok(res)
+    }
+
+    pub async fn create_part_stark_vk_attestation_batch(
+        &mut self,
+        batch: &PartStarkVkAttestationBatch,
+    ) -> anyhow::Result<i64> {
+        let result = sqlx::query(
+            r#"INSERT INTO part_stark_vk_attestation_batch (
+                    domain_tag,
+                    zkm_version,
+                    part_stark_vk_hash,
+                    sequencer_set_hash,
+                    sequencer_set_cosmos_block_height,
+                    sequencer_set_goat_block_height,
+                    sequencer_set_size,
+                    threshold,
+                    attestation_hash,
+                    status,
+                    bitcoin_txid,
+                    bitcoin_confirmed_height,
+                    locally_verified_at,
+                    bitcoin_confirmed_at,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+            .bind(&batch.domain_tag)
+            .bind(&batch.zkm_version)
+            .bind(&batch.part_stark_vk_hash)
+            .bind(&batch.sequencer_set_hash)
+            .bind(batch.sequencer_set_cosmos_block_height)
+            .bind(batch.sequencer_set_goat_block_height)
+            .bind(batch.sequencer_set_size)
+            .bind(batch.threshold)
+            .bind(&batch.attestation_hash)
+            .bind(&batch.status)
+            .bind(&batch.bitcoin_txid)
+            .bind(batch.bitcoin_confirmed_height)
+            .bind(batch.locally_verified_at)
+            .bind(batch.bitcoin_confirmed_at)
+            .bind(batch.created_at)
+            .execute(self.conn())
+            .await?;
+        Ok(result.last_insert_rowid())
+    }
+
+    pub async fn create_part_stark_vk_attestation_signature(
+        &mut self,
+        signature: &PartStarkVkAttestationSignature,
+    ) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            r#"INSERT INTO part_stark_vk_attestation_signature (
+                    batch_id,
+                    signer_pubkey,
+                    signature,
+                    created_at
+                ) VALUES (?, ?, ?, ?)"#,
+        )
+            .bind(signature.batch_id)
+            .bind(&signature.signer_pubkey)
+            .bind(&signature.signature)
+            .bind(signature.created_at)
+            .execute(self.conn())
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn find_part_stark_vk_attestation_signatures_by_batch_id(
+        &mut self,
+        batch_id: i64,
+    ) -> anyhow::Result<Vec<PartStarkVkAttestationSignature>> {
+        let rows = sqlx::query_as::<_, PartStarkVkAttestationSignature>(
+            r#"SELECT id, batch_id, signer_pubkey, signature, created_at
+               FROM part_stark_vk_attestation_signature
+               WHERE batch_id = ?
+               ORDER BY id ASC"#,
+        )
+            .bind(batch_id)
+            .fetch_all(self.conn())
+            .await?;
+        Ok(rows)
+    }
+
+    pub async fn find_part_stark_vk_attestation_batch_by_id(
+        &mut self,
+        batch_id: i64,
+    ) -> anyhow::Result<Option<PartStarkVkAttestationBatch>> {
+        let row = sqlx::query_as::<_, PartStarkVkAttestationBatch>(
+            r#"SELECT id,
+                      domain_tag,
+                      zkm_version,
+                      part_stark_vk_hash,
+                      sequencer_set_hash,
+                      sequencer_set_cosmos_block_height,
+                      sequencer_set_goat_block_height,
+                      sequencer_set_size,
+                      threshold,
+                      attestation_hash,
+                      status,
+                      bitcoin_txid,
+                      bitcoin_confirmed_height,
+                      locally_verified_at,
+                      bitcoin_confirmed_at,
+                      created_at
+               FROM part_stark_vk_attestation_batch
+               WHERE id = ?
+               LIMIT 1"#,
+        )
+            .bind(batch_id)
+            .fetch_optional(self.conn())
+            .await?;
+        Ok(row)
+    }
+
+    pub async fn find_part_stark_vk_attestation_batches_by_statuses(
+        &mut self,
+        statuses: &[String],
+    ) -> anyhow::Result<Vec<PartStarkVkAttestationBatch>> {
+        if statuses.is_empty() {
+            return Ok(vec![]);
+        }
+        let placeholders = create_place_holders(statuses);
+        let query = format!(
+            r#"SELECT id,
+                      domain_tag,
+                      zkm_version,
+                      part_stark_vk_hash,
+                      sequencer_set_hash,
+                      sequencer_set_cosmos_block_height,
+                      sequencer_set_goat_block_height,
+                      sequencer_set_size,
+                      threshold,
+                      attestation_hash,
+                      status,
+                      bitcoin_txid,
+                      bitcoin_confirmed_height,
+                      locally_verified_at,
+                      bitcoin_confirmed_at,
+                      created_at
+               FROM part_stark_vk_attestation_batch
+               WHERE status IN ({placeholders})
+                 AND bitcoin_txid IS NOT NULL
+               ORDER BY id ASC"#
+        );
+        let mut sql = sqlx::query_as::<_, PartStarkVkAttestationBatch>(&query);
+        for status in statuses {
+            sql = sql.bind(status);
+        }
+        Ok(sql.fetch_all(self.conn()).await?)
+    }
+
+    pub async fn update_part_stark_vk_attestation_batch_anchor(
+        &mut self,
+        batch_id: i64,
+        bitcoin_txid: &str,
+        bitcoin_confirmed_height: Option<i64>,
+        status: crate::AttestationBatchStatus,
+        bitcoin_confirmed_at: Option<i64>,
+    ) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            r#"UPDATE part_stark_vk_attestation_batch
+               SET bitcoin_txid = ?,
+                   bitcoin_confirmed_height = ?,
+                   status = ?,
+                   bitcoin_confirmed_at = ?
+               WHERE id = ?"#,
+        )
+            .bind(bitcoin_txid)
+            .bind(bitcoin_confirmed_height)
+            .bind(status.to_string())
+            .bind(bitcoin_confirmed_at)
+            .bind(batch_id)
+            .execute(self.conn())
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn find_latest_confirmed_part_stark_vk_attestation_batch(
+        &mut self,
+        domain_tag: &str,
+        zkm_version: &str,
+        part_stark_vk_hash: &str,
+        sequencer_set_hash: &str,
+    ) -> anyhow::Result<Option<PartStarkVkAttestationBatch>> {
+        let row = sqlx::query_as::<_, PartStarkVkAttestationBatch>(
+            r#"SELECT b.id,
+                      b.domain_tag,
+                      b.zkm_version,
+                      b.part_stark_vk_hash,
+                      b.sequencer_set_hash,
+                      b.sequencer_set_cosmos_block_height,
+                      b.sequencer_set_goat_block_height,
+                      b.sequencer_set_size,
+                      b.threshold,
+                      b.attestation_hash,
+                      b.status,
+                      b.bitcoin_txid,
+                      b.bitcoin_confirmed_height,
+                      b.locally_verified_at,
+                      b.bitcoin_confirmed_at,
+                      b.created_at
+               FROM part_stark_vk_attestation_batch b
+               WHERE b.domain_tag = ?
+                 AND b.zkm_version = ?
+                 AND b.part_stark_vk_hash = ?
+                 AND b.sequencer_set_hash = ?
+                 AND b.status = 'BitcoinConfirmed'
+                 AND (
+                     SELECT COUNT(1)
+                     FROM part_stark_vk_attestation_signature s
+                     WHERE s.batch_id = b.id
+                 ) >= b.threshold
+               ORDER BY b.id DESC
+               LIMIT 1"#,
+        )
+            .bind(domain_tag)
+            .bind(zkm_version)
+            .bind(part_stark_vk_hash)
+            .bind(sequencer_set_hash)
+            .fetch_optional(self.conn())
+            .await?;
+        Ok(row)
+    }
+
+    pub async fn find_latest_confirmed_part_stark_vk_attestation_batch_by_domain_version_and_hash(
+        &mut self,
+        domain_tag: &str,
+        zkm_version: &str,
+        part_stark_vk_hash: &str,
+    ) -> anyhow::Result<Option<PartStarkVkAttestationBatch>> {
+        let row = sqlx::query_as::<_, PartStarkVkAttestationBatch>(
+            r#"SELECT b.id,
+                      b.domain_tag,
+                      b.zkm_version,
+                      b.part_stark_vk_hash,
+                      b.sequencer_set_hash,
+                      b.sequencer_set_cosmos_block_height,
+                      b.sequencer_set_goat_block_height,
+                      b.sequencer_set_size,
+                      b.threshold,
+                      b.attestation_hash,
+                      b.status,
+                      b.bitcoin_txid,
+                      b.bitcoin_confirmed_height,
+                      b.locally_verified_at,
+                      b.bitcoin_confirmed_at,
+                      b.created_at
+               FROM part_stark_vk_attestation_batch b
+               WHERE b.domain_tag = ?
+                 AND b.zkm_version = ?
+                 AND b.part_stark_vk_hash = ?
+                 AND b.status = 'BitcoinConfirmed'
+                 AND (
+                     SELECT COUNT(1)
+                     FROM part_stark_vk_attestation_signature s
+                     WHERE s.batch_id = b.id
+                 ) >= b.threshold
+               ORDER BY b.id DESC
+               LIMIT 1"#,
+        )
+            .bind(domain_tag)
+            .bind(zkm_version)
+            .bind(part_stark_vk_hash)
+            .fetch_optional(self.conn())
+            .await?;
+        Ok(row)
+    }
+
+    pub async fn find_latest_confirmed_part_stark_vk_attestation_batch_by_hash(
+        &mut self,
+        domain_tag: &str,
+        part_stark_vk_hash: &str,
+    ) -> anyhow::Result<Option<PartStarkVkAttestationBatch>> {
+        let row = sqlx::query_as::<_, PartStarkVkAttestationBatch>(
+            r#"SELECT b.id,
+                      b.domain_tag,
+                      b.zkm_version,
+                      b.part_stark_vk_hash,
+                      b.sequencer_set_hash,
+                      b.sequencer_set_cosmos_block_height,
+                      b.sequencer_set_goat_block_height,
+                      b.sequencer_set_size,
+                      b.threshold,
+                      b.attestation_hash,
+                      b.status,
+                      b.bitcoin_txid,
+                      b.bitcoin_confirmed_height,
+                      b.locally_verified_at,
+                      b.bitcoin_confirmed_at,
+                      b.created_at
+               FROM part_stark_vk_attestation_batch b
+               WHERE b.domain_tag = ?
+                 AND b.part_stark_vk_hash = ?
+                 AND b.status = 'BitcoinConfirmed'
+                 AND (
+                     SELECT COUNT(1)
+                     FROM part_stark_vk_attestation_signature s
+                     WHERE s.batch_id = b.id
+                 ) >= b.threshold
+               ORDER BY b.id DESC
+               LIMIT 1"#,
+        )
+            .bind(domain_tag)
+            .bind(part_stark_vk_hash)
+            .fetch_optional(self.conn())
+            .await?;
+        Ok(row)
+    }
+
+    pub async fn assert_confirmed_part_stark_vk_attestation_by_domain_version_and_hash(
+        &mut self,
+        domain_tag: &str,
+        zkm_version: &str,
+        part_stark_vk_hash: &str,
+    ) -> anyhow::Result<()> {
+        let found = self
+            .find_latest_confirmed_part_stark_vk_attestation_batch_by_domain_version_and_hash(
+                domain_tag,
+                zkm_version,
+                part_stark_vk_hash,
+            )
+            .await?;
+        if found.is_none() {
+            return Err(anyhow::anyhow!(
+                "no confirmed part_stark_vk attestation found for zkm_version={}, part_stark_vk_hash={}",
+                zkm_version,
+                part_stark_vk_hash
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn assert_confirmed_part_stark_vk_attestation_by_hash(
+        &mut self,
+        domain_tag: &str,
+        part_stark_vk_hash: &str,
+    ) -> anyhow::Result<()> {
+        let found = self
+            .find_latest_confirmed_part_stark_vk_attestation_batch_by_hash(
+                domain_tag,
+                part_stark_vk_hash,
+            )
+            .await?;
+        if found.is_none() {
+            return Err(anyhow::anyhow!(
+                "no confirmed part_stark_vk attestation found for part_stark_vk_hash={}",
+                part_stark_vk_hash
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn get_sequencer_set_scan_state(
         &mut self,
     ) -> anyhow::Result<Option<SequencerSetScanState>> {
@@ -3023,6 +3386,7 @@ pub async fn create_local_db(db_path: &str) -> LocalDB {
 #[cfg(test)]
 mod sequencer_set_tests {
     use super::*;
+    use crate::AttestationBatchStatus;
 
     async fn setup_db() -> LocalDB {
         create_local_db("sqlite::memory:").await
@@ -3148,5 +3512,139 @@ mod sequencer_set_tests {
                 .is_none()
         );
         assert!(s.get_sequencer_set_scan_state().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_find_by_exact_cosmos_block_height() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+
+        s.upsert_sequencer_set_hash_change(100, 1000, "aa").await.unwrap();
+        s.upsert_sequencer_set_hash_change(200, 2000, "bb").await.unwrap();
+
+        let found = s.find_sequencer_set_hash_change_by_cosmos_block_height(200).await.unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().validators_hash, "bb");
+
+        let missing = s.find_sequencer_set_hash_change_by_cosmos_block_height(201).await.unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_part_stark_vk_attestation_append_only_and_query() {
+        let db = setup_db().await;
+        let mut s = db.acquire().await.unwrap();
+        let now = get_current_timestamp_secs();
+
+        let batch_id = s
+            .create_part_stark_vk_attestation_batch(&PartStarkVkAttestationBatch {
+                id: 0,
+                domain_tag: "bitvm2:part_stark_vk_attestation:v1".to_string(),
+                zkm_version: "v1.2.4".to_string(),
+                part_stark_vk_hash: "abcd".to_string(),
+                sequencer_set_hash: "ffee".to_string(),
+                sequencer_set_cosmos_block_height: 100,
+                sequencer_set_goat_block_height: 1000,
+                sequencer_set_size: 3,
+                threshold: 2,
+                attestation_hash: "hash1".to_string(),
+                status: AttestationBatchStatus::BitcoinPending.to_string(),
+                bitcoin_txid: None,
+                bitcoin_confirmed_height: None,
+                locally_verified_at: now,
+                bitcoin_confirmed_at: None,
+                created_at: now,
+            })
+            .await
+            .unwrap();
+
+        let sig_1 = PartStarkVkAttestationSignature {
+            id: 0,
+            batch_id,
+            signer_pubkey: "02aa".to_string(),
+            signature: "11".to_string(),
+            created_at: now,
+        };
+        s.create_part_stark_vk_attestation_signature(&sig_1).await.unwrap();
+
+        assert!(
+            s.find_latest_confirmed_part_stark_vk_attestation_batch(
+                "bitvm2:part_stark_vk_attestation:v1",
+                "v1.2.4",
+                "abcd",
+                "ffee",
+            )
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let sig_2 = PartStarkVkAttestationSignature {
+            id: 0,
+            batch_id,
+            signer_pubkey: "03bb".to_string(),
+            signature: "22".to_string(),
+            created_at: now,
+        };
+        s.create_part_stark_vk_attestation_signature(&sig_2).await.unwrap();
+
+        s.update_part_stark_vk_attestation_batch_anchor(
+            batch_id,
+            "txid1",
+            Some(123),
+            AttestationBatchStatus::BitcoinConfirmed,
+            Some(now),
+        )
+            .await
+            .unwrap();
+
+        let confirmed = s
+            .find_latest_confirmed_part_stark_vk_attestation_batch(
+                "bitvm2:part_stark_vk_attestation:v1",
+                "v1.2.4",
+                "abcd",
+                "ffee",
+            )
+            .await
+            .unwrap();
+        assert!(confirmed.is_some());
+        assert_eq!(confirmed.unwrap().id, batch_id);
+        let confirmed_by_hash = s
+            .find_latest_confirmed_part_stark_vk_attestation_batch_by_hash(
+                "bitvm2:part_stark_vk_attestation:v1",
+                "abcd",
+            )
+            .await
+            .unwrap();
+        assert!(confirmed_by_hash.is_some());
+        assert_eq!(confirmed_by_hash.unwrap().id, batch_id);
+
+        let signatures =
+            s.find_part_stark_vk_attestation_signatures_by_batch_id(batch_id).await.unwrap();
+        assert_eq!(signatures.len(), 2);
+        s.assert_confirmed_part_stark_vk_attestation_by_domain_version_and_hash(
+            "bitvm2:part_stark_vk_attestation:v1",
+            "v1.2.4",
+            "abcd",
+        )
+            .await
+            .unwrap();
+        s.assert_confirmed_part_stark_vk_attestation_by_hash(
+            "bitvm2:part_stark_vk_attestation:v1",
+            "abcd",
+        )
+            .await
+            .unwrap();
+
+        let dup = s
+            .create_part_stark_vk_attestation_signature(&PartStarkVkAttestationSignature {
+                id: 0,
+                batch_id,
+                signer_pubkey: "03bb".to_string(),
+                signature: "33".to_string(),
+                created_at: now,
+            })
+            .await;
+        assert!(dup.is_err());
     }
 }

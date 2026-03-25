@@ -6,13 +6,14 @@ mod validation;
 
 use crate::api::metrics_service::{ApiMetricsState, metrics_handler, metrics_middleware};
 use crate::api::proof_handler::{
-    get_chain_proof_task_desc, get_operator_proof_task_desc, post_operator_proof_task,
-    post_watchtower_proof_task, update_operator_proof_task_timeout,
-    update_watchtower_proof_task_timeout,
+    bind_part_stark_vk_attestation_anchor, get_chain_proof_task_desc, get_operator_proof_task_desc,
+    post_operator_proof_task, post_part_stark_vk_attestation, post_watchtower_proof_task,
+    update_operator_proof_task_timeout, update_watchtower_proof_task_timeout,
 };
 use axum::http::Method;
 use axum::routing::{get, post};
 use axum::{Router, middleware};
+use bitcoin::Network;
 use std::sync::Arc;
 use store::localdb::LocalDB;
 use tokio::net::TcpListener;
@@ -21,25 +22,49 @@ use tower_http::cors::{Any, CorsLayer};
 
 struct ApiState {
     pub local_db: LocalDB,
+    pub cosmos_rpc_url: String,
+    pub esplora_url: String,
+    pub bitcoin_network: Network,
     pub metrics_state: ApiMetricsState,
 }
 
 impl ApiState {
-    pub(crate) async fn create_arc_app_state(local_db: LocalDB) -> anyhow::Result<Arc<ApiState>> {
+    pub(crate) async fn create_arc_app_state(
+        local_db: LocalDB,
+        cosmos_rpc_url: String,
+        esplora_url: String,
+        bitcoin_network: Network,
+    ) -> anyhow::Result<Arc<ApiState>> {
         let metrics_state = ApiMetricsState::new();
-        Ok(Arc::new(ApiState { local_db, metrics_state }))
+        Ok(Arc::new(ApiState {
+            local_db,
+            cosmos_rpc_url,
+            esplora_url,
+            bitcoin_network,
+            metrics_state,
+        }))
     }
 }
 pub(crate) async fn serve(
     addr: String,
     local_db: LocalDB,
+    cosmos_rpc_url: String,
+    esplora_url: String,
+    bitcoin_network: Network,
     cancellation_token: CancellationToken,
 ) -> anyhow::Result<String> {
-    let api_state = ApiState::create_arc_app_state(local_db).await?;
+    let api_state =
+        ApiState::create_arc_app_state(local_db, cosmos_rpc_url, esplora_url, bitcoin_network)
+            .await?;
     let server = Router::new()
         .route(routes::ROOT, get(root))
         .route(routes::METRICS, get(metrics_handler))
         .route(routes::v1::PROOFS_CHAIN_PROOFS_DESC, get(get_chain_proof_task_desc))
+        .route(routes::v1::PROOFS_PART_STARK_VK_ATTESTATION, post(post_part_stark_vk_attestation))
+        .route(
+            routes::v1::PROOFS_PART_STARK_VK_ATTESTATION_ANCHOR,
+            post(bind_part_stark_vk_attestation_anchor),
+        )
         .route(routes::v1::PROOFS_WATCHTOWER_PROOF, post(post_watchtower_proof_task))
         .route(
             routes::v1::PROOFS_WATCHTOWER_PROOF_TIMEOUT,

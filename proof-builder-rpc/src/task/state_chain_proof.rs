@@ -1,6 +1,9 @@
+use crate::attestation::ensure_input_proof_part_stark_vk_attested;
 use crate::task::ProofState::{Failed, New, Proven, Proving};
 use crate::task::fetch_latest_long_running_task_by_state;
-use crate::task::{create_long_running_task, update_long_running_task};
+use crate::task::{
+    PROOF_TASK_RETRY_DELAY_SECS, create_long_running_task, update_long_running_task,
+};
 use crate::{ProofBuilderConfig, task::fetch_latest_long_running_task};
 use proof_builder::{ProofBuilder, ProofRequest};
 use state_chain_proof::{StateChainProofBuilder, fetch_state_chain};
@@ -182,6 +185,21 @@ async fn spawn_state_chain_prover(
                     }
                 };
                 tracing::info!("Updated long running task to proving state, affected rows: {affteced}");
+
+                if !args.init_input
+                    && let Err(err) = ensure_input_proof_part_stark_vk_attested(
+                        &local_db,
+                        &args.input_proof,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        "State chain input proof attestation check failed, input_proof: {}, error: {err}",
+                        args.input_proof
+                    );
+                    tokio::time::sleep(Duration::from_secs(PROOF_TASK_RETRY_DELAY_SECS)).await;
+                    continue;
+                }
 
                 let (input, proof, cycles, proving_time) =
                     match builder.build_proof(&ctx) {

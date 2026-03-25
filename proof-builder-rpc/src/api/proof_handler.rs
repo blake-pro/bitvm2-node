@@ -1,21 +1,120 @@
 use crate::api::ApiState;
 use crate::api::response::{ApiErrorExt, ApiResult, ok_response};
 use crate::api::validation::InputValidator;
+use crate::attestation::{
+    bind_part_stark_vk_attestation_anchor as bind_part_stark_vk_attestation_anchor_inner,
+    ensure_declared_recursive_part_stark_vks_attested, ensure_part_stark_vk_attested,
+    verify_and_store_part_stark_vk_attestation,
+};
 use crate::task::{
     add_operator_task, add_watchtower_task, find_operator_task, find_watchtower_task,
     update_operator_task_state, update_watchtower_task_state,
 };
 use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
+use client::btc_chain::BTCClient;
 use proof_builder::{
     ChainProofDescRequest, OperatorProofDescRequest, OperatorProofRequest, OperatorProofResponse,
-    OperatorProofTimeoutUpdateRequest, OperatorProofTimeoutUpdateResponse, ProofData, ProofDesc,
+    OperatorProofTimeoutUpdateRequest, OperatorProofTimeoutUpdateResponse,
+    PartStarkVkAttestationAnchorRequest, PartStarkVkAttestationAnchorResponse,
+    PartStarkVkAttestationRequest, PartStarkVkAttestationResponse, ProofData, ProofDesc,
     ProofDescResponse, ProofType, WatchtowerProofRequest, WatchtowerProofResponse,
     WatchtowerProofTimeoutUpdateRequest, WatchtowerProofTimeoutUpdateResponse,
 };
 use std::sync::Arc;
 use store::ProofState;
 use tracing::info;
+
+async fn ensure_proof_attested(
+    api_state: &ApiState,
+    proof_type: ProofType,
+    proof_data: &ProofData,
+) -> Result<(), String> {
+    ensure_part_stark_vk_attested(&api_state.local_db, &proof_data.zkm_version)
+        .await
+        .map_err(|err| format!("part_stark_vk attestation check failed: {err}"))?;
+    ensure_declared_recursive_part_stark_vks_attested(
+        &api_state.local_db,
+        proof_type,
+        &proof_data.public_inputs,
+    )
+    .await
+    .map_err(|err| format!("declared recursive part_stark_vk attestation check failed: {err}"))?;
+    Ok(())
+}
+
+#[axum::debug_handler]
+pub(super) async fn post_part_stark_vk_attestation(
+    State(api_state): State<Arc<ApiState>>,
+    Json(payload): Json<PartStarkVkAttestationRequest>,
+) -> ApiResult<PartStarkVkAttestationResponse> {
+    match verify_and_store_part_stark_vk_attestation(
+        &api_state.local_db,
+        &api_state.cosmos_rpc_url,
+        &payload,
+    )
+    .await
+    {
+        Ok((
+            batch_id,
+            part_stark_vk_hash,
+            attestation_hash,
+            verified_signers,
+            required_signers,
+            status,
+        )) => ok_response(PartStarkVkAttestationResponse {
+            batch_id: Some(batch_id),
+            zkm_version: payload.zkm_version,
+            part_stark_vk_hash: Some(part_stark_vk_hash),
+            attestation_hash: Some(attestation_hash),
+            verified_signers,
+            required_signers,
+            status: Some(status.to_string()),
+            error: None,
+        }),
+        Err(error) => ok_response(PartStarkVkAttestationResponse {
+            batch_id: None,
+            zkm_version: payload.zkm_version,
+            part_stark_vk_hash: None,
+            attestation_hash: None,
+            verified_signers: 0,
+            required_signers: 0,
+            status: None,
+            error: Some(error.to_string()),
+        }),
+    }
+}
+
+#[axum::debug_handler]
+pub(super) async fn bind_part_stark_vk_attestation_anchor(
+    State(api_state): State<Arc<ApiState>>,
+    Path(batch_id): Path<i64>,
+    Json(payload): Json<PartStarkVkAttestationAnchorRequest>,
+) -> ApiResult<PartStarkVkAttestationAnchorResponse> {
+    let _txid = InputValidator::validate_btc_txid(&payload.bitcoin_txid, "bitcoin_txid")?;
+    let btc_client = BTCClient::new(api_state.bitcoin_network, Some(&api_state.esplora_url));
+    match bind_part_stark_vk_attestation_anchor_inner(
+        &api_state.local_db,
+        &btc_client,
+        batch_id,
+        &payload.bitcoin_txid,
+    )
+    .await
+    {
+        Ok(batch) => ok_response(PartStarkVkAttestationAnchorResponse {
+            batch_id,
+            bitcoin_txid: batch.bitcoin_txid,
+            status: Some(batch.status),
+            error: None,
+        }),
+        Err(error) => ok_response(PartStarkVkAttestationAnchorResponse {
+            batch_id,
+            bitcoin_txid: None,
+            status: None,
+            error: Some(error.to_string()),
+        }),
+    }
+}
 
 #[axum::debug_handler]
 pub(super) async fn get_chain_proof_task_desc(
@@ -148,13 +247,18 @@ pub(super) async fn post_operator_proof_task(
             if operator_proof.proof_state == ProofState::Proven.to_i64()
                 && operator_proof.path_to_proof.is_some() =>
         {
-            ok_response(OperatorProofResponse {
-                proof_data: Some(ProofData::load_proof_data(
-                    &operator_proof.path_to_proof.unwrap(),
-                    ProofType::Operator,
-                )),
-                error: None,
-            })
+            let proof_data = ProofData::load_proof_data(
+                &operator_proof.path_to_proof.unwrap(),
+                ProofType::Operator,
+            );
+            match ensure_proof_attested(&api_state, ProofType::Operator, &proof_data).await {
+                Ok(_) => {
+                    ok_response(OperatorProofResponse { proof_data: Some(proof_data), error: None })
+                }
+                Err(err) => {
+                    ok_response(OperatorProofResponse { proof_data: None, error: Some(err) })
+                }
+            }
         }
         Some(operator_proof) => ok_response(OperatorProofResponse {
             proof_data: None,
@@ -237,13 +341,19 @@ pub(super) async fn post_watchtower_proof_task(
             if watchtower_proof.proof_state == ProofState::Proven.to_i64()
                 && watchtower_proof.path_to_proof.is_some() =>
         {
-            ok_response(WatchtowerProofResponse {
-                proof_data: Some(ProofData::load_proof_data(
-                    &watchtower_proof.path_to_proof.unwrap(),
-                    ProofType::Watchtower,
-                )),
-                error: None,
-            })
+            let proof_data = ProofData::load_proof_data(
+                &watchtower_proof.path_to_proof.unwrap(),
+                ProofType::Watchtower,
+            );
+            match ensure_proof_attested(&api_state, ProofType::Watchtower, &proof_data).await {
+                Ok(_) => ok_response(WatchtowerProofResponse {
+                    proof_data: Some(proof_data),
+                    error: None,
+                }),
+                Err(err) => {
+                    ok_response(WatchtowerProofResponse { proof_data: None, error: Some(err) })
+                }
+            }
         }
         Some(watchtower_proof) => ok_response(WatchtowerProofResponse {
             proof_data: None,

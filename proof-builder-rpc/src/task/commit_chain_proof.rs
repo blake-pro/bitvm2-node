@@ -1,4 +1,6 @@
 use crate::ProofBuilderConfig;
+use crate::attestation::ensure_input_proof_part_stark_vk_attested;
+use crate::task::PROOF_TASK_RETRY_DELAY_SECS;
 use crate::task::create_commit_chain_proof;
 use crate::task::fetch_latest_long_running_task;
 use crate::task::fetch_next_commit_task_index;
@@ -57,6 +59,17 @@ pub(crate) fn spawn_commit_chain_proof_task(
                         args.init_input = false;
                     }
                     info!("Commit chain proof generate task: generate proof, args: {args:?}");
+                    if !args.init_input
+                        && let Err(err) =
+                            ensure_input_proof_part_stark_vk_attested(&local_db, &args.input_proof)
+                                .await
+                    {
+                        tracing::warn!(
+                            "Skip commit chain proof generation because part_stark_vk attestation check failed: {err}"
+                        );
+                        tokio::time::sleep(Duration::from_secs(PROOF_TASK_RETRY_DELAY_SECS)).await;
+                        continue;
+                    }
 
                     let commits = match fetch_commit_chain(&args.esplora_url, &args.commit_info, &args.commits, args.bitcoin_network).await {
                         Ok(d) => d,

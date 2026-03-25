@@ -1,7 +1,9 @@
 mod api;
+mod attestation;
 mod config;
 mod task;
 
+use crate::attestation::{is_watcher_enabled, spawn_bitcoin_anchor_watcher_task};
 use crate::task::{is_start_generate_proof_tasks, run_generate_proof_tasks};
 use clap::Parser;
 use futures::future;
@@ -35,6 +37,9 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = ProofBuilderConfig::new(&opt.config)?;
     println!("proof builder config: {:?}", cfg);
+    let cosmos_rpc_url = cfg.state_chain.cosmos_rpc_url.clone();
+    let esplora_url = cfg.header_chain.esplora_url.clone();
+    let bitcoin_network = cfg.header_chain.bitcoin_network;
 
     let _ = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).try_init();
     // Create cancellation token for graceful shutdown
@@ -45,9 +50,19 @@ async fn main() -> anyhow::Result<()> {
     let mut task_handles: Vec<JoinHandle<anyhow::Result<String, String>>> = vec![];
     let cancel_token_clone = cancellation_token.clone();
     let opt_rpc_addr = opt.rpc_addr.clone();
+    let api_esplora_url = esplora_url.clone();
     info!("start api server");
     task_handles.push(tokio::spawn(async move {
-        match api::serve(opt_rpc_addr, local_db_clone1, cancel_token_clone).await {
+        match api::serve(
+            opt_rpc_addr,
+            local_db_clone1,
+            cosmos_rpc_url,
+            api_esplora_url,
+            bitcoin_network,
+            cancel_token_clone,
+        )
+        .await
+        {
             Ok(tag) => Ok(tag),
             Err(e) => {
                 tracing::error!("RPC service error: {}", e);
@@ -55,6 +70,17 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }));
+    if is_watcher_enabled() {
+        let cancel_token_clone = cancellation_token.clone();
+        let local_db_clone = local_db.clone();
+        task_handles.push(spawn_bitcoin_anchor_watcher_task(
+            local_db_clone,
+            esplora_url,
+            bitcoin_network,
+            15,
+            cancel_token_clone,
+        ));
+    }
     if is_start_generate_proof_tasks(&cfg) {
         info!("start generate proof tasks");
         let cancel_token_clone = cancellation_token.clone();
