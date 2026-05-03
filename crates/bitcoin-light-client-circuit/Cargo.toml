@@ -16,6 +16,7 @@ state-chain = { workspace = true }
 
 # Ziren
 zkm-verifier = { workspace = true }
+verifier = { workspace = true }
 zkm-zkvm = { workspace = true }
 zkm-primitives = { workspace = true }
 #zkm-verifier = { path = "../../../Ziren/crates/verifier" }
@@ -25,10 +26,9 @@ zkm-primitives = { workspace = true }
 tracing = { workspace = true, features = ["max_level_trace"] }
 
 alloy-primitives = { workspace = true, features = ["sha3-keccak", "map-foldhash", "serde"] }
-revm-database-interface = { workspace = true, features = ["serde"]}
+revm-database-interface = { workspace = true, features = ["serde"] }
 
 #revm = { workspace = true, branch = "patch-31.0.2", features = ["serde", "bn"], default-features = false }
-sha2 = "0.10.9"
 hex = { workspace = true }
 
 #prost = { version = "0.13", features = ["prost-derive"], default-features = false }
@@ -40,13 +40,13 @@ serde_json = { workspace = true }
 
 tendermint = { git = "https://github.com/ProjectZKM/tendermint-rs", branch = "patch-0.40.3", default-features = false, features = ["secp256k1"] }
 tendermint-light-client-verifier = { git = "https://github.com/ProjectZKM/tendermint-rs", branch = "patch-0.40.3", default-features = false, features = [
-  "rust-crypto",
+    "rust-crypto",
 ] }
 
 
 [dev-dependencies]
 rand = "0.8.5"
-borsh = {version = "1.5.3", features = ["derive"] }
+borsh = { version = "1.5.3", features = ["derive"] }
 blake3 = "1.6.1"
 #zkm-sdk = { git = "https://github.com/ProjectZKM/Ziren" }
 

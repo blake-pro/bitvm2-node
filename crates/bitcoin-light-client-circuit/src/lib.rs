@@ -1,38 +1,33 @@
-mod attestation;
 mod signature;
 mod utils;
 use alloy_primitives::U32;
-pub use attestation::*;
 pub use signature::*;
 use state_chain::verify_sequencer_commit;
 pub use utils::*;
 
 use alloy_primitives::U256;
 use bitcoin::Block;
-use bitcoin::Transaction;
 use bitcoin::hashes::{Hash, HashEngine, sha256};
-use commit_chain::sequencer_hash;
 use commit_chain::{
-    CommitChainCircuitInput, CommitChainCircuitOutput, extract_data_from_commitment_outputs,
+    CommitChainCircuitInput, CommitChainPrevProofType, extract_data_from_commitment_outputs,
+    sequencer_hash,
 };
 use header_chain::{
     BitcoinMerkleTree, CircuitBlockHeader, CircuitTransaction, HeaderChainCircuitInput,
     HeaderChainPrevProofType, MMRHost, SPV, verify_merkle_proof,
 };
 use state_chain::{StateChainCircuitInput, StateChainPrevProofType};
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use zkm_primitives::io::ZKMPublicValues;
-use zkm_verifier::{Groth16Verifier, IMM_GROTH16_VK_BYTES};
 
-use bitcoin::{ScriptBuf, TxOut, Txid, secp256k1::PublicKey};
+use bitcoin::{ScriptBuf, Transaction, TxOut, Txid, secp256k1::PublicKey};
 pub use guest_executor::io::EthClientExecutorInput;
 use serde::{Deserialize, Serialize};
+use verifier::verify_groth16_proof;
 
 pub const GRAPH_ID_SIZE: usize = 16;
 pub const PROOF_SIZE: usize = 260;
 pub const PUBLIC_INPUTS_SIZE: usize = 36;
-pub const WATCHTOWER_COMMITMENT_PUBLIC_INPUTS_LEN_SIZE: usize = 4;
-pub const WATCHTOWER_COMMITMENT_PROOF_PART_STARK_VK_LEN_SIZE: usize = 4;
+pub const ZKM_VERSION_LEN_SIZE: usize = 4;
 pub const VK_HASH_SIZE: usize = 66;
 
 pub const TOTAL_WORK_SIZE: usize = 32;
@@ -57,21 +52,26 @@ pub fn watch_longest_chain(
     header_chain: HeaderChainCircuitInput,
     commit_chain: CommitChainCircuitInput,
     state_chain: StateChainCircuitInput,
-    attestation: WatchtowerAttestationInputs,
     spv: SPV,
-) -> WatchtowerPublicOutputs {
+) -> ([u8; 32], u32) {
     println!("commit header, size: {}", commit_chain.commits.len());
-    let commit_chain_output =
-        verify_commit_chain_output(&commit_chain).expect("Failed to verify commit chain proof");
-    let (publisher_public_keys, threshold) =
-        commit_chain_attestation_authority(&commit_chain_output);
-    verify_unique_part_stark_vk_witnesses(
-        &attestation.unique_witnesses,
-        publisher_public_keys,
-        threshold,
-        PART_STARK_VK_TREE_HEIGHT,
+    // verify latest_sequencer_commit is valid:
+    //   * Check both latest_sequencer_commit_txid and genesis_sequencer_commit_txid are in all_sequencer_commit_txids (which is a private input)
+    //   * Check latest_sequencer_commit_txid is derived from genesis_sequencer_commit_txid
+    // verify the commit chain proof
+    verify_groth16_proof(
+        &commit_chain.zkm_proof,
+        &commit_chain.zkm_public_values,
+        &commit_chain.zkm_vk_hash,
+        &commit_chain.zkm_version,
     )
-    .expect("Failed to verify unique part_stark_vk attestations");
+    .expect("Failed to verify commit chain proof");
+
+    let prev_output = ZKMPublicValues::from(&commit_chain.zkm_public_values).read();
+    let prev_proof = CommitChainPrevProofType::PrevProof(prev_output);
+    let CommitChainPrevProofType::PrevProof(commit_chain_output) = &prev_proof else {
+        panic!("Only PrevProof is supported in watch_longest_chain");
+    };
 
     assert_eq!(
         commit_chain_output.chain_state.commit_txn.compute_txid(),
@@ -81,16 +81,11 @@ pub fn watch_longest_chain(
 
     println!("header chain: applying: {}", header_chain.block_headers.len());
     // verify header_chain is valid
-    let header_part_stark_vk = attested_part_stark_vk_for_zkm_version(
-        &attestation.unique_witnesses,
-        &header_chain.zkm_version,
-    )
-    .expect("Failed to resolve attested header-chain part_stark_vk");
-    verify_proof_with_part_stark_vk(
+    verify_groth16_proof(
         &header_chain.zkm_proof,
         &header_chain.zkm_public_values,
         &header_chain.zkm_vk_hash,
-        &header_part_stark_vk,
+        &header_chain.zkm_version,
     )
     .expect("Failed to verify header chain proof");
 
@@ -103,16 +98,11 @@ pub fn watch_longest_chain(
     println!("SPV");
     assert!(spv.verify(&btc_header_chain_output.chain_state.block_hashes_mmr));
 
-    let state_part_stark_vk = attested_part_stark_vk_for_zkm_version(
-        &attestation.unique_witnesses,
-        &state_chain.zkm_version,
-    )
-    .expect("Failed to resolve attested state-chain part_stark_vk");
-    verify_proof_with_part_stark_vk(
+    verify_groth16_proof(
         &state_chain.zkm_proof,
         &state_chain.zkm_public_values,
         &state_chain.zkm_vk_hash,
-        &state_part_stark_vk,
+        &state_chain.zkm_version,
     )
     .expect("Failed to verify state chain proof");
     let prev_output = ZKMPublicValues::from(&state_chain.zkm_public_values).read();
@@ -120,17 +110,6 @@ pub fn watch_longest_chain(
     let StateChainPrevProofType::PrevProof(state_chain_output) = &prev_proof else {
         panic!("Only PrevProof is supported in watch_longest_chain");
     };
-    assert_part_stark_vk_in_verified_witnesses(
-        &attestation.unique_witnesses,
-        &btc_header_chain_output.part_stark_vk,
-    )
-    .expect("Failed to match header-chain part_stark_vk in verified witnesses");
-    assert_part_stark_vk_in_verified_witnesses(
-        &attestation.unique_witnesses,
-        &state_chain_output.part_stark_vk,
-    )
-    .expect("Failed to match state-chain part_stark_vk in verified witnesses");
-
     // check the signature.
     let cosmos_block_bytes = &state_chain_output.chain_state.latest_cosmos_block;
     let cosmos_block: LightBlock =
@@ -154,10 +133,7 @@ pub fn watch_longest_chain(
 
     println!("commit public inputs");
     // commit public inputs
-    WatchtowerPublicOutputs {
-        total_work: btc_header_chain_output.chain_state.total_work,
-        consensus_block_height: commit_chain_output.chain_state.block_height.to_le_bytes(),
-    }
+    (btc_header_chain_output.chain_state.total_work, commit_chain_output.chain_state.block_height)
 }
 
 pub fn u256_to_le_bits(u: U256) -> [bool; 256] {
@@ -193,24 +169,23 @@ pub fn propose_longest_chain(
     operator_header_chain: HeaderChainCircuitInput,
     commit_chain: CommitChainCircuitInput,
     state_chain: StateChainCircuitInput,
-    attestation: OperatorAttestationInputs,
     spv_ss_commit: SPV,
     operator_committed_blockhash: [u8; 32],
-) -> OperatorPublicOutputs {
+) -> ([u8; 32], [u8; 32], [u8; 32]) {
     // verify operator_latest_sequencer_commit_txid is valid, and on operator head chain
     //   * Check operator_latest_sequencer_commit_txid is derived from genesis_sequencer_commit_txid
-    let commit_chain_output =
-        verify_commit_chain_output(&commit_chain).expect("Failed to verify commit chain proof");
-    let (publisher_public_keys, threshold) =
-        commit_chain_attestation_authority(&commit_chain_output);
-    verify_unique_part_stark_vk_witnesses(
-        &attestation.unique_witnesses,
-        publisher_public_keys,
-        threshold,
-        PART_STARK_VK_TREE_HEIGHT,
+    verify_groth16_proof(
+        &commit_chain.zkm_proof,
+        &commit_chain.zkm_public_values,
+        &commit_chain.zkm_vk_hash,
+        &commit_chain.zkm_version,
     )
-    .expect("Failed to verify unique part_stark_vk attestations");
-
+    .expect("Failed to verify commit chain proof");
+    let prev_output = ZKMPublicValues::from(&commit_chain.zkm_public_values).read();
+    let prev_proof = CommitChainPrevProofType::PrevProof(prev_output);
+    let CommitChainPrevProofType::PrevProof(commit_chain_output) = &prev_proof else {
+        panic!("Only PrevProof is supported in propose_longest_chain");
+    };
     assert_eq!(
         commit_chain_output.chain_state.commit_txn.compute_txid(),
         spv_ss_commit.transaction.0.compute_txid()
@@ -222,16 +197,11 @@ pub fn propose_longest_chain(
 
     // https://github.com/KSlashh/BitVM/blob/v2/goat/src/transactions/watchtower_challenge.rs#L128
     // verify operator_header_chain is valid
-    let header_part_stark_vk = attested_part_stark_vk_for_zkm_version(
-        &attestation.unique_witnesses,
-        &operator_header_chain.zkm_version,
-    )
-    .expect("Failed to resolve attested header-chain part_stark_vk");
-    verify_proof_with_part_stark_vk(
+    verify_groth16_proof(
         &operator_header_chain.zkm_proof,
         &operator_header_chain.zkm_public_values,
         &operator_header_chain.zkm_vk_hash,
-        &header_part_stark_vk,
+        &operator_header_chain.zkm_version,
     )
     .expect("Failed to verify header chain proof");
     let prev_output = ZKMPublicValues::from(&operator_header_chain.zkm_public_values).read();
@@ -239,11 +209,6 @@ pub fn propose_longest_chain(
     let HeaderChainPrevProofType::PrevProof(btc_header_chain_output) = &prev_proof else {
         panic!("Only PrevProof is supported in propose_longest_chain");
     };
-    assert_part_stark_vk_in_verified_witnesses(
-        &attestation.unique_witnesses,
-        &btc_header_chain_output.part_stark_vk,
-    )
-    .expect("Failed to match header-chain part_stark_vk in verified witnesses");
     let operator_total_work = btc_header_chain_output.chain_state.total_work;
     let operator_consensus_block_height = U32::from(commit_chain_output.chain_state.block_height);
     // commit header chain best block hash as pis
@@ -262,46 +227,95 @@ pub fn propose_longest_chain(
     for i in 0..watchtower_challenge_txns.len() {
         if included_watchertowers_bits[i] {
             let tx = &watchtower_challenge_txns[i];
+            println!("Verify watchtower[{i}] tx: {}, {:?}", tx.compute_txid(), tx);
             let prev_out = &watchtower_challenge_txn_prev_outs[i];
+            let prev_index = tx.input[0].previous_output.vout as usize;
             let pubkey = &watchtower_challenge_txn_pubkey[i];
-            let watchtower_outputs = verify_included_watchtower_challenge(
-                i,
-                &graph_id,
-                tx,
-                prev_out,
+
+            let sig = bitcoin::taproot::Signature::from_slice(&tx.input[0].witness[0]).unwrap();
+            // check tx signature is valid
+            match verify_taproot_leaf_schnorr_signature(
                 &watchtower_challenge_txn_scripts[i],
+                tx,
+                prev_index,
+                prev_out,
                 pubkey,
-                &attestation.unique_witnesses,
-                operator_total_work,
-                operator_consensus_block_height,
-            )
-            .unwrap_or_else(|err| panic!("Watchtower[{i}] invalid included challenge: {err}"));
+                &sig,
+            ) {
+                Ok(_) => {}
+                Err(msg) => {
+                    println!("Watchtower[{i}] signature verification: {msg}");
+                    continue;
+                }
+            };
+
+            let commitment = &extract_data_from_commitment_outputs(&tx.output)[..];
+            println!("commitment: {commitment:?}");
+            println!("commitment hex: {}", hex::encode(commitment));
+            let (
+                parsed_graph_id,
+                proof,
+                public_values,
+                vk,
+                watchtower_total_work,
+                watchtower_consensus_block_height,
+                zkm_version,
+            ) = match parse_watchtower_commitment(commitment) {
+                Ok(c) => c,
+                Err(err) => {
+                    println!("Watchtower[{i}] parse commitment error, {err}");
+                    continue;
+                }
+            };
+
+            match verify_groth16_proof(&proof, &public_values, &vk, &zkm_version) {
+                Ok(_) => {}
+                Err(err) => {
+                    println!("Watchtower[{i}] invalid proof: {err}");
+                    continue;
+                }
+            }
+
+            if parsed_graph_id != graph_id {
+                println!(
+                    "Watchtower[{i}] invalid commitment: graph id: parsed = {}, expected = {}",
+                    hex::encode(parsed_graph_id),
+                    hex::encode(graph_id)
+                );
+                continue;
+            }
+            println!("check total work with watchtower {i}");
+
+            // extract ChainState
+            // check watchtower_chain_state.total_work <= operator_header_chain.total_work
+            println!("watchtower total work: {:?}", U256::from_be_bytes(watchtower_total_work));
+            println!("operator total work: {operator_total_work:?}");
 
             println!(
-                "watchtower total work: {:?}",
-                U256::from_be_bytes(watchtower_outputs.total_work)
-            );
-            println!("operator total work: {operator_total_work:?}");
-            println!(
                 "watchtower_consensus_block_height : {:?}",
-                U32::from_le_bytes(watchtower_outputs.consensus_block_height)
+                U32::from_le_bytes(watchtower_consensus_block_height)
             );
             println!("operator_consensus_block_height : {operator_consensus_block_height:?}");
+
+            assert!(
+                U256::from_be_bytes(watchtower_total_work)
+                    <= U256::from_be_bytes(operator_total_work)
+            );
+            // check watchtower.consensus.block_height <= consensus.block_height
+            assert!(
+                U32::from_le_bytes(watchtower_consensus_block_height)
+                    <= operator_consensus_block_height
+            );
         }
     }
 
     println!("verify el block");
 
-    let state_part_stark_vk = attested_part_stark_vk_for_zkm_version(
-        &attestation.unique_witnesses,
-        &state_chain.zkm_version,
-    )
-    .expect("Failed to resolve attested state-chain part_stark_vk");
-    verify_proof_with_part_stark_vk(
+    verify_groth16_proof(
         &state_chain.zkm_proof,
         &state_chain.zkm_public_values,
         &state_chain.zkm_vk_hash,
-        &state_part_stark_vk,
+        &state_chain.zkm_version,
     )
     .expect("Failed to verify state chain proof");
 
@@ -310,13 +324,6 @@ pub fn propose_longest_chain(
     let StateChainPrevProofType::PrevProof(state_chain_output) = &prev_proof else {
         panic!("Only PrevProof is supported in propose_longest_chain");
     };
-
-    assert_part_stark_vk_in_verified_witnesses(
-        &attestation.unique_witnesses,
-        &state_chain_output.part_stark_vk,
-    )
-    .expect("Failed to match state-chain part_stark_vk in verified witnesses");
-
     // check the signature.
     let cosmos_block_bytes = &state_chain_output.chain_state.latest_cosmos_block;
     let cosmos_block: LightBlock =
@@ -370,11 +377,7 @@ pub fn propose_longest_chain(
     );
 
     //operator_public_input
-    OperatorPublicOutputs {
-        btc_best_block_hash: operator_committed_blockhash,
-        constant,
-        included_watchtowers: included_watchtowers.to_le_bytes::<32>(),
-    }
+    (operator_committed_blockhash, constant, included_watchtowers.to_le_bytes::<32>())
 }
 
 pub fn hash_operator_constant(
@@ -452,54 +455,37 @@ pub fn build_spv(
 
 pub fn build_watchtower_commitment(
     graph_id: &[u8; GRAPH_ID_SIZE],
-    proof: &[u8],
-    public_inputs: &[u8],
+    proof: &[u8; PROOF_SIZE],
+    public_inputs: &[u8; PUBLIC_INPUTS_SIZE],
     vk_hash: &str,
-    proof_part_stark_vk: &[u8],
-) -> Result<Vec<u8>, String> {
-    if proof.len() != PROOF_SIZE {
-        return Err(format!("invalid proof length: {}, expected {}", proof.len(), PROOF_SIZE));
-    }
-    if proof_part_stark_vk.is_empty() {
-        return Err("proof_part_stark_vk must not be empty".to_string());
-    }
-    let mut comm = Vec::with_capacity(
-        GRAPH_ID_SIZE
-            + PROOF_SIZE
-            + WATCHTOWER_COMMITMENT_PUBLIC_INPUTS_LEN_SIZE
-            + public_inputs.len()
-            + VK_HASH_SIZE
-            + WATCHTOWER_COMMITMENT_PROOF_PART_STARK_VK_LEN_SIZE
-            + proof_part_stark_vk.len(),
-    );
-    comm.extend_from_slice(graph_id);
+    zkm_version: &str,
+) -> Vec<u8> {
+    let mut comm = graph_id.to_vec();
     comm.extend_from_slice(proof);
-    comm.extend_from_slice(&(public_inputs.len() as u32).to_le_bytes());
     comm.extend_from_slice(public_inputs);
-    if vk_hash.len() != VK_HASH_SIZE {
-        return Err(format!(
-            "invalid vk_hash length: {}, expected {}",
-            vk_hash.len(),
-            VK_HASH_SIZE
-        ));
-    }
+    assert_eq!(vk_hash.len(), VK_HASH_SIZE);
     comm.extend_from_slice(vk_hash.as_bytes());
-    comm.extend_from_slice(&(proof_part_stark_vk.len() as u32).to_le_bytes());
-    comm.extend_from_slice(proof_part_stark_vk);
-    Ok(comm)
+    comm.extend_from_slice(&(zkm_version.len() as u32).to_le_bytes());
+    comm.extend_from_slice(zkm_version.as_bytes());
+
+    comm
 }
 
-pub type WatchtowerCommitmentResult =
-    ([u8; GRAPH_ID_SIZE], Vec<u8>, Vec<u8>, [u8; VK_HASH_SIZE], Vec<u8>);
+pub type WatchtowerCommitmentResult = (
+    [u8; GRAPH_ID_SIZE],
+    [u8; PROOF_SIZE],
+    [u8; PUBLIC_INPUTS_SIZE],
+    [u8; VK_HASH_SIZE],
+    [u8; TOTAL_WORK_SIZE],
+    [u8; CONSENSUS_BLOCK_HEIGHT_SIZE],
+    String,
+);
 
 pub fn parse_watchtower_commitment(
     commitment: &[u8],
 ) -> Result<WatchtowerCommitmentResult, String> {
-    let min_commitment_size = GRAPH_ID_SIZE
-        + PROOF_SIZE
-        + WATCHTOWER_COMMITMENT_PUBLIC_INPUTS_LEN_SIZE
-        + VK_HASH_SIZE
-        + WATCHTOWER_COMMITMENT_PROOF_PART_STARK_VK_LEN_SIZE;
+    let min_commitment_size =
+        GRAPH_ID_SIZE + PROOF_SIZE + PUBLIC_INPUTS_SIZE + VK_HASH_SIZE + ZKM_VERSION_LEN_SIZE;
     if commitment.len() < min_commitment_size {
         return Err(format!(
             "invalid commitment size: {}, expected at least {}",
@@ -511,30 +497,27 @@ pub fn parse_watchtower_commitment(
     let mut graph_id = [0u8; GRAPH_ID_SIZE];
     graph_id.copy_from_slice(&commitment[..end]);
 
-    let proof = commitment[end..end + PROOF_SIZE].to_vec();
+    let mut proof = [0u8; PROOF_SIZE];
+    proof.copy_from_slice(&commitment[end..end + PROOF_SIZE]);
     end += PROOF_SIZE;
 
-    let public_inputs_len = u32::from_le_bytes(
-        commitment[end..end + WATCHTOWER_COMMITMENT_PUBLIC_INPUTS_LEN_SIZE].try_into().unwrap(),
-    ) as usize;
-    end += WATCHTOWER_COMMITMENT_PUBLIC_INPUTS_LEN_SIZE;
+    let mut zkm_public_values = [0u8; PUBLIC_INPUTS_SIZE];
+    zkm_public_values.copy_from_slice(&commitment[end..end + PUBLIC_INPUTS_SIZE]);
+    end += PUBLIC_INPUTS_SIZE;
 
-    let proof_part_stark_vk_len_offset = end + public_inputs_len + VK_HASH_SIZE;
-    if commitment.len()
-        < proof_part_stark_vk_len_offset + WATCHTOWER_COMMITMENT_PROOF_PART_STARK_VK_LEN_SIZE
-    {
-        return Err(format!(
-            "invalid commitment size: {}, missing proof_part_stark_vk length field",
-            commitment.len()
-        ));
+    let mut zkm_vk_hash_bytes = [0u8; VK_HASH_SIZE];
+    zkm_vk_hash_bytes.copy_from_slice(&commitment[end..end + VK_HASH_SIZE]);
+    end += VK_HASH_SIZE;
+
+    let zkm_version_len =
+        u32::from_le_bytes(commitment[end..end + ZKM_VERSION_LEN_SIZE].try_into().unwrap())
+            as usize;
+    if zkm_version_len == 0 {
+        return Err("zkm_version must not be empty".to_string());
     }
-    let proof_part_stark_vk_len = u32::from_le_bytes(
-        commitment[proof_part_stark_vk_len_offset
-            ..proof_part_stark_vk_len_offset + WATCHTOWER_COMMITMENT_PROOF_PART_STARK_VK_LEN_SIZE]
-            .try_into()
-            .unwrap(),
-    ) as usize;
-    let expected_size = min_commitment_size + public_inputs_len + proof_part_stark_vk_len;
+    end += ZKM_VERSION_LEN_SIZE;
+
+    let expected_size = min_commitment_size + zkm_version_len;
     if commitment.len() != expected_size {
         return Err(format!(
             "invalid commitment size: {}, expected {}",
@@ -542,177 +525,39 @@ pub fn parse_watchtower_commitment(
             expected_size
         ));
     }
+    let zkm_version = String::from_utf8(commitment[end..end + zkm_version_len].to_vec())
+        .map_err(|err| format!("invalid zkm_version UTF-8: {err}"))?;
 
-    let zkm_public_values = commitment[end..end + public_inputs_len].to_vec();
-    end += public_inputs_len;
+    // extract ChainState
+    let mut watchtower_total_work = [0u8; TOTAL_WORK_SIZE];
+    watchtower_total_work.copy_from_slice(&zkm_public_values[0..TOTAL_WORK_SIZE]);
+    let mut watchtower_consensus_block_height = [0u8; CONSENSUS_BLOCK_HEIGHT_SIZE];
+    watchtower_consensus_block_height.copy_from_slice(
+        &zkm_public_values[TOTAL_WORK_SIZE..TOTAL_WORK_SIZE + CONSENSUS_BLOCK_HEIGHT_SIZE],
+    );
 
-    let mut zkm_vk_hash_bytes = [0u8; VK_HASH_SIZE];
-    zkm_vk_hash_bytes.copy_from_slice(&commitment[end..end + VK_HASH_SIZE]);
-    end += VK_HASH_SIZE;
+    println!("watchtower total work: {watchtower_total_work:?}");
+    println!("watchtower total work: {:?}", U256::from_be_bytes(watchtower_total_work));
+    println!("watchtower consensus block height: {watchtower_consensus_block_height:?}");
+    println!(
+        "watchtower consensus block height: {:?}",
+        U32::from_le_bytes(watchtower_consensus_block_height)
+    );
 
-    let proof_part_stark_vk_len = u32::from_le_bytes(
-        commitment[end..end + WATCHTOWER_COMMITMENT_PROOF_PART_STARK_VK_LEN_SIZE]
-            .try_into()
-            .unwrap(),
-    ) as usize;
-    if proof_part_stark_vk_len == 0 {
-        return Err("proof_part_stark_vk must not be empty".to_string());
-    }
-    end += WATCHTOWER_COMMITMENT_PROOF_PART_STARK_VK_LEN_SIZE;
-    let proof_part_stark_vk = commitment[end..end + proof_part_stark_vk_len].to_vec();
-    Ok((graph_id, proof, zkm_public_values, zkm_vk_hash_bytes, proof_part_stark_vk))
-}
-
-pub fn parse_watchtower_public_outputs(
-    zkm_public_values: &[u8],
-) -> Result<WatchtowerPublicOutputs, String> {
-    let mut public_values = ZKMPublicValues::from(zkm_public_values);
-    catch_unwind(AssertUnwindSafe(|| public_values.read::<WatchtowerPublicOutputs>()))
-        .map_err(|_| "failed to deserialize watchtower public outputs".to_string())
-}
-
-// Check the public values are consistent with the total work and block hash
-fn groth16_verifier_keys(zkm_version: &str) -> Result<(&'static [u8], &'static [u8]), String> {
-    let imm_groth16_vk = *IMM_GROTH16_VK_BYTES;
-    let part_stark_vk =
-        catch_unwind(AssertUnwindSafe(|| Groth16Verifier::get_part_stark_vk(zkm_version)))
-            .map_err(|_| format!("failed to load part_stark_vk for zkm_version '{zkm_version}'"))?;
-    Ok((imm_groth16_vk, part_stark_vk))
-}
-
-/// Resolve the version-derived `part_stark_vk` and require it to be attested before use.
-fn attested_part_stark_vk_for_zkm_version(
-    unique_witnesses: &[UniquePartStarkVkWitness],
-    zkm_version: &str,
-) -> Result<Vec<u8>, String> {
-    let (_, part_stark_vk) = groth16_verifier_keys(zkm_version)?;
-    assert_part_stark_vk_in_verified_witnesses(unique_witnesses, part_stark_vk)?;
-    Ok(part_stark_vk.to_vec())
-}
-
-/// Verify one included watchtower challenge end-to-end and return its parsed public outputs.
-#[allow(clippy::too_many_arguments)]
-fn verify_included_watchtower_challenge(
-    index: usize,
-    graph_id: &[u8; GRAPH_ID_SIZE],
-    tx: &Transaction,
-    prev_out: &TxOut,
-    script: &ScriptBuf,
-    pubkey: &PublicKey,
-    unique_witnesses: &[UniquePartStarkVkWitness],
-    operator_total_work: [u8; TOTAL_WORK_SIZE],
-    operator_consensus_block_height: U32,
-) -> Result<WatchtowerPublicOutputs, String> {
-    println!("Verify watchtower[{index}] tx: {}, {:?}", tx.compute_txid(), tx);
-    let input = tx
-        .input
-        .first()
-        .ok_or_else(|| "watchtower tx must contain at least one input".to_string())?;
-    let witness = input
-        .witness
-        .iter()
-        .next()
-        .ok_or_else(|| "watchtower tx witness must contain a taproot signature".to_string())?;
-    let sig = bitcoin::taproot::Signature::from_slice(witness)
-        .map_err(|err| format!("invalid taproot signature: {err}"))?;
-    let prev_index = input.previous_output.vout as usize;
-    verify_taproot_leaf_schnorr_signature(script, tx, prev_index, prev_out, pubkey, &sig)
-        .map_err(|err| format!("signature verification failed: {err}"))?;
-
-    let commitment = extract_data_from_commitment_outputs(&tx.output);
-    println!("commitment: {commitment:?}");
-    println!("commitment hex: {}", hex::encode(&commitment));
-
-    let (parsed_graph_id, proof, public_values, vk, proof_part_stark_vk) =
-        parse_watchtower_commitment(&commitment)?;
-    if parsed_graph_id != *graph_id {
-        return Err(format!(
-            "graph id mismatch: parsed={}, expected={}",
-            hex::encode(parsed_graph_id),
-            hex::encode(graph_id)
-        ));
-    }
-    assert_part_stark_vk_in_verified_witnesses(unique_witnesses, &proof_part_stark_vk)?;
-    verify_proof_with_part_stark_vk(&proof, &public_values, &vk, &proof_part_stark_vk)?;
-
-    println!("check total work with watchtower {index}");
-    let watchtower_outputs = parse_watchtower_public_outputs(&public_values)?;
-    if U256::from_be_bytes(watchtower_outputs.total_work) > U256::from_be_bytes(operator_total_work)
-    {
-        return Err("watchtower total work exceeds operator total work".to_string());
-    }
-    if U32::from_le_bytes(watchtower_outputs.consensus_block_height)
-        > operator_consensus_block_height
-    {
-        return Err(
-            "watchtower consensus block height exceeds operator consensus block height".to_string()
-        );
-    }
-    Ok(watchtower_outputs)
-}
-
-/// Verify commit-chain with the trusted base-layer verifier and return its output.
-fn verify_commit_chain_output(
-    commit_chain: &CommitChainCircuitInput,
-) -> Result<CommitChainCircuitOutput, String> {
-    let trusted_part_stark_vk = commit_chain::trusted_commit_chain_part_stark_vk();
-    verify_proof_with_part_stark_vk(
-        &commit_chain.zkm_proof,
-        &commit_chain.zkm_public_values,
-        &commit_chain.zkm_vk_hash,
-        &trusted_part_stark_vk,
-    )?;
-    let output: CommitChainCircuitOutput =
-        ZKMPublicValues::from(&commit_chain.zkm_public_values).read();
-
-    Ok(output)
-}
-
-/// Return the publisher set that authorizes part_stark_vk attestations for this commit-chain output.
-fn commit_chain_attestation_authority(
-    commit_chain_output: &CommitChainCircuitOutput,
-) -> (&[PublicKey], u16) {
-    (
-        &commit_chain_output.chain_state.publisher_public_keys,
-        commit_chain_output.chain_state.threshold,
-    )
-}
-
-pub fn verify_proof(
-    proof: &[u8],
-    zkm_public_values: &[u8],
-    zkm_vk_hash: &[u8],
-    zkm_version: &str,
-) -> Result<(), String> {
-    let (_, part_stark_vk) = groth16_verifier_keys(zkm_version)?;
-    verify_proof_with_part_stark_vk(proof, zkm_public_values, zkm_vk_hash, part_stark_vk)
-}
-
-/// Verify a Groth16 proof against an explicit part_stark_vk instead of a version lookup.
-pub fn verify_proof_with_part_stark_vk(
-    proof: &[u8],
-    zkm_public_values: &[u8],
-    zkm_vk_hash: &[u8],
-    part_stark_vk: &[u8],
-) -> Result<(), String> {
-    let groth16_vk = *IMM_GROTH16_VK_BYTES;
-    let zkm_vk_hash = String::from_utf8(zkm_vk_hash.to_vec()).map_err(|e| e.to_string())?;
-    match Groth16Verifier::verify_by_imm_groth16_vk(
+    Ok((
+        graph_id,
         proof,
         zkm_public_values,
-        &zkm_vk_hash,
-        groth16_vk,
-        part_stark_vk,
-    ) {
-        Ok(_) => Ok(()),
-        Err(err) => Err(format!("Verify Groth16 proof, err: {err:?}")),
-    }
+        zkm_vk_hash_bytes,
+        watchtower_total_work,
+        watchtower_consensus_block_height,
+        zkm_version,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PartStarkVkAttestationBundle;
     use bitcoin::Transaction;
     const PROOF: &[u8] = include_bytes!("../../../circuits/data/watchtower/output3.bin.proof.bin");
     const PUBLIC_INPUTS: &[u8] =
@@ -721,42 +566,20 @@ mod tests {
     const ZKM_VERSION: &str = "v1.2.4";
 
     #[test]
-    fn test_groth16_verifier_keys_keep_common_vk_available() {
-        assert!(!IMM_GROTH16_VK_BYTES.is_empty());
-
-        match groth16_verifier_keys(ZKM_VERSION) {
-            Ok((imm_groth16_vk, part_stark_vk)) => {
-                assert_eq!(imm_groth16_vk, *IMM_GROTH16_VK_BYTES);
-                assert!(!part_stark_vk.is_empty());
-            }
-            Err(err) => {
-                assert!(err.contains("failed to load part_stark_vk"));
-            }
-        }
-    }
-
-    #[test]
     fn test_build_watchtower_commitment() {
         let graph_id = hex::decode("00112233445566778899aabbccddeeff").unwrap().try_into().unwrap();
 
-        let total_work = 1006120u64;
-        let block_height = 503043u32;
-        let proof_part_stark_vk = vec![8u8; 52];
-        let expected_outputs = WatchtowerPublicOutputs {
-            total_work: U256::from(total_work).to_be_bytes(),
-            consensus_block_height: U32::from(block_height).to_le_bytes(),
-        };
-        let public_inputs = bincode::serialize(&expected_outputs).unwrap();
+        let total_work = 1006120;
+        let block_height = 503043;
         println!("public inputs: {:?}", PUBLIC_INPUTS.len());
         println!("vk hash: {:?}", VK_HASH.len());
         let comm = build_watchtower_commitment(
             &graph_id,
-            PROOF,
-            &public_inputs,
+            &PROOF.try_into().unwrap(),
+            &PUBLIC_INPUTS.try_into().unwrap(),
             VK_HASH,
-            &proof_part_stark_vk,
-        )
-        .unwrap();
+            ZKM_VERSION,
+        );
 
         println!("comm: {:?}", comm.len());
         println!("comm hex: {:?}", hex::encode(&comm));
@@ -765,11 +588,11 @@ mod tests {
 
         assert_eq!(expected.0, graph_id);
         assert_eq!(expected.1, PROOF);
-        assert_eq!(expected.2, public_inputs);
+        assert_eq!(expected.2, PUBLIC_INPUTS);
         assert_eq!(expected.3, VK_HASH.as_bytes());
-        assert_eq!(expected.4, proof_part_stark_vk);
-        let parsed_outputs = parse_watchtower_public_outputs(&expected.2).unwrap();
-        assert_eq!(parsed_outputs, expected_outputs);
+        assert_eq!(expected.4, U256::from(total_work).to_be_bytes());
+        assert_eq!(expected.5, U32::from(block_height).to_le_bytes());
+        assert_eq!(expected.6, ZKM_VERSION.to_string());
     }
 
     #[test]
@@ -817,58 +640,22 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_watchtower_commitment_rejects_legacy_v1_payload() {
-        let graph_id: [u8; GRAPH_ID_SIZE] =
-            hex::decode("00112233445566778899aabbccddeeff").unwrap().try_into().unwrap();
-        let mut legacy = graph_id.to_vec();
-        legacy.extend_from_slice(PROOF);
-        legacy.extend_from_slice(&(PUBLIC_INPUTS.len() as u32).to_le_bytes());
-        legacy.extend_from_slice(PUBLIC_INPUTS);
-        legacy.extend_from_slice(VK_HASH.as_bytes());
-        let mut legacy_zkm_version = [0u8; 16];
-        legacy_zkm_version[..ZKM_VERSION.len()].copy_from_slice(ZKM_VERSION.as_bytes());
-        legacy.extend_from_slice(&legacy_zkm_version);
-        assert!(parse_watchtower_commitment(&legacy).is_err());
-    }
-
-    #[test]
-    fn test_parse_watchtower_commitment_rejects_missing_proof_part_stark_vk() {
+    fn test_parse_watchtower_commitment_rejects_missing_zkm_version_len() {
         let graph_id: [u8; GRAPH_ID_SIZE] =
             hex::decode("00112233445566778899aabbccddeeff").unwrap().try_into().unwrap();
         let mut commitment = graph_id.to_vec();
         commitment.extend_from_slice(PROOF);
-        commitment.extend_from_slice(&(PUBLIC_INPUTS.len() as u32).to_le_bytes());
         commitment.extend_from_slice(PUBLIC_INPUTS);
         commitment.extend_from_slice(VK_HASH.as_bytes());
         assert!(parse_watchtower_commitment(&commitment).is_err());
     }
 
     #[test]
-    fn test_parse_watchtower_commitment_accepts_versionless_dual_key_payload() {
-        let graph_id: [u8; GRAPH_ID_SIZE] =
-            hex::decode("00112233445566778899aabbccddeeff").unwrap().try_into().unwrap();
-        let proof_part_stark_vk = vec![9u8; 48];
-        let mut commitment = graph_id.to_vec();
-        commitment.extend_from_slice(PROOF);
-        commitment.extend_from_slice(&(PUBLIC_INPUTS.len() as u32).to_le_bytes());
-        commitment.extend_from_slice(PUBLIC_INPUTS);
-        commitment.extend_from_slice(VK_HASH.as_bytes());
-        commitment.extend_from_slice(&(proof_part_stark_vk.len() as u32).to_le_bytes());
-        commitment.extend_from_slice(&proof_part_stark_vk);
-
-        assert!(
-            parse_watchtower_commitment(&commitment).is_ok(),
-            "versionless dual-key commitment should parse"
-        );
-    }
-
-    #[test]
-    fn test_parse_watchtower_commitment_rejects_empty_proof_part_stark_vk() {
+    fn test_parse_watchtower_commitment_rejects_empty_zkm_version() {
         let graph_id: [u8; GRAPH_ID_SIZE] =
             hex::decode("00112233445566778899aabbccddeeff").unwrap().try_into().unwrap();
         let mut commitment = graph_id.to_vec();
         commitment.extend_from_slice(PROOF);
-        commitment.extend_from_slice(&(PUBLIC_INPUTS.len() as u32).to_le_bytes());
         commitment.extend_from_slice(PUBLIC_INPUTS);
         commitment.extend_from_slice(VK_HASH.as_bytes());
         commitment.extend_from_slice(&0u32.to_le_bytes());
@@ -877,156 +664,16 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_watchtower_commitment_rejects_versioned_payload() {
+    fn test_parse_watchtower_commitment_rejects_invalid_zkm_version_utf8() {
         let graph_id: [u8; GRAPH_ID_SIZE] =
             hex::decode("00112233445566778899aabbccddeeff").unwrap().try_into().unwrap();
-        let proof_part_stark_vk = vec![3u8; 12];
-        let mut versioned = vec![2u8];
-        versioned.extend_from_slice(&graph_id);
-        versioned.extend_from_slice(PROOF);
-        versioned.extend_from_slice(&(PUBLIC_INPUTS.len() as u32).to_le_bytes());
-        versioned.extend_from_slice(PUBLIC_INPUTS);
-        versioned.extend_from_slice(VK_HASH.as_bytes());
-        versioned.extend_from_slice(&(proof_part_stark_vk.len() as u32).to_le_bytes());
-        versioned.extend_from_slice(&proof_part_stark_vk);
+        let mut commitment = graph_id.to_vec();
+        commitment.extend_from_slice(PROOF);
+        commitment.extend_from_slice(PUBLIC_INPUTS);
+        commitment.extend_from_slice(VK_HASH.as_bytes());
+        commitment.extend_from_slice(&2u32.to_le_bytes());
+        commitment.extend_from_slice(&[0xff, 0xff]);
 
-        assert!(
-            parse_watchtower_commitment(&versioned).is_err(),
-            "versioned watchtower commitment should be rejected"
-        );
-    }
-
-    #[test]
-    fn test_parse_watchtower_public_outputs_rejects_short_public_inputs() {
-        let result = parse_watchtower_public_outputs(&[0u8; TOTAL_WORK_SIZE + 1]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_watchtower_public_outputs_reads_bincode_serialized_struct() {
-        let expected = WatchtowerPublicOutputs {
-            total_work: [9u8; TOTAL_WORK_SIZE],
-            consensus_block_height: 123u32.to_le_bytes(),
-        };
-
-        let public_inputs = bincode::serialize(&expected).unwrap();
-        let parsed = parse_watchtower_public_outputs(&public_inputs).unwrap();
-
-        assert_eq!(parsed, expected);
-    }
-
-    #[test]
-    fn test_verify_proof_accepts_non_fixed_length_version() {
-        let long_version = "v1.12.15-rc1+build.20260319";
-        let result = verify_proof(&[], &[], &[], long_version);
-        assert!(result.is_err());
-        assert!(!result.unwrap_err().contains("too long"));
-    }
-
-    #[test]
-    fn test_verify_proof_with_part_stark_vk_uses_explicit_vk_bytes() {
-        let part_stark_vk = groth16_verifier_keys(ZKM_VERSION).unwrap().1.to_vec();
-        let result = verify_proof_with_part_stark_vk(&[], &[], &[], &part_stark_vk);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_groth16_verifier_keys_reject_unknown_version_without_panic() {
-        let result = groth16_verifier_keys("v0.0.0-test");
-        assert!(result.is_err());
-    }
-
-    fn sample_unique_witness(part_stark_vk: Vec<u8>) -> PartStarkVkAttestationBundle {
-        PartStarkVkAttestationBundle {
-            part_stark_vk,
-            leaf_index: 0,
-            merkle_path: vec![],
-            root: [0u8; 32],
-            threshold: 1,
-            publisher_set_id: [0u8; 32],
-            signatures: vec![],
-        }
-    }
-
-    #[test]
-    fn test_attested_part_stark_vk_for_zkm_version_accepts_verified_witness_payload() {
-        let part_stark_vk = groth16_verifier_keys(ZKM_VERSION).unwrap().1.to_vec();
-        let unique_witnesses = vec![sample_unique_witness(part_stark_vk.clone())];
-
-        assert_eq!(
-            attested_part_stark_vk_for_zkm_version(&unique_witnesses, ZKM_VERSION).unwrap(),
-            part_stark_vk
-        );
-    }
-
-    #[test]
-    fn test_attested_part_stark_vk_for_zkm_version_rejects_missing_witness_payload() {
-        let unique_witnesses = vec![sample_unique_witness(vec![7u8; 32])];
-
-        assert!(attested_part_stark_vk_for_zkm_version(&unique_witnesses, ZKM_VERSION).is_err());
-    }
-
-    fn sample_commit_tx() -> Transaction {
-        use bitcoin::{absolute::LockTime, transaction::Version};
-
-        Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![],
-            output: vec![],
-        }
-    }
-
-    fn sample_commit_chain_output(
-        genesis_txid: [u8; 32],
-        commit_txn: Transaction,
-        publisher_public_keys: Vec<PublicKey>,
-        threshold: u16,
-    ) -> CommitChainCircuitOutput {
-        CommitChainCircuitOutput {
-            chain_state: commit_chain::CommitChainState {
-                block_height: 7,
-                commit_txn,
-                genesis_txid,
-                sequencers: vec![],
-                publisher_public_keys,
-                threshold,
-            },
-        }
-    }
-
-    #[test]
-    fn test_commit_chain_attestation_authority_uses_chain_state() {
-        let publisher_public_keys =
-            commit_chain::create_dummy_publisher_keys(3, bitcoin::Network::Regtest)
-                .into_iter()
-                .map(|(_, pk)| pk)
-                .collect::<Vec<_>>();
-        let threshold = 2u16;
-        let commit_chain_output = sample_commit_chain_output(
-            [3u8; 32],
-            sample_commit_tx(),
-            publisher_public_keys.clone(),
-            threshold,
-        );
-
-        let (actual_keys, actual_threshold) =
-            commit_chain_attestation_authority(&commit_chain_output);
-        assert_eq!(actual_keys, publisher_public_keys.as_slice());
-        assert_eq!(actual_threshold, threshold);
-    }
-
-    #[test]
-    fn test_operator_public_outputs_bincode_shape_excludes_part_stark_vk() {
-        let expected = OperatorPublicOutputs {
-            btc_best_block_hash: [1u8; 32],
-            constant: [2u8; 32],
-            included_watchtowers: [3u8; 32],
-        };
-
-        let public_inputs = bincode::serialize(&expected).unwrap();
-        let parsed: OperatorPublicOutputs = bincode::deserialize(&public_inputs).unwrap();
-
-        assert_eq!(parsed, expected);
+        assert!(parse_watchtower_commitment(&commitment).is_err());
     }
 }

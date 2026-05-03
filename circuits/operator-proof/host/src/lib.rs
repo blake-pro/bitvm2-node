@@ -6,31 +6,21 @@ use bitcoin::{
     hashes::Hash,
     secp256k1::{PublicKey, XOnlyPublicKey},
 };
+use bitcoin_light_client_circuit::build_spv;
+use bitcoin_script::script;
 use borsh::BorshDeserialize;
+use clap::Parser;
 use client::btc_chain::BTCClient;
-use commit_chain::{
-    CommitChainCircuitInput, CommitChainPrevProofType, extract_data_from_commitment_outputs,
-};
-use header_chain::{
-    BlockHeaderCircuitOutput, CircuitBlockHeader, HeaderChainCircuitInput, HeaderChainPrevProofType,
-};
+use commit_chain::{CommitChainCircuitInput, CommitChainPrevProofType};
+use header_chain::{CircuitBlockHeader, HeaderChainCircuitInput, HeaderChainPrevProofType};
 use proof_builder::{LongRunning, ProofBuilder, ProofRequest};
-use state_chain::{StateChainCircuitInput, StateChainCircuitOutput, StateChainPrevProofType};
+use state_chain::{StateChainCircuitInput, StateChainPrevProofType};
 use std::str::FromStr;
 use util::get_btc_block_confirms;
 use zkm_sdk::{
     HashableKey, Prover, ProverClient, ZKMProofKind, ZKMProofWithPublicValues, ZKMStdin,
     include_elf,
 };
-use zkm_verifier::Groth16Verifier;
-
-use bincode::deserialize;
-use bitcoin_light_client_circuit::{
-    OperatorAttestationInputs, build_spv, load_unique_part_stark_vk_witnesses,
-    parse_watchtower_commitment, part_stark_vk_attestation_dir,
-};
-use bitcoin_script::script;
-use clap::Parser;
 
 /// The arguments for the cli.
 #[derive(Debug, Clone, Parser, serde::Deserialize, serde::Serialize)]
@@ -93,9 +83,7 @@ impl LongRunning for Args {
 /// A program that aggregates the proofs of the simple program.
 const OPERATOR: &[u8] = include_elf!("guest");
 
-use serde::de::DeserializeOwned;
 use std::fs;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
@@ -241,46 +229,6 @@ impl OperatorProofBuilder {
     }
 }
 
-fn load_proof_public_output<T: DeserializeOwned>(proof_path: &str) -> anyhow::Result<T> {
-    let public_inputs = fs::read(format!("{proof_path}.public_inputs.bin"))
-        .context("Failed to read public inputs")?;
-    deserialize(&public_inputs).context("Failed to decode proof public outputs")
-}
-
-fn extract_watchtower_part_stark_vk(tx: &Transaction) -> Option<Vec<u8>> {
-    let commitment = extract_data_from_commitment_outputs(&tx.output);
-    let (_, _, _, _, proof_part_stark_vk) = parse_watchtower_commitment(&commitment).ok()?;
-    Some(proof_part_stark_vk)
-}
-
-fn load_part_stark_vk(zkm_version: &str) -> anyhow::Result<Vec<u8>> {
-    catch_unwind(AssertUnwindSafe(|| Groth16Verifier::get_part_stark_vk(zkm_version).to_vec()))
-        .map_err(|_| anyhow::anyhow!("Failed to load part_stark_vk for zkm_version {zkm_version}"))
-}
-
-/// Collect both the version-derived verifier key and the recursive inner verifier key
-/// for header/state subproofs, plus each watchtower proof verifier key from commitments.
-fn collect_requested_part_stark_vks(
-    header_chain_input: &HeaderChainCircuitInput,
-    header_chain_output: &BlockHeaderCircuitOutput,
-    state_chain_input: &StateChainCircuitInput,
-    state_chain_output: &StateChainCircuitOutput,
-    watchtower_challenge_txns: &[Transaction],
-) -> anyhow::Result<Vec<Vec<u8>>> {
-    let mut requested_part_stark_vks = vec![
-        load_part_stark_vk(&header_chain_input.zkm_version)?,
-        header_chain_output.part_stark_vk.clone(),
-        load_part_stark_vk(&state_chain_input.zkm_version)?,
-        state_chain_output.part_stark_vk.clone(),
-    ];
-    for tx in watchtower_challenge_txns {
-        if let Some(part_stark_vk) = extract_watchtower_part_stark_vk(tx) {
-            requested_part_stark_vks.push(part_stark_vk);
-        }
-    }
-    Ok(requested_part_stark_vks)
-}
-
 impl ProofBuilder for OperatorProofBuilder {
     fn client(&self) -> &zkm_sdk::ProverClient {
         &self.client
@@ -409,23 +357,6 @@ impl ProofBuilder for OperatorProofBuilder {
             }
         };
 
-        let header_chain_output: BlockHeaderCircuitOutput =
-            load_proof_public_output(header_chain_input_proof)?;
-        let state_chain_output: StateChainCircuitOutput =
-            load_proof_public_output(state_chain_input_proof)?;
-        let requested_part_stark_vks = collect_requested_part_stark_vks(
-            &header_chain_input,
-            &header_chain_output,
-            &state_chain_input,
-            &state_chain_output,
-            watchtower_challenge_txns,
-        )?;
-        let attestation_dir = part_stark_vk_attestation_dir();
-        let (unique_witnesses, _) =
-            load_unique_part_stark_vk_witnesses(&attestation_dir, &requested_part_stark_vks)
-                .map_err(anyhow::Error::msg)?;
-        let attestation_inputs = OperatorAttestationInputs { unique_witnesses };
-
         // --- spv --- //
         //let latest_sequencer_commit_txid = Txid::from_str(&latest_sequencer_commit_txid).unwrap();
 
@@ -484,7 +415,6 @@ impl ProofBuilder for OperatorProofBuilder {
                 stdin.write(&header_chain_input);
                 stdin.write(&commit_chain_input);
                 stdin.write(&state_chain_input);
-                stdin.write(&attestation_inputs);
                 stdin.write(&spv_ss_commit);
                 stdin.write(&operator_committed_blockhash.to_byte_array());
 
@@ -543,80 +473,6 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use zkm_verifier::{Groth16Verifier, IMM_GROTH16_VK_BYTES, convert_ark_imm_wrap_vk};
-
-    fn sample_header_input(zkm_version: &str) -> HeaderChainCircuitInput {
-        HeaderChainCircuitInput {
-            prev_proof: HeaderChainPrevProofType::GenesisBlock,
-            zkm_proof: vec![],
-            zkm_public_values: vec![],
-            zkm_vk_hash: vec![],
-            zkm_version: zkm_version.to_string(),
-            block_headers: vec![],
-        }
-    }
-
-    fn sample_state_input(zkm_version: &str) -> StateChainCircuitInput {
-        StateChainCircuitInput {
-            prev_proof: StateChainPrevProofType::GenesisBlock,
-            zkm_proof: vec![],
-            zkm_public_values: vec![],
-            zkm_vk_hash: vec![],
-            zkm_version: zkm_version.to_string(),
-            blocks: vec![],
-        }
-    }
-
-    fn sample_header_output(part_stark_vk: Vec<u8>) -> BlockHeaderCircuitOutput {
-        BlockHeaderCircuitOutput { chain_state: header_chain::ChainState::new(), part_stark_vk }
-    }
-
-    fn sample_state_output(part_stark_vk: Vec<u8>) -> StateChainCircuitOutput {
-        StateChainCircuitOutput {
-            chain_state: state_chain::StateChainState::new(0, [0u8; 32], Vec::new()),
-            part_stark_vk,
-        }
-    }
-
-    #[test]
-    fn test_collect_requested_part_stark_vks_includes_outer_inner_and_watchtower_keys() {
-        let old_vk = load_part_stark_vk("v1.2.4").unwrap();
-        let new_vk = load_part_stark_vk("v1.2.5").unwrap();
-
-        let graph_id = [7u8; 16];
-        let proof = vec![3u8; 260];
-        let public_inputs = vec![9u8; 36];
-        let vk_hash = "ab".repeat(33);
-        let watchtower_comm = bitcoin_light_client_circuit::build_watchtower_commitment(
-            &graph_id,
-            &proof,
-            &public_inputs,
-            &vk_hash,
-            &new_vk,
-        )
-        .unwrap();
-        let watchtower_tx = Transaction {
-            version: bitcoin::transaction::Version::TWO,
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: vec![],
-            output: vec![TxOut {
-                value: bitcoin::Amount::ZERO,
-                script_pubkey: bitcoin::ScriptBuf::new_op_return(
-                    bitcoin::script::PushBytesBuf::try_from(watchtower_comm).unwrap(),
-                ),
-            }],
-        };
-
-        let requested = collect_requested_part_stark_vks(
-            &sample_header_input("v1.2.5"),
-            &sample_header_output(old_vk.clone()),
-            &sample_state_input("v1.2.5"),
-            &sample_state_output(old_vk.clone()),
-            &[watchtower_tx],
-        )
-        .unwrap();
-
-        assert_eq!(requested, vec![new_vk.clone(), old_vk.clone(), new_vk.clone(), old_vk, new_vk]);
-    }
 
     #[tokio::test]
     #[ignore = "local test"]

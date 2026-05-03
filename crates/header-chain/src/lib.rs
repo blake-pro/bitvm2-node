@@ -12,25 +12,20 @@ pub use transaction::*;
 
 pub mod spv;
 pub use spv::SPV;
-use zkm_verifier::{Groth16Verifier, IMM_GROTH16_VK_BYTES};
 
 /// The main entry point of the header chain circuit.
 pub fn header_chain_circuit(input: HeaderChainCircuitInput) -> BlockHeaderCircuitOutput {
-    let current_part_stark_vk = Groth16Verifier::get_part_stark_vk(&input.zkm_version).to_vec();
     // println!("Detected network: {:?}", NETWORK_TYPE);
     // println!("NETWORK_CONSTANTS: {:?}", NETWORK_CONSTANTS);
     let mut chain_state = match input.prev_proof {
         HeaderChainPrevProofType::GenesisBlock => ChainState::new(),
         HeaderChainPrevProofType::PrevProof(prev_proof) => {
             println!("verify header chain of prev proof");
-            let groth16_vk = *IMM_GROTH16_VK_BYTES;
-            let zkm_vk_hash = String::from_utf8(input.zkm_vk_hash.to_vec()).unwrap();
-            Groth16Verifier::verify_by_imm_groth16_vk(
+            verifier::verify_groth16_proof(
                 &input.zkm_proof,
                 &input.zkm_public_values,
-                &zkm_vk_hash,
-                groth16_vk,
-                &current_part_stark_vk,
+                &input.zkm_vk_hash,
+                &input.zkm_version,
             )
             .unwrap();
 
@@ -39,5 +34,5 @@ pub fn header_chain_circuit(input: HeaderChainCircuitInput) -> BlockHeaderCircui
     };
 
     chain_state.apply_blocks(input.block_headers);
-    BlockHeaderCircuitOutput { chain_state, part_stark_vk: current_part_stark_vk }
+    BlockHeaderCircuitOutput { chain_state }
 }

@@ -35,10 +35,6 @@ path = "src/bin/send_bridge_out.rs"
 name = "update-db"
 path = "src/bin/db_inject.rs"
 
-[[bin]]
-name = "part-stark-vk-attest"
-path = "src/bin/part_stark_vk_attest.rs"
-
 [dependencies]
 libp2p = { workspace = true, features = [
     "autonat",
@@ -112,7 +108,6 @@ dirs = "5.0.1"
 zkm-sdk = { workspace = true }
 zkm-verifier = { workspace = true, features = ["ark"] }
 borsh = {version = "1.5.3", features = ["derive"] }
-semver = "1.0"
 
 proof-builder = { workspace = true }
 util = { workspace = true }

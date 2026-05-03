@@ -1022,11 +1022,11 @@ dependencies = [
  "revm-database-interface",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "state-chain",
  "tendermint",
  "tendermint-light-client-verifier",
  "tracing",
+ "verifier",
  "zkm-primitives",
  "zkm-verifier",
  "zkm-zkvm",
@@ -1297,7 +1297,7 @@ dependencies = [
  "tendermint",
  "tendermint-light-client-verifier",
  "tracing",
- "zkm-verifier",
+ "verifier",
  "zkm-zkvm",
 ]
 
@@ -2276,7 +2276,6 @@ dependencies = [
  "sha2 0.10.9",
  "state-chain",
  "tracing",
- "zkm-verifier",
  "zkm-zkvm",
 ]
 
@@ -2434,7 +2433,7 @@ dependencies = [
  "crypto-bigint",
  "serde",
  "sha2 0.10.9",
- "zkm-verifier",
+ "verifier",
  "zkm-zkvm",
 ]
 
@@ -5186,7 +5185,7 @@ dependencies = [
  "tendermint",
  "tendermint-light-client-verifier",
  "tracing",
- "zkm-verifier",
+ "verifier",
  "zkm-zkvm",
 ]
 
@@ -5753,6 +5752,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1bddf1187be692e79c5ffeab891132dfb0f236ed36a43c7ed39f1165ee20191"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "verifier"
+version = "0.3.3"
+dependencies = [
+ "zkm-verifier",
 ]
 
 [[package]]

@@ -1,7 +1,10 @@
 use bitcoin::Network;
 use borsh::{BorshDeserialize, BorshSerialize};
 use client::btc_chain::BTCClient;
-use header_chain::{CircuitBlockHeader, HeaderChainCircuitInput, HeaderChainPrevProofType};
+use header_chain::{
+    BlockHeaderCircuitOutput, ChainState, CircuitBlockHeader, HeaderChainCircuitInput,
+    HeaderChainPrevProofType,
+};
 use proof_builder::{LongRunning, ProofBuilder, ProofRequest};
 use sha2::{Digest, Sha256};
 use std::{
@@ -320,4 +323,26 @@ impl ProofBuilder for HeaderChainProofBuilder {
         tracing::info!("Generate proof successfully, proof: {:?}", proof);
         Ok((public_value_hex, proof_size))
     }
+}
+
+#[test]
+fn test_deserde() {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize, Debug)]
+    struct BlockHeaderCircuitOutputFull {
+        chain_state: ChainState,
+        part_stark_vk: Vec<u8>,
+    }
+
+    let file = "/Users/blake/CLionProjects/zkMIPS/bitvm2-node/circuits/data/header-chain/129595-1.bin.public_inputs.bin";
+    let public_inputs = fs::read(file).expect("Failed to read public inputs");
+
+    let prev_output: BlockHeaderCircuitOutput =
+        zkm_sdk::ZKMPublicValues::from(&public_inputs).read();
+    println!("{:?}", prev_output);
+
+    let prev_output_full: BlockHeaderCircuitOutputFull =
+        zkm_sdk::ZKMPublicValues::from(&public_inputs).read();
+    println!("{:?}", prev_output_full);
 }

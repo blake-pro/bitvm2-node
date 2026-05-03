@@ -1271,7 +1271,7 @@ dependencies = [
  "tendermint",
  "tendermint-light-client-verifier",
  "tracing",
- "zkm-verifier",
+ "verifier",
  "zkm-zkvm",
 ]
 
@@ -2235,7 +2235,6 @@ dependencies = [
  "commit-chain",
  "sha2 0.10.9",
  "tracing",
- "zkm-verifier",
  "zkm-zkvm",
 ]
 
@@ -5647,6 +5646,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1bddf1187be692e79c5ffeab891132dfb0f236ed36a43c7ed39f1165ee20191"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "verifier"
+version = "0.3.3"
+dependencies = [
+ "zkm-verifier",
 ]
 
 [[package]]

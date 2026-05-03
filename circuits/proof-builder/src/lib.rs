@@ -206,7 +206,6 @@ pub struct ProofData {
     pub vk: String,
     pub public_inputs: Vec<u8>,
     pub zkm_version: String,
-    pub proof_part_stark_vk: Vec<u8>,
 }
 
 impl ProofData {
@@ -228,8 +227,6 @@ impl ProofData {
                     fs::read(format!("{path}.zkm_version.bin")).unwrap_or_default(),
                 )
                 .unwrap_or_default();
-                proof_data.proof_part_stark_vk =
-                    fs::read(format!("{path}.proof_part_stark_vk.bin")).unwrap_or_default();
             }
         }
         proof_data
@@ -298,27 +295,25 @@ mod tests {
     }
 
     #[test]
-    fn load_proof_data_reads_proof_part_stark_vk_sidecar() {
+    fn load_proof_data_omits_legacy_vk_sidecar() {
         let base = temp_proof_base();
         let base_str = base.to_string_lossy().to_string();
         fs::write(&base, [1u8, 2, 3]).unwrap();
         fs::write(format!("{base_str}.public_inputs.bin"), [4u8, 5, 6]).unwrap();
         fs::write(format!("{base_str}.vk_hash.bin"), b"vk-hash").unwrap();
         fs::write(format!("{base_str}.zkm_version.bin"), b"v1.2.5").unwrap();
-        fs::write(format!("{base_str}.proof_part_stark_vk.bin"), [9u8, 8, 7]).unwrap();
 
         let proof_data = ProofData::load_proof_data(&base_str, ProofType::Watchtower);
+        let ProofData { proof, vk, public_inputs, zkm_version } = proof_data;
 
-        assert_eq!(proof_data.proof, vec![1u8, 2, 3]);
-        assert_eq!(proof_data.public_inputs, vec![4u8, 5, 6]);
-        assert_eq!(proof_data.vk, "vk-hash");
-        assert_eq!(proof_data.zkm_version, "v1.2.5");
-        assert_eq!(proof_data.proof_part_stark_vk, vec![9u8, 8, 7]);
+        assert_eq!(proof, vec![1u8, 2, 3]);
+        assert_eq!(public_inputs, vec![4u8, 5, 6]);
+        assert_eq!(vk, "vk-hash");
+        assert_eq!(zkm_version, "v1.2.5");
 
         let _ = fs::remove_file(&base);
         let _ = fs::remove_file(format!("{base_str}.public_inputs.bin"));
         let _ = fs::remove_file(format!("{base_str}.vk_hash.bin"));
         let _ = fs::remove_file(format!("{base_str}.zkm_version.bin"));
-        let _ = fs::remove_file(format!("{base_str}.proof_part_stark_vk.bin"));
     }
 }

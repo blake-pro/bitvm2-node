@@ -1,0 +1,10 @@
+[package]
+name = "verifier"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+zkm-verifier = { workspace = true }
+
+[lints]
+workspace = true

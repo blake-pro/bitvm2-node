@@ -1752,22 +1752,27 @@ pub async fn broadcast_package(
 
 fn gen_watchtower_commitment(graph_id: Uuid, proof_data: ProofData) -> Result<Vec<u8>> {
     let graph_id = graph_id.as_bytes();
-    let proof = proof_data.proof.as_slice();
+    let proof =
+        proof_data.proof.as_slice().try_into().map_err(|_| anyhow!("invalid proof length"))?;
+    let public_inputs = proof_data
+        .public_inputs
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("invalid public inputs length"))?;
     if proof_data.vk.len() != VK_HASH_SIZE {
         bail!("invalid vk_hash length");
     }
-    if proof_data.proof_part_stark_vk.is_empty() {
-        bail!("missing proof_part_stark_vk");
+    if proof_data.zkm_version.is_empty() {
+        bail!("missing zkm_version");
     }
 
-    build_watchtower_commitment(
+    Ok(build_watchtower_commitment(
         graph_id,
         proof,
-        &proof_data.public_inputs,
+        &public_inputs,
         &proof_data.vk,
-        &proof_data.proof_part_stark_vk,
-    )
-    .map_err(|e| anyhow!("failed to build watchtower commitment: {e}"))
+        &proof_data.zkm_version,
+    ))
 }
 
 fn load_part_stark_vk_for_zkm_version(zkm_version: &str) -> Result<Vec<u8>> {
@@ -1943,7 +1948,7 @@ pub async fn get_operator_proof(
                 info!("get_operator_proof get proof successfully");
                 let proof: ZKMProofWithPublicValues =
                     bincode::deserialize(proof_data.proof.as_slice()).unwrap();
-                let proof_part_stark_vk = load_part_stark_vk_for_zkm_version(&proof.zkm_version)?;
+                let part_stark_vk = load_part_stark_vk_for_zkm_version(&proof.zkm_version)?;
                 let output: bitcoin_light_client_circuit::OperatorPublicOutputs =
                     proof.public_values.clone().read();
                 // TODO: additionally check constant and included_watchtower with included_watchtowers.
@@ -1953,7 +1958,7 @@ pub async fn get_operator_proof(
                     &proof,
                     &proof_data.vk,
                     &IMM_GROTH16_VK_BYTES,
-                    &proof_part_stark_vk,
+                    &part_stark_vk,
                 )
                 .map_err(|e| anyhow!("failed to convert operator proof to ark format: {e}"))?;
                 info!("get_operator_proof parse proof successfully");

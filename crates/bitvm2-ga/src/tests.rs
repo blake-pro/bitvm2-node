@@ -991,21 +991,18 @@ mod tests {
             include_bytes!("../../../circuits/data/watchtower/output3.bin.public_inputs.bin");
         const VK_HASH: &str =
             include_str!("../../../circuits/data/watchtower/output3.bin.vk_hash.bin");
-        const PROOF_PART_STARK_VK: &[u8] =
-            include_bytes!("../../../circuits/data/watchtower/output3.bin.proof_part_stark_vk.bin");
-        let proof_part_stark_vk = PROOF_PART_STARK_VK.to_vec();
+        const ZKM_VERSION: &str = "v1.2.4";
 
         let graph_id = *graph.parameters.graph_id.as_bytes();
         //let total_work = 1006120;
         //let consensus_commit_block_height = 503043;
         let comm = bitcoin_light_client_circuit::build_watchtower_commitment(
             &graph_id,
-            PROOF,
-            PUBLIC_INPUTS,
+            &PROOF.try_into().unwrap(),
+            &PUBLIC_INPUTS.try_into().unwrap(),
             VK_HASH,
-            &proof_part_stark_vk,
-        )
-        .unwrap();
+            ZKM_VERSION,
+        );
 
         let mut watchtower_0_challenge = build_watchtower_challenge_tx(
             &graph,
