@@ -391,6 +391,19 @@ pub fn hash_operator_constant(
     *hash.as_byte_array()
 }
 
+pub fn hash_partial_binding_witness(
+    constant: [u8; 32],
+    btc_best_block_hash: [u8; 32],
+    included_watchtowers: [u8; 32],
+) -> [u8; 32] {
+    let mut engine = sha256::HashEngine::default();
+    engine.input(&constant);
+    engine.input(&btc_best_block_hash);
+    engine.input(&included_watchtowers);
+    let hash = sha256::Hash::from_engine(engine);
+    *hash.as_byte_array()
+}
+
 /// Utility method for converting u32 words to bytes in big endian.
 pub fn words_to_bytes_be(words: &[u32; 8]) -> [u8; 32] {
     let mut bytes = [0u8; 32];
@@ -604,6 +617,25 @@ mod tests {
         let bytes = words_to_bytes_be(&words);
         let recovered = words_from_bytes_be(&bytes);
         assert_eq!(words, recovered);
+    }
+
+    #[test]
+    fn test_hash_partial_binding_witness() {
+        use bitcoin::hashes::Hash as _;
+
+        let constant = [1u8; 32];
+        let btc_best_block_hash = [2u8; 32];
+        let included_watchtowers = [3u8; 32];
+        let mut input = Vec::new();
+        input.extend_from_slice(&constant);
+        input.extend_from_slice(&btc_best_block_hash);
+        input.extend_from_slice(&included_watchtowers);
+        let expected = bitcoin::hashes::sha256::Hash::hash(&input);
+
+        assert_eq!(
+            hash_partial_binding_witness(constant, btc_best_block_hash, included_watchtowers),
+            *expected.as_byte_array()
+        );
     }
 
     #[test]
