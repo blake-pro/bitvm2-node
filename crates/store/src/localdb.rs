@@ -2691,7 +2691,6 @@ impl<'a> StorageProcessor<'a> {
                 operator_path_to_proof,
                 path_to_proof,
                 public_value_hex,
-                x_d,
                 operator_vk_hash,
                 genesis_sequencer_commit_txid,
                 operator_public_value_hex,
@@ -2704,7 +2703,7 @@ impl<'a> StorageProcessor<'a> {
                 extra,
                 created_at,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(wrapper_proof.operator_proof_id)
         .bind(wrapper_proof.instance_id)
@@ -2713,7 +2712,6 @@ impl<'a> StorageProcessor<'a> {
         .bind(&wrapper_proof.operator_path_to_proof)
         .bind(&wrapper_proof.path_to_proof)
         .bind(&wrapper_proof.public_value_hex)
-        .bind(&wrapper_proof.x_d)
         .bind(&wrapper_proof.operator_vk_hash)
         .bind(&wrapper_proof.genesis_sequencer_commit_txid)
         .bind(&wrapper_proof.operator_public_value_hex)
@@ -2854,7 +2852,6 @@ impl<'a> StorageProcessor<'a> {
             "UPDATE wrapper_proof
              SET path_to_proof = ?,
                  public_value_hex = ?,
-                 x_d = ?,
                  proof_size = ?,
                  cycles = ?,
                  proof_state = ?,
@@ -2868,7 +2865,6 @@ impl<'a> StorageProcessor<'a> {
              WHERE id = ?",
         )
         .bind(path_to_proof)
-        .bind(public_value_hex.clone())
         .bind(public_value_hex)
         .bind(proof_size)
         .bind(cycles)
@@ -3417,7 +3413,7 @@ mod sequencer_set_tests {
         s.update_wrapper_proof_success(
             claimed.id,
             "wrapper.bin".to_string(),
-            "x-d-hex".to_string(),
+            "wrapper-public-value-hex".to_string(),
             1234,
             5678,
             90,
@@ -3432,7 +3428,7 @@ mod sequencer_set_tests {
             .expect("wrapper proof should be found by instance and graph");
         assert_eq!(proven.proof_state, ProofState::Proven.to_i64());
         assert_eq!(proven.path_to_proof.as_deref(), Some("wrapper.bin"));
-        assert_eq!(proven.x_d, "x-d-hex");
+        assert_eq!(proven.public_value_hex.as_deref(), Some("wrapper-public-value-hex"));
 
         s.update_wrapper_proof_failure(proven.id).await.unwrap();
         let failed = s

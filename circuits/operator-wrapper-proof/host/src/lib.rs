@@ -1,9 +1,7 @@
 //! Generate operator wrapper proof.
 use anyhow::{Context, ensure};
 use bitcoin::{Txid, hashes::Hash};
-use bitcoin_light_client_circuit::{
-    OperatorPublicOutputs, hash_operator_constant, hash_partial_binding_witness,
-};
+use bitcoin_light_client_circuit::{OperatorPublicOutputs, hash_operator_constant};
 use clap::Parser;
 use proof_builder::{LongRunning, ProofBuilder, ProofRequest};
 use sha2::{Digest, Sha256};
@@ -176,13 +174,6 @@ impl ProofBuilder for OperatorWrapperProofBuilder {
             operator_inputs.outputs.constant == expected_constant,
             "operator public constant does not match wrapper session"
         );
-        let x_d = hash_partial_binding_witness(
-            operator_inputs.outputs.constant,
-            operator_inputs.outputs.btc_best_block_hash,
-            operator_inputs.outputs.included_watchtowers,
-        );
-        tracing::info!("operator wrapper x_D: {}", hex::encode(x_d));
-
         let (proof, cycles, proving_time) = tracing::info_span!("generate wrapper proof")
             .in_scope(|| -> anyhow::Result<(ZKMProofWithPublicValues, u64, f32)> {
                 let mut stdin = ZKMStdin::new();

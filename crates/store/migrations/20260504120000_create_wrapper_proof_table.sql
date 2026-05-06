@@ -8,7 +8,6 @@ CREATE TABLE IF NOT EXISTS wrapper_proof
     `operator_path_to_proof`          TEXT   NOT NULL DEFAULT '',
     `path_to_proof`                   TEXT,
     `public_value_hex`                TEXT,
-    `x_d`                             TEXT   NOT NULL DEFAULT '',
     `operator_vk_hash`                TEXT   NOT NULL DEFAULT '',
     `genesis_sequencer_commit_txid`   TEXT   NOT NULL DEFAULT '',
     `operator_public_value_hex`       TEXT,

@@ -1,9 +1,7 @@
 #![no_main]
 zkm_zkvm::entrypoint!(main);
 
-use bitcoin_light_client_circuit::{
-    OperatorPublicOutputs, hash_operator_constant, hash_partial_binding_witness,
-};
+use bitcoin_light_client_circuit::{OperatorPublicOutputs, hash_operator_constant};
 use verifier::verify_groth16_proof;
 use zkm_primitives::io::ZKMPublicValues;
 
@@ -28,11 +26,7 @@ pub fn main() {
     let expected_constant = hash_operator_constant(graph_id, genesis_sequencer_commit_txid);
     assert_eq!(operator_outputs.constant, expected_constant);
 
-    let x_d = hash_partial_binding_witness(
-        operator_outputs.constant,
-        operator_outputs.btc_best_block_hash,
-        operator_outputs.included_watchtowers,
-    );
-
-    zkm_zkvm::io::commit(&x_d);
+    zkm_zkvm::io::commit(&operator_vk_hash);
+    zkm_zkvm::io::commit(&graph_id);
+    zkm_zkvm::io::commit(&genesis_sequencer_commit_txid);
 }

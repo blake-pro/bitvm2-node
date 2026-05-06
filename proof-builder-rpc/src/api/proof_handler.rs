@@ -311,7 +311,6 @@ fn wrapper_metadata(wrapper_proof: &WrapperProof) -> WrapperProofMetadata {
         operator_path_to_proof: wrapper_proof.operator_path_to_proof.clone(),
         path_to_proof: wrapper_proof.path_to_proof.clone(),
         public_value_hex: wrapper_proof.public_value_hex.clone(),
-        x_d: wrapper_proof.x_d.clone(),
         operator_vk_hash: wrapper_proof.operator_vk_hash.clone(),
         genesis_sequencer_commit_txid: wrapper_proof.genesis_sequencer_commit_txid.clone(),
         operator_public_value_hex: wrapper_proof.operator_public_value_hex.clone(),

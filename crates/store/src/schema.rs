@@ -720,7 +720,6 @@ pub struct WrapperProof {
     pub operator_path_to_proof: String,
     pub path_to_proof: Option<String>,
     pub public_value_hex: Option<String>,
-    pub x_d: String,
     pub operator_vk_hash: String,
     pub genesis_sequencer_commit_txid: String,
     pub operator_public_value_hex: Option<String>,
