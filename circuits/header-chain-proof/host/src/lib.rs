@@ -324,25 +324,3 @@ impl ProofBuilder for HeaderChainProofBuilder {
         Ok((public_value_hex, proof_size))
     }
 }
-
-#[test]
-fn test_deserde() {
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Serialize, Deserialize, Debug)]
-    struct BlockHeaderCircuitOutputFull {
-        chain_state: ChainState,
-        part_stark_vk: Vec<u8>,
-    }
-
-    let file = "/Users/blake/CLionProjects/zkMIPS/bitvm2-node/circuits/data/header-chain/129595-1.bin.public_inputs.bin";
-    let public_inputs = fs::read(file).expect("Failed to read public inputs");
-
-    let prev_output: BlockHeaderCircuitOutput =
-        zkm_sdk::ZKMPublicValues::from(&public_inputs).read();
-    println!("{:?}", prev_output);
-
-    let prev_output_full: BlockHeaderCircuitOutputFull =
-        zkm_sdk::ZKMPublicValues::from(&public_inputs).read();
-    println!("{:?}", prev_output_full);
-}

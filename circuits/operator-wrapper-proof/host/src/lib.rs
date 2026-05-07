@@ -2,7 +2,7 @@
 use anyhow::{Context, ensure};
 use bitcoin::{Txid, hashes::Hash};
 use bitcoin_light_client_circuit::{
-    OperatorPublicOutputs, RAW_OPERATOR_VK_HASH_SIZE, hash_operator_constant, zkm_vk_hash_to_raw,
+    OperatorPublicOutputs, hash_operator_constant, zkm_vk_hash_to_raw,
 };
 use clap::Parser;
 use proof_builder::{LongRunning, ProofBuilder, ProofRequest};
@@ -74,7 +74,7 @@ pub struct OperatorProofInputs {
     pub proof_bytes: Vec<u8>,
     pub public_values: Vec<u8>,
     pub vk_hash: Vec<u8>,
-    pub vk_hash_raw: [u8; RAW_OPERATOR_VK_HASH_SIZE],
+    pub vk_hash_raw: [u8; 32],
     pub zkm_version: String,
     pub outputs: OperatorPublicOutputs,
 }
@@ -147,7 +147,7 @@ pub fn read_operator_proof_inputs(path: &str) -> anyhow::Result<OperatorProofInp
 pub fn validate_operator_vk_hash_binding(
     outputs: &OperatorPublicOutputs,
     vk_hash: &[u8],
-) -> anyhow::Result<[u8; RAW_OPERATOR_VK_HASH_SIZE]> {
+) -> anyhow::Result<[u8; 32]> {
     let raw_vk_hash = zkm_vk_hash_to_raw(vk_hash).map_err(anyhow::Error::msg)?;
     ensure!(
         outputs.operator_vk_hash == raw_vk_hash,
