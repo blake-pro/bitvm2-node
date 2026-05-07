@@ -167,7 +167,8 @@ fn save_output(input: OutputData, output_file: &str) {
 }
 
 /// Query sequencer set hash from local DB.
-/// If `goat_block_number` is provided, find the first record at or after that goat block.
+/// If `goat_block_number` is provided, find the first record at or before that goat block.
+/// That is, the sequencer set hash at that goat block.
 /// If not provided, return the latest record.
 async fn get_sequencer_set_hash_from_db(
     db_path: &str,
@@ -177,7 +178,7 @@ async fn get_sequencer_set_hash_from_db(
     let mut storage = local_db.acquire().await?;
     let record = if let Some(goat_block_number) = goat_block_number {
         storage
-            .find_first_sequencer_set_hash_change_by_goat_block_at_or_after(i64::try_from(
+            .find_first_sequencer_set_hash_change_by_goat_block_at_or_before(i64::try_from(
                 goat_block_number,
             )?)
             .await?

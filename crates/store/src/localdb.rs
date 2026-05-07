@@ -3161,27 +3161,14 @@ impl<'a> StorageProcessor<'a> {
         Ok(res)
     }
 
-    pub async fn find_first_sequencer_set_hash_change_by_goat_block_at_or_after(
+    pub async fn find_first_sequencer_set_hash_change_by_goat_block_at_or_before(
         &mut self,
         goat_block_height: i64,
     ) -> anyhow::Result<Option<SequencerSetHashChange>> {
         let res = sqlx::query_as::<_, SequencerSetHashChange>(
-            "SELECT * FROM sequencer_set_hash_changes WHERE goat_block_height >= ? ORDER BY goat_block_height ASC LIMIT 1",
+            "SELECT * FROM sequencer_set_hash_changes WHERE goat_block_height <= ? ORDER BY goat_block_height DESC LIMIT 1",
         )
         .bind(goat_block_height)
-        .fetch_optional(self.conn())
-        .await?;
-        Ok(res)
-    }
-
-    pub async fn find_first_sequencer_set_hash_change_by_cosmos_block_at_or_after(
-        &mut self,
-        cosmos_block_height: i64,
-    ) -> anyhow::Result<Option<SequencerSetHashChange>> {
-        let res = sqlx::query_as::<_, SequencerSetHashChange>(
-            "SELECT * FROM sequencer_set_hash_changes WHERE cosmos_block_height >= ? ORDER BY cosmos_block_height ASC LIMIT 1",
-        )
-        .bind(cosmos_block_height)
         .fetch_optional(self.conn())
         .await?;
         Ok(res)
@@ -3274,7 +3261,7 @@ mod sequencer_set_tests {
     }
 
     #[tokio::test]
-    async fn test_find_by_goat_block_at_or_after() {
+    async fn test_find_by_goat_block_at_or_before() {
         let db = setup_db().await;
         let mut s = db.acquire().await.unwrap();
 
@@ -3284,43 +3271,25 @@ mod sequencer_set_tests {
 
         // Exact match
         let r = s
-            .find_first_sequencer_set_hash_change_by_goat_block_at_or_after(2000)
+            .find_first_sequencer_set_hash_change_by_goat_block_at_or_before(2000)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(r.goat_block_height, 2000);
+        assert_eq!(r.validators_hash, "bb");
 
-        // Between records — should return next one
+        // Between records — should return previous one
         let r = s
-            .find_first_sequencer_set_hash_change_by_goat_block_at_or_after(1500)
+            .find_first_sequencer_set_hash_change_by_goat_block_at_or_before(2500)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(r.goat_block_height, 2000);
+        assert_eq!(r.validators_hash, "bb");
 
-        // Beyond all records — should return None
+        // Before all records — should return None
         let r =
-            s.find_first_sequencer_set_hash_change_by_goat_block_at_or_after(4000).await.unwrap();
-        assert!(r.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_find_by_cosmos_block_at_or_after() {
-        let db = setup_db().await;
-        let mut s = db.acquire().await.unwrap();
-
-        s.upsert_sequencer_set_hash_change(100, 1000, "aa").await.unwrap();
-        s.upsert_sequencer_set_hash_change(200, 2000, "bb").await.unwrap();
-
-        let r = s
-            .find_first_sequencer_set_hash_change_by_cosmos_block_at_or_after(150)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(r.cosmos_block_height, 200);
-
-        let r =
-            s.find_first_sequencer_set_hash_change_by_cosmos_block_at_or_after(300).await.unwrap();
+            s.find_first_sequencer_set_hash_change_by_goat_block_at_or_before(500).await.unwrap();
         assert!(r.is_none());
     }
 
@@ -3342,27 +3311,6 @@ mod sequencer_set_tests {
         let state = s.get_sequencer_set_scan_state().await.unwrap().unwrap();
         assert_eq!(state.next_cosmos_block_height, 200);
         assert_eq!(state.latest_validators_hash, "ddeeff");
-    }
-
-    #[tokio::test]
-    async fn test_find_returns_none_when_empty() {
-        let db = setup_db().await;
-        let mut s = db.acquire().await.unwrap();
-
-        assert!(s.find_latest_sequencer_set_hash_change().await.unwrap().is_none());
-        assert!(
-            s.find_first_sequencer_set_hash_change_by_goat_block_at_or_after(0)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            s.find_first_sequencer_set_hash_change_by_cosmos_block_at_or_after(0)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(s.get_sequencer_set_scan_state().await.unwrap().is_none());
     }
 
     #[tokio::test]
