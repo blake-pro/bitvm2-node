@@ -10,7 +10,7 @@ use bitcoin::Block;
 use bitcoin::hashes::{Hash, HashEngine, sha256};
 use commit_chain::{
     CommitChainCircuitInput, CommitChainPrevProofType, extract_data_from_commitment_outputs,
-    sequencer_hash,
+    parse_commit_chain_commitment, sequencer_hash,
 };
 use header_chain::{
     BitcoinMerkleTree, CircuitBlockHeader, CircuitTransaction, HeaderChainCircuitInput,
@@ -44,6 +44,7 @@ pub struct OperatorPublicOutputs {
     pub btc_best_block_hash: [u8; 32],
     pub constant: [u8; 32],
     pub included_watchtowers: [u8; 32],
+    pub operator_vk_hash: [u8; 32],
 }
 
 pub fn watch_longest_chain(
@@ -124,12 +125,16 @@ pub fn watch_longest_chain(
     // check commit chain's genesis block
     let commitment =
         commit_chain::extract_op_return_data(&commit_chain_output.chain_state.commit_txn.output);
+    let commitment = parse_commit_chain_commitment(&commitment);
     if let tendermint::Hash::Sha256(x) = expected_seqeuencer_set_hash {
-        assert_eq!(commitment[0..32], x);
+        assert_eq!(commitment.sequencer_set_hash, x);
     } else {
         panic!("Invalid commitment: inconsistent sequencer set hash");
     };
-    assert_eq!(commitment[32..64], state_chain_output.chain_state.genesis_evm_block_hash[..]);
+    assert_eq!(
+        commitment.genesis_evm_block_hash,
+        state_chain_output.chain_state.genesis_evm_block_hash
+    );
 
     println!("commit public inputs");
     // commit public inputs
@@ -171,7 +176,7 @@ pub fn propose_longest_chain(
     state_chain: StateChainCircuitInput,
     spv_ss_commit: SPV,
     operator_committed_blockhash: [u8; 32],
-) -> ([u8; 32], [u8; 32], [u8; 32]) {
+) -> ([u8; 32], [u8; 32], [u8; 32], [u8; 32]) {
     // verify operator_latest_sequencer_commit_txid is valid, and on operator head chain
     //   * Check operator_latest_sequencer_commit_txid is derived from genesis_sequencer_commit_txid
     verify_groth16_proof(
@@ -336,12 +341,16 @@ pub fn propose_longest_chain(
     // check commit chain's genesis block
     let commitment =
         commit_chain::extract_op_return_data(&commit_chain_output.chain_state.commit_txn.output);
+    let commitment = parse_commit_chain_commitment(&commitment);
     if let tendermint::Hash::Sha256(x) = expected_seqeuencer_set_hash {
-        assert_eq!(commitment[0..32], x);
+        assert_eq!(commitment.sequencer_set_hash, x);
     } else {
         panic!("Invalid commitment: inconsistent sequencer set hash");
     };
-    assert_eq!(commitment[32..64], state_chain_output.chain_state.genesis_evm_block_hash[..]);
+    assert_eq!(
+        commitment.genesis_evm_block_hash,
+        state_chain_output.chain_state.genesis_evm_block_hash
+    );
 
     assert_eq!(commit_sequencer_set_hash, expected_seqeuencer_set_hash);
 
@@ -377,7 +386,12 @@ pub fn propose_longest_chain(
     );
 
     //operator_public_input
-    (operator_committed_blockhash, constant, included_watchtowers.to_le_bytes::<32>())
+    (
+        operator_committed_blockhash,
+        constant,
+        included_watchtowers.to_le_bytes::<32>(),
+        commit_chain_output.chain_state.operator_vk_hash,
+    )
 }
 
 pub fn hash_operator_constant(
@@ -389,6 +403,24 @@ pub fn hash_operator_constant(
     engine.input(&operator_genesis_sequencer_commit_txid);
     let hash = sha256::Hash::from_engine(engine);
     *hash.as_byte_array()
+}
+
+// zkm_vk_hash: 66 bytes, prefix with '0x'
+pub fn zkm_vk_hash_to_raw(vk_hash: &[u8]) -> Result<[u8; 32], String> {
+    let vk_hash =
+        std::str::from_utf8(vk_hash).map_err(|err| format!("invalid zkm vk hash UTF-8: {err}"))?;
+    let Some(hex_hash) = vk_hash.strip_prefix("0x") else {
+        return Err("zkm vk hash must have 0x prefix".to_string());
+    };
+    if hex_hash.len() != 64 {
+        return Err(format!("zkm vk hash must be 64 hex chars, got {}", hex_hash.len()));
+    }
+    let bytes = hex::decode(hex_hash).map_err(|err| format!("invalid zkm vk hash hex: {err}"))?;
+    bytes.try_into().map_err(|_| "zkm vk hash must decode to 32 bytes".to_string())
+}
+
+pub fn zkm_vk_hash_from_raw(raw: &[u8; 32]) -> Vec<u8> {
+    format!("0x{}", hex::encode(raw)).into_bytes()
 }
 
 pub fn hash_partial_binding_witness(
@@ -707,5 +739,21 @@ mod tests {
         commitment.extend_from_slice(&[0xff, 0xff]);
 
         assert!(parse_watchtower_commitment(&commitment).is_err());
+    }
+
+    #[test]
+    fn test_zkm_vk_hash_to_raw_accepts_prefixed_hash() {
+        let raw = [0xabu8; 32];
+        let prefixed = zkm_vk_hash_from_raw(&raw);
+
+        assert_eq!(zkm_vk_hash_to_raw(&prefixed).unwrap(), raw);
+    }
+
+    #[test]
+    fn test_zkm_vk_hash_to_raw_rejects_unprefixed_hash() {
+        let raw = [0xcdu8; 32];
+        let unprefixed = hex::encode(raw);
+
+        assert!(zkm_vk_hash_to_raw(unprefixed.as_bytes()).is_err());
     }
 }

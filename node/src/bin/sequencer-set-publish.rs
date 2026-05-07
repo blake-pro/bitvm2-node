@@ -216,6 +216,8 @@ enum Commands {
         next_publisher_btc_pubkeys: Vec<secp256k1::PublicKey>,
         #[arg(long, env = "GOAT_GENESIS_BLOCK_HASH", value_parser = hex_parse::<32>)]
         goat_genesis_block_hash: [u8; 32],
+        #[arg(long, env = "OPERATOR_VK_HASH", value_parser = hex_parse::<32>)]
+        operator_vk_hash: [u8; 32],
     },
     PushSeq {
         #[arg(long, env = "OWNER_BTC_KEY_WIF")]
@@ -230,6 +232,8 @@ enum Commands {
         init_genesis: bool,
         #[arg(long, env = "GOAT_GENESIS_BLOCK_HASH", value_parser = hex_parse::<32>)]
         goat_genesis_block_hash: [u8; 32],
+        #[arg(long, env = "OPERATOR_VK_HASH", value_parser = hex_parse::<32>)]
+        operator_vk_hash: [u8; 32],
         #[arg(long)]
         commit_info: String,
     },
@@ -320,6 +324,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             publisher_btc_pubkeys,
             next_publisher_btc_pubkeys,
             goat_genesis_block_hash,
+            operator_vk_hash,
         } => {
             let (sequencer_set_hash, goat_block_number, cosmos_block_number) =
                 get_sequencer_set_hash_from_db(&args.db_path, goat_block_number).await?;
@@ -340,6 +345,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 update_connector,
                 sequencer_set_hash,
                 goat_genesis_block_hash,
+                operator_vk_hash,
                 goat_block_number,
             )
             .await
@@ -351,6 +357,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             next_publisher_btc_pubkeys,
             init_genesis,
             goat_genesis_block_hash,
+            operator_vk_hash,
             commit_info,
         } => {
             println!("goat genesis block hash: {:#?}", hex::encode(goat_genesis_block_hash));
@@ -372,6 +379,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 goat_block_number,
                 sequencer_set_hash,
                 goat_genesis_block_hash,
+                operator_vk_hash,
                 output_file,
             )
             .await?;
@@ -524,6 +532,7 @@ async fn action_push_sequencer_set_update(
     goat_block_number: u64,
     sequencer_set_hash: [u8; 32],
     goat_genesis_block_hash: [u8; 32],
+    operator_vk_hash: [u8; 32],
     output_file: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let witnesses = goat_client.ss_get_sequencer_set_update_witness(goat_block_number).await?;
@@ -584,9 +593,10 @@ async fn action_push_sequencer_set_update(
     };
 
     // Skip construction of the genesis tx
-    let mut commitment = [0u8; 64];
+    let mut commitment = [0u8; 96];
     commitment[0..32].copy_from_slice(&sequencer_set_hash);
-    commitment[32..].copy_from_slice(&goat_genesis_block_hash[0..32]);
+    commitment[32..64].copy_from_slice(&goat_genesis_block_hash);
+    commitment[64..].copy_from_slice(&operator_vk_hash);
     let mut sequencer_set_publish_tx = create_sequencer_update_partial_tx(
         commitment,
         &update_connector,
@@ -632,6 +642,7 @@ async fn action_sign_sequencer_set_update(
     update_connector: Option<OutPoint>,
     sequencer_set_hash: [u8; 32],
     goat_genesis_block_hash: [u8; 32],
+    operator_vk_hash: [u8; 32],
     goat_block_number: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let total = btc_public_keys.len();
@@ -648,9 +659,10 @@ async fn action_sign_sequencer_set_update(
         * estimate_tx_vbytes(&[(threshold as u32, total as u32)], &[("p2wsh", 3)], 73) as f64
         + RELAYER_FEE as f64;
     let replenish_fee = Amount::from_sat(replenish_fee.ceil() as u64);
-    let mut commitment = [0u8; 64];
+    let mut commitment = [0u8; 96];
     commitment[0..32].copy_from_slice(&sequencer_set_hash);
-    commitment[32..].copy_from_slice(&goat_genesis_block_hash[0..32]);
+    commitment[32..64].copy_from_slice(&goat_genesis_block_hash);
+    commitment[64..].copy_from_slice(&operator_vk_hash);
 
     let mut sequencer_set_publish_tx = create_sequencer_update_partial_tx(
         commitment,

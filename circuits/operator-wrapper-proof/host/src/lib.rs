@@ -1,7 +1,9 @@
 //! Generate operator wrapper proof.
 use anyhow::{Context, ensure};
 use bitcoin::{Txid, hashes::Hash};
-use bitcoin_light_client_circuit::{OperatorPublicOutputs, hash_operator_constant};
+use bitcoin_light_client_circuit::{
+    OperatorPublicOutputs, RAW_OPERATOR_VK_HASH_SIZE, hash_operator_constant, zkm_vk_hash_to_raw,
+};
 use clap::Parser;
 use proof_builder::{LongRunning, ProofBuilder, ProofRequest};
 use sha2::{Digest, Sha256};
@@ -72,6 +74,7 @@ pub struct OperatorProofInputs {
     pub proof_bytes: Vec<u8>,
     pub public_values: Vec<u8>,
     pub vk_hash: Vec<u8>,
+    pub vk_hash_raw: [u8; RAW_OPERATOR_VK_HASH_SIZE],
     pub zkm_version: String,
     pub outputs: OperatorPublicOutputs,
 }
@@ -129,8 +132,28 @@ pub fn read_operator_proof_inputs(path: &str) -> anyhow::Result<OperatorProofInp
         };
 
     let outputs: OperatorPublicOutputs = ZKMPublicValues::from(&public_values).read();
+    let vk_hash_raw = validate_operator_vk_hash_binding(&outputs, &vk_hash)?;
 
-    Ok(OperatorProofInputs { proof_bytes, public_values, vk_hash, zkm_version, outputs })
+    Ok(OperatorProofInputs {
+        proof_bytes,
+        public_values,
+        vk_hash,
+        vk_hash_raw,
+        zkm_version,
+        outputs,
+    })
+}
+
+pub fn validate_operator_vk_hash_binding(
+    outputs: &OperatorPublicOutputs,
+    vk_hash: &[u8],
+) -> anyhow::Result<[u8; RAW_OPERATOR_VK_HASH_SIZE]> {
+    let raw_vk_hash = zkm_vk_hash_to_raw(vk_hash).map_err(anyhow::Error::msg)?;
+    ensure!(
+        outputs.operator_vk_hash == raw_vk_hash,
+        "operator vk hash does not match authenticated operator public output"
+    );
+    Ok(raw_vk_hash)
 }
 
 impl ProofBuilder for OperatorWrapperProofBuilder {
@@ -226,5 +249,26 @@ impl ProofBuilder for OperatorWrapperProofBuilder {
         fs::write(format!("{output}.vk_hash.bin"), self.verifying_key.bytes32())?;
         fs::write(format!("{output}.zkm_version.bin"), zkm_version)?;
         Ok((public_value_hex, proof_size))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin_light_client_circuit::zkm_vk_hash_from_raw;
+
+    #[test]
+    fn validate_operator_vk_hash_binding_rejects_mismatched_sidecar() {
+        let outputs = OperatorPublicOutputs {
+            btc_best_block_hash: [0u8; 32],
+            constant: [1u8; 32],
+            included_watchtowers: [2u8; 32],
+            operator_vk_hash: [3u8; 32],
+        };
+        let mismatched = zkm_vk_hash_from_raw(&[4u8; 32]);
+
+        let err = validate_operator_vk_hash_binding(&outputs, &mismatched).unwrap_err();
+
+        assert!(err.to_string().contains("operator vk hash does not match"));
     }
 }
