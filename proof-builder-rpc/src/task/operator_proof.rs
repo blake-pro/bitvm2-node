@@ -30,6 +30,7 @@ pub(crate) fn spawn_operator_proof_task(
         }
 
         let builder = OperatorProofBuilder::new();
+        info!("operator vk hash {:?}", builder.vk().bytes32());
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(interval)) => {

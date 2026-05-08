@@ -26,7 +26,7 @@ Long-running proof tasks (stored in the `long_running_task_proof` table) — suc
 GOAT_BLOCK_NUMBER=${THE_GOAT_BLOCK_NUMBER} bash -x scp.sh
 ```
 
-Example `scp.sh` used for Regtest integration tests:
+Example `scp.sh` used for Regtest integration tests, remember to set the `OPERATOR_VK_HASH` environment variable before running:
 
 ```bash
 #!/bin/bash
