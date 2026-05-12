@@ -115,6 +115,9 @@ impl CircuitCommit {
 pub const PROOF_SIZE: usize = 260;
 pub const PUBLIC_INPUTS_SIZE: usize = 36;
 pub const VK_HASH_SIZE: usize = 66;
+pub const LEGACY_COMMIT_CHAIN_COMMITMENT_SIZE: usize = 64;
+pub const COMMIT_CHAIN_COMMITMENT_SIZE: usize = 96;
+pub const LEGACY_OPERATOR_VK_HASH: [u8; 32] = [0u8; 32];
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug)]
 pub struct CommitChainCommitment {
@@ -126,6 +129,38 @@ pub struct CommitChainCommitment {
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 pub struct CommitChainCircuitOutput {
     pub chain_state: CommitChainState,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
+struct LegacyCommitChainState {
+    block_height: u32,
+    commit_txn: Transaction,
+    genesis_txid: [u8; 32],
+    sequencers: Vec<SequencerInfo>,
+    publisher_public_keys: Vec<PublicKey>,
+    threshold: u16,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
+struct LegacyCommitChainCircuitOutput {
+    chain_state: LegacyCommitChainState,
+}
+
+impl From<LegacyCommitChainCircuitOutput> for CommitChainCircuitOutput {
+    fn from(output: LegacyCommitChainCircuitOutput) -> Self {
+        let chain_state = output.chain_state;
+        CommitChainCircuitOutput {
+            chain_state: CommitChainState {
+                block_height: chain_state.block_height,
+                commit_txn: chain_state.commit_txn,
+                genesis_txid: chain_state.genesis_txid,
+                sequencers: chain_state.sequencers,
+                publisher_public_keys: chain_state.publisher_public_keys,
+                threshold: chain_state.threshold,
+                operator_vk_hash: LEGACY_OPERATOR_VK_HASH,
+            },
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
@@ -145,16 +180,37 @@ pub fn sequencer_hash(sequencers: &[SequencerInfo]) -> Hash {
 }
 
 pub fn parse_commit_chain_commitment(commitment: &[u8]) -> CommitChainCommitment {
-    assert_eq!(commitment.len(), 96, "commit chain commitment must be 96 bytes");
+    assert!(
+        commitment.len() == LEGACY_COMMIT_CHAIN_COMMITMENT_SIZE
+            || commitment.len() == COMMIT_CHAIN_COMMITMENT_SIZE,
+        "commit chain commitment must be 64 or 96 bytes"
+    );
 
     let mut sequencer_set_hash = [0u8; 32];
     sequencer_set_hash.copy_from_slice(&commitment[0..32]);
     let mut genesis_evm_block_hash = [0u8; 32];
     genesis_evm_block_hash.copy_from_slice(&commitment[32..64]);
-    let mut operator_vk_hash = [0u8; 32];
-    operator_vk_hash.copy_from_slice(&commitment[64..]);
+    let mut operator_vk_hash = LEGACY_OPERATOR_VK_HASH;
+    if commitment.len() == COMMIT_CHAIN_COMMITMENT_SIZE {
+        operator_vk_hash.copy_from_slice(&commitment[64..]);
+        assert_ne!(
+            operator_vk_hash, LEGACY_OPERATOR_VK_HASH,
+            "new commit chain commitment must include non-zero operator vk hash"
+        );
+    }
 
     CommitChainCommitment { sequencer_set_hash, genesis_evm_block_hash, operator_vk_hash }
+}
+
+/// Decode current or legacy commit-chain public values.
+pub fn decode_commit_chain_circuit_output(public_values: &[u8]) -> CommitChainCircuitOutput {
+    if let Ok(output) = bincode::deserialize::<CommitChainCircuitOutput>(public_values) {
+        return output;
+    }
+
+    bincode::deserialize::<LegacyCommitChainCircuitOutput>(public_values)
+        .map(Into::into)
+        .expect("failed to decode commit chain circuit output as current or legacy format")
 }
 
 impl CommitChainState {
@@ -359,6 +415,72 @@ mod tests {
         assert_eq!(commitment.sequencer_set_hash, sequencer_set_hash);
         assert_eq!(commitment.genesis_evm_block_hash, genesis_evm_block_hash);
         assert_eq!(commitment.operator_vk_hash, operator_vk_hash);
+    }
+
+    #[test]
+    fn test_parse_commit_chain_commitment_accepts_legacy_64_byte_payload() {
+        let sequencer_set_hash = [0x11u8; 32];
+        let genesis_evm_block_hash = [0x22u8; 32];
+        let mut payload = Vec::with_capacity(64);
+        payload.extend_from_slice(&sequencer_set_hash);
+        payload.extend_from_slice(&genesis_evm_block_hash);
+
+        let commitment = parse_commit_chain_commitment(&payload);
+
+        assert_eq!(commitment.sequencer_set_hash, sequencer_set_hash);
+        assert_eq!(commitment.genesis_evm_block_hash, genesis_evm_block_hash);
+        assert_eq!(commitment.operator_vk_hash, LEGACY_OPERATOR_VK_HASH);
+    }
+
+    #[test]
+    fn test_parse_commit_chain_commitment_rejects_new_payload_with_zero_operator_vk_hash() {
+        let mut payload = vec![0x11u8; 96];
+        payload[64..].fill(0);
+
+        let result = std::panic::catch_unwind(|| parse_commit_chain_commitment(&payload));
+
+        assert!(result.is_err());
+    }
+
+    #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
+    struct LegacyCommitChainState {
+        block_height: u32,
+        commit_txn: Transaction,
+        genesis_txid: [u8; 32],
+        sequencers: Vec<SequencerInfo>,
+        publisher_public_keys: Vec<PublicKey>,
+        threshold: u16,
+    }
+
+    #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
+    struct LegacyCommitChainCircuitOutput {
+        chain_state: LegacyCommitChainState,
+    }
+
+    #[test]
+    fn test_decode_commit_chain_circuit_output_accepts_legacy_public_values() {
+        let legacy_output = LegacyCommitChainCircuitOutput {
+            chain_state: LegacyCommitChainState {
+                block_height: 7,
+                commit_txn: Transaction {
+                    version: Version::TWO,
+                    lock_time: LockTime::ZERO,
+                    input: vec![],
+                    output: vec![],
+                },
+                genesis_txid: [0x22u8; 32],
+                sequencers: vec![],
+                publisher_public_keys: vec![],
+                threshold: 0,
+            },
+        };
+        let public_values = bincode::serialize(&legacy_output).unwrap();
+
+        let decoded = decode_commit_chain_circuit_output(&public_values);
+
+        assert_eq!(decoded.chain_state.block_height, legacy_output.chain_state.block_height);
+        assert_eq!(decoded.chain_state.genesis_txid, legacy_output.chain_state.genesis_txid);
+        assert_eq!(decoded.chain_state.operator_vk_hash, LEGACY_OPERATOR_VK_HASH);
     }
 
     // todo: use new commit file

@@ -6,7 +6,7 @@ use bitcoin::{
     hashes::Hash,
     secp256k1::{PublicKey, XOnlyPublicKey},
 };
-use bitcoin_light_client_circuit::build_spv;
+use bitcoin_light_client_circuit::{build_spv, zkm_vk_hash_to_raw};
 use bitcoin_script::script;
 use borsh::BorshDeserialize;
 use clap::Parser;
@@ -394,6 +394,9 @@ impl ProofBuilder for OperatorProofBuilder {
             &bitcoin_block_headers,
         );
 
+        let actual_operator_vk_hash = zkm_vk_hash_to_raw(self.verifying_key.bytes32().as_bytes())
+            .map_err(anyhow::Error::msg)?;
+
         // Generate the proofs
         let (proof, cycles, proving_time) = tracing::info_span!("generate proof").in_scope(
             || -> anyhow::Result<(ZKMProofWithPublicValues, u64, f32)> {
@@ -417,6 +420,7 @@ impl ProofBuilder for OperatorProofBuilder {
                 stdin.write(&state_chain_input);
                 stdin.write(&spv_ss_commit);
                 stdin.write(&operator_committed_blockhash.to_byte_array());
+                stdin.write(&actual_operator_vk_hash);
 
                 let elf_id = if ELF_ID.get().is_none() {
                     ELF_ID
@@ -483,8 +487,14 @@ mod tests {
 
         let proof: ZKMProofWithPublicValues = bincode::deserialize(&proof_bytes).unwrap();
 
-        let a: bitcoin_light_client_circuit::OperatorPublicOutputs =
-            proof.public_values.clone().read();
+        let vk_hash = String::from_utf8(vk_bytes).unwrap();
+        let operator_vk_hash =
+            bitcoin_light_client_circuit::zkm_vk_hash_to_raw(vk_hash.as_bytes()).unwrap();
+        let a = bitcoin_light_client_circuit::decode_operator_public_outputs(
+            proof.public_values.as_slice(),
+            operator_vk_hash,
+        )
+        .unwrap();
         println!(
             "block hash: {:?}, constant: {:?}, included map: {:?}",
             hex::encode(a.btc_best_block_hash),
@@ -492,7 +502,6 @@ mod tests {
             U256::from_le_bytes(a.included_watchtowers)
         );
 
-        let vk_hash = String::from_utf8(vk_bytes).unwrap();
         let part_stark_vk = catch_unwind(AssertUnwindSafe(|| {
             Groth16Verifier::get_part_stark_vk(&proof.zkm_version)
         }))

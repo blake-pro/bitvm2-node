@@ -19,7 +19,9 @@ use bitcoin::{
     PrivateKey, PublicKey, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
     XOnlyPublicKey,
 };
-use bitcoin_light_client_circuit::{VK_HASH_SIZE, build_watchtower_commitment};
+use bitcoin_light_client_circuit::{
+    VK_HASH_SIZE, build_watchtower_commitment, decode_operator_public_outputs, zkm_vk_hash_to_raw,
+};
 use bitvm::treepp::*;
 use bitvm2_lib::actors::Actor;
 use bitvm2_lib::challenger::*;
@@ -1949,8 +1951,13 @@ pub async fn get_operator_proof(
                 let proof: ZKMProofWithPublicValues =
                     bincode::deserialize(proof_data.proof.as_slice()).unwrap();
                 let part_stark_vk = load_part_stark_vk_for_zkm_version(&proof.zkm_version)?;
-                let output: bitcoin_light_client_circuit::OperatorPublicOutputs =
-                    proof.public_values.clone().read();
+                let operator_vk_hash =
+                    zkm_vk_hash_to_raw(proof_data.vk.as_bytes()).map_err(|err| anyhow!(err))?;
+                let output = decode_operator_public_outputs(
+                    proof.public_values.as_slice(),
+                    operator_vk_hash,
+                )
+                .map_err(|err| anyhow!(err))?;
                 // TODO: additionally check constant and included_watchtower with included_watchtowers.
                 //proof.public_values.head();
                 info!("get_operator_proof parse proof successfully");

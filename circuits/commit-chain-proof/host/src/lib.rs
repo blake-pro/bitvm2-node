@@ -205,8 +205,7 @@ impl ProofBuilder for CommitChainProofBuilder {
                                 format!("invalid UTF-8 in zkm_version file '{version_path}'")
                             })
                         })?;
-                    let prev_output: CommitChainCircuitOutput =
-                        zkm_sdk::ZKMPublicValues::from(&public_inputs).read();
+                    let prev_output = decode_commit_chain_circuit_output(&public_inputs);
                     (
                         CommitChainPrevProofType::PrevProof(prev_output),
                         proof_bytes,
@@ -316,8 +315,7 @@ mod tests {
     fn test_parse_commit_chain_proof() {
         let proof_path = "/home/ubuntu/data/proof-builder-rpc/circuits/data/commit-chain/10-1.bin.public_inputs.bin";
         let proof_bytes = std::fs::read(proof_path).unwrap();
-        let mut pis = zkm_sdk::ZKMPublicValues::from(&proof_bytes);
-        let public_input: CommitChainCircuitOutput = pis.read();
+        let public_input = decode_commit_chain_circuit_output(&proof_bytes);
         let hash = sequencer_hash(&public_input.chain_state.sequencers);
         println!("proof: {public_input:?}, hash : {:?}", hash);
 

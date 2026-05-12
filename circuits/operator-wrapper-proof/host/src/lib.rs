@@ -2,7 +2,8 @@
 use anyhow::{Context, ensure};
 use bitcoin::{Txid, hashes::Hash};
 use bitcoin_light_client_circuit::{
-    OperatorPublicOutputs, hash_operator_constant, zkm_vk_hash_to_raw,
+    OperatorPublicOutputs, decode_operator_public_outputs, hash_operator_constant,
+    zkm_vk_hash_to_raw,
 };
 use clap::Parser;
 use proof_builder::{LongRunning, ProofBuilder, ProofRequest};
@@ -10,7 +11,6 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::str::FromStr;
 use std::sync::OnceLock;
-use zkm_primitives::io::ZKMPublicValues;
 use zkm_sdk::{
     HashableKey, Prover, ProverClient, ZKMProofKind, ZKMProofWithPublicValues, ZKMStdin,
     include_elf,
@@ -131,7 +131,9 @@ pub fn read_operator_proof_inputs(path: &str) -> anyhow::Result<OperatorProofInp
             proof_file
         };
 
-    let outputs: OperatorPublicOutputs = ZKMPublicValues::from(&public_values).read();
+    let raw_vk_hash = zkm_vk_hash_to_raw(&vk_hash).map_err(anyhow::Error::msg)?;
+    let outputs =
+        decode_operator_public_outputs(&public_values, raw_vk_hash).map_err(anyhow::Error::msg)?;
     let vk_hash_raw = validate_operator_vk_hash_binding(&outputs, &vk_hash)?;
 
     Ok(OperatorProofInputs {
@@ -256,6 +258,31 @@ impl ProofBuilder for OperatorWrapperProofBuilder {
 mod tests {
     use super::*;
     use bitcoin_light_client_circuit::zkm_vk_hash_from_raw;
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct LegacyOperatorPublicOutputs {
+        btc_best_block_hash: [u8; 32],
+        constant: [u8; 32],
+        included_watchtowers: [u8; 32],
+    }
+
+    #[test]
+    fn decode_operator_public_outputs_accepts_legacy_public_values() {
+        let actual_vk_hash = [4u8; 32];
+        let legacy_outputs = LegacyOperatorPublicOutputs {
+            btc_best_block_hash: [0u8; 32],
+            constant: [1u8; 32],
+            included_watchtowers: [2u8; 32],
+        };
+        let public_values = bincode::serialize(&legacy_outputs).unwrap();
+
+        let outputs = decode_operator_public_outputs(&public_values, actual_vk_hash).unwrap();
+
+        assert_eq!(outputs.btc_best_block_hash, legacy_outputs.btc_best_block_hash);
+        assert_eq!(outputs.constant, legacy_outputs.constant);
+        assert_eq!(outputs.included_watchtowers, legacy_outputs.included_watchtowers);
+        assert_eq!(outputs.operator_vk_hash, actual_vk_hash);
+    }
 
     #[test]
     fn validate_operator_vk_hash_binding_rejects_mismatched_sidecar() {

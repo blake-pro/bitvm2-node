@@ -9,8 +9,8 @@ use alloy_primitives::U256;
 use bitcoin::Block;
 use bitcoin::hashes::{Hash, HashEngine, sha256};
 use commit_chain::{
-    CommitChainCircuitInput, CommitChainPrevProofType, extract_data_from_commitment_outputs,
-    parse_commit_chain_commitment, sequencer_hash,
+    CommitChainCircuitInput, CommitChainPrevProofType, decode_commit_chain_circuit_output,
+    extract_data_from_commitment_outputs, parse_commit_chain_commitment, sequencer_hash,
 };
 use header_chain::{
     BitcoinMerkleTree, CircuitBlockHeader, CircuitTransaction, HeaderChainCircuitInput,
@@ -47,6 +47,31 @@ pub struct OperatorPublicOutputs {
     pub operator_vk_hash: [u8; 32],
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct LegacyOperatorPublicOutputs {
+    btc_best_block_hash: [u8; 32],
+    constant: [u8; 32],
+    included_watchtowers: [u8; 32],
+}
+
+pub fn decode_operator_public_outputs(
+    public_values: &[u8],
+    actual_operator_vk_hash: [u8; 32],
+) -> Result<OperatorPublicOutputs, String> {
+    if let Ok(outputs) = bincode::deserialize::<OperatorPublicOutputs>(public_values) {
+        return Ok(outputs);
+    }
+
+    let legacy_outputs = bincode::deserialize::<LegacyOperatorPublicOutputs>(public_values)
+        .map_err(|err| format!("failed to decode operator public values: {err}"))?;
+    Ok(OperatorPublicOutputs {
+        btc_best_block_hash: legacy_outputs.btc_best_block_hash,
+        constant: legacy_outputs.constant,
+        included_watchtowers: legacy_outputs.included_watchtowers,
+        operator_vk_hash: actual_operator_vk_hash,
+    })
+}
+
 pub fn watch_longest_chain(
     genesis_sequencer_commit_txid: [u8; 32],
     latest_sequencer_commit_txid: [u8; 32],
@@ -68,7 +93,7 @@ pub fn watch_longest_chain(
     )
     .expect("Failed to verify commit chain proof");
 
-    let prev_output = ZKMPublicValues::from(&commit_chain.zkm_public_values).read();
+    let prev_output = decode_commit_chain_circuit_output(&commit_chain.zkm_public_values);
     let prev_proof = CommitChainPrevProofType::PrevProof(prev_output);
     let CommitChainPrevProofType::PrevProof(commit_chain_output) = &prev_proof else {
         panic!("Only PrevProof is supported in watch_longest_chain");
@@ -176,6 +201,7 @@ pub fn propose_longest_chain(
     state_chain: StateChainCircuitInput,
     spv_ss_commit: SPV,
     operator_committed_blockhash: [u8; 32],
+    actual_operator_vk_hash: [u8; 32],
 ) -> ([u8; 32], [u8; 32], [u8; 32], [u8; 32]) {
     // verify operator_latest_sequencer_commit_txid is valid, and on operator head chain
     //   * Check operator_latest_sequencer_commit_txid is derived from genesis_sequencer_commit_txid
@@ -186,7 +212,7 @@ pub fn propose_longest_chain(
         &commit_chain.zkm_version,
     )
     .expect("Failed to verify commit chain proof");
-    let prev_output = ZKMPublicValues::from(&commit_chain.zkm_public_values).read();
+    let prev_output = decode_commit_chain_circuit_output(&commit_chain.zkm_public_values);
     let prev_proof = CommitChainPrevProofType::PrevProof(prev_output);
     let CommitChainPrevProofType::PrevProof(commit_chain_output) = &prev_proof else {
         panic!("Only PrevProof is supported in propose_longest_chain");
@@ -390,8 +416,22 @@ pub fn propose_longest_chain(
         operator_committed_blockhash,
         constant,
         included_watchtowers.to_le_bytes::<32>(),
-        commit_chain_output.chain_state.operator_vk_hash,
+        resolve_operator_vk_hash(
+            commit_chain_output.chain_state.operator_vk_hash,
+            actual_operator_vk_hash,
+        ),
     )
+}
+
+pub fn resolve_operator_vk_hash(
+    commit_chain_operator_vk_hash: [u8; 32],
+    actual_operator_vk_hash: [u8; 32],
+) -> [u8; 32] {
+    if commit_chain_operator_vk_hash == commit_chain::LEGACY_OPERATOR_VK_HASH {
+        actual_operator_vk_hash
+    } else {
+        commit_chain_operator_vk_hash
+    }
 }
 
 pub fn hash_operator_constant(
