@@ -19,6 +19,7 @@ use client::btc_chain::BTCClient;
 use std::str::FromStr;
 use std::time::UNIX_EPOCH;
 use uuid::Uuid;
+pub(crate) use wrapper_proof::create_missing_wrapper_tasks;
 
 use futures::future::Either;
 use proof_builder::{OnDemandTask, ProofBuilder};

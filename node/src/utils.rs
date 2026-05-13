@@ -20,7 +20,8 @@ use bitcoin::{
     XOnlyPublicKey,
 };
 use bitcoin_light_client_circuit::{
-    VK_HASH_SIZE, build_watchtower_commitment, decode_operator_public_outputs, zkm_vk_hash_to_raw,
+    VK_HASH_SIZE, build_watchtower_commitment, decode_operator_public_outputs,
+    wrapper_public_values, zkm_vk_hash_to_raw,
 };
 use bitvm::treepp::*;
 use bitvm2_lib::actors::Actor;
@@ -79,7 +80,7 @@ use zkm_verifier::{Groth16Verifier, IMM_GROTH16_VK_BYTES, convert_ark_imm_wrap_v
 use crate::env;
 use crate::rpc_service::routes::v1::{
     NODES_OPERATOR_BASE, NODES_WATCHTOWER_BASE, PROOFS_OPERATOR_PROOF_TIMEOUT,
-    PROOFS_WATCHTOWER_PROOF_TIMEOUT,
+    PROOFS_WATCHTOWER_PROOF_TIMEOUT, PROOFS_WRAPPER_PROOF,
 };
 use crate::scheduled_tasks::get_goat_message_content_type;
 use crate::scheduled_tasks::graph_maintenance_tasks::{
@@ -95,6 +96,7 @@ use proof_builder::{
     OperatorProofRequest, OperatorProofResponse, OperatorProofTimeoutUpdateRequest,
     OperatorProofTimeoutUpdateResponse, ProofData, WatchtowerProofRequest, WatchtowerProofResponse,
     WatchtowerProofTimeoutUpdateRequest, WatchtowerProofTimeoutUpdateResponse,
+    WrapperProofResponse,
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -1638,11 +1640,16 @@ pub async fn get_partial_scripts() -> Result<Vec<ScriptBuf>> {
 
 pub async fn get_disprove_scripts(graph_params: &Bitvm2GraphParameters) -> Result<Vec<ScriptBuf>> {
     let partial_scripts = get_partial_scripts().await?;
+    let wrapper_values = [
+        graph_params.guest_operator_vk_hash,
+        graph_params.guest_graph_id,
+        graph_params.guest_genesis_sequencer_commit_txid,
+    ];
     let (mut disprove_scripts, disprove_scripts_1) = generate_disprove_scripts(
         &partial_scripts,
         graph_params.operator_wots_pubkeys.clone(),
-        &graph_params.guest_constant_value,
-        &graph_params.hashlocks,
+        &wrapper_values,
+        graph_params.hashlocks.len(),
     );
     disprove_scripts.extend(disprove_scripts_1);
     Ok(disprove_scripts)
@@ -1987,7 +1994,130 @@ pub async fn get_operator_proof(
         bail!("No graph in db");
     }
 }
-const ASSERT_COMMIT_CACHE_VERSION: u32 = 1;
+
+/// Returns:
+/// - `Ok(Some(WrapperProof), _)` if wrapper proof is available
+/// - `Ok(None, wait_secs)` if operator or wrapper proof is not yet available
+pub async fn get_operator_wrapper_proof(
+    local_db: &LocalDB,
+    http_client: &HttpAsyncClient,
+    bitvm_graph: &Bitvm2Graph,
+    btc_client: &BTCClient,
+    instance_id: Uuid,
+    graph_id: Uuid,
+    operator_committed_blockhash: String,
+) -> Result<(Option<(GuestInputs, Groth16Proof, PublicInputs, VerifyingKey)>, usize)> {
+    let mut storage_processor = local_db.acquire().await?;
+    let Some(graph) = storage_processor.find_graph(&graph_id).await? else {
+        warn!("graph:{graph_id} not found");
+        bail!("No graph in db");
+    };
+    drop(storage_processor);
+
+    if graph.proceed_withdraw_height <= 0 {
+        warn!("graph {graph_id} proceed_withdraw_height <= 0, waiting to been updated");
+        return Ok((None, get_operator_proof_wait_secs()));
+    }
+
+    let watchtower_challenge_init_txid = graph
+        .watchtower_challenge_init_txid
+        .ok_or_else(|| anyhow::anyhow!("watchtower_challenge_init_txid is none"))?;
+    let num_challenger = bitvm_graph.parameters.watchtower_pubkeys.len();
+    let (watchtower_challenge_txids, included_watchtowers) = match get_watchtower_challenge_info(
+        btc_client,
+        &watchtower_challenge_init_txid,
+        num_challenger,
+    )
+    .await
+    {
+        Ok(info) => info,
+        Err(e) => {
+            warn!("Failed to get watchtower challenge info: {e}");
+            return Ok((None, get_operator_proof_wait_secs()));
+        }
+    };
+
+    let base_url = Url::parse(
+        &get_proof_build_rpc_host()
+            .ok_or_else(|| anyhow::anyhow!("failed to get proof_build_rpc_host"))?,
+    )?;
+    let operator_url = base_url.join(NODES_OPERATOR_BASE)?;
+    let operator_response = http_client
+        .post_response_json::<OperatorProofResponse, OperatorProofRequest>(
+            operator_url.as_str(),
+            &OperatorProofRequest {
+                instance_id: instance_id.to_string(),
+                graph_id: graph_id.to_string(),
+                operator_committed_blockhash,
+                execution_layer_block_number: graph.proceed_withdraw_height,
+                watchtower_challenge_txids,
+                included_watchtowers,
+                watchtower_challenge_init_txid: watchtower_challenge_init_txid.0.to_string(),
+                watchtower_challenge_pubkeys: bitvm_graph
+                    .parameters
+                    .watchtower_pubkeys
+                    .iter()
+                    .map(|pk| pk.public_key(secp256k1::Parity::Even).to_string())
+                    .collect(),
+            },
+        )
+        .await?;
+
+    if operator_response.proof_data.is_none() {
+        return Ok((None, get_operator_proof_wait_secs()));
+    }
+
+    let operator_vk_hash = get_operator_vk_hash()?;
+    let genesis_txid = get_genesis_sequencer_commit_id();
+    let wrapper_values =
+        wrapper_public_values(operator_vk_hash, *graph_id.as_bytes(), genesis_txid);
+    let expected_public_values =
+        wrapper_values.iter().flat_map(|value| value.iter().copied()).collect::<Vec<_>>();
+    let genesis_txid_text = std::env::var(ENV_GENESIS_SEQUENCER_COMMIT_TXID)
+        .map_err(|_| anyhow!("{ENV_GENESIS_SEQUENCER_COMMIT_TXID} needs to be set"))?;
+
+    let mut wrapper_url = base_url.join(PROOFS_WRAPPER_PROOF)?;
+    wrapper_url
+        .query_pairs_mut()
+        .append_pair("instance_id", &instance_id.to_string())
+        .append_pair("graph_id", &graph_id.to_string())
+        .append_pair("genesis_sequencer_commit_txid", &genesis_txid_text);
+    let wrapper_response =
+        http_client.get_response_json::<WrapperProofResponse>(wrapper_url.as_str()).await?;
+
+    let Some(proof_data) = wrapper_response.proof_data else {
+        if let Some(error) = wrapper_response.error {
+            info!("operator wrapper proof is not ready for graph_id:{graph_id}: {error}");
+        }
+        return Ok((None, get_operator_proof_wait_secs()));
+    };
+
+    let proof: ZKMProofWithPublicValues = bincode::deserialize(proof_data.proof.as_slice())
+        .map_err(|err| anyhow!("failed to deserialize operator wrapper proof: {err}"))?;
+    let proof_public_values = proof.public_values.to_vec();
+    if proof_public_values != expected_public_values {
+        bail!("operator wrapper proof public values do not match graph challenge inputs");
+    }
+    if !proof_data.public_inputs.is_empty() && proof_data.public_inputs != expected_public_values {
+        bail!("operator wrapper proof public input sidecar does not match proof");
+    }
+
+    let part_stark_vk = load_part_stark_vk_for_zkm_version(&proof.zkm_version)?;
+    let ark_proof =
+        convert_ark_imm_wrap_vk(&proof, &proof_data.vk, &IMM_GROTH16_VK_BYTES, &part_stark_vk)
+            .map_err(|e| anyhow!("failed to convert operator wrapper proof to ark format: {e}"))?;
+
+    Ok((
+        Some((
+            [wrapper_values[1], wrapper_values[2]],
+            ark_proof.proof.clone(),
+            ark_proof.public_inputs.into(),
+            ark_proof.groth16_vk.into(),
+        )),
+        0,
+    ))
+}
+const ASSERT_COMMIT_CACHE_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 struct CachedAssertCommitInput {
@@ -2699,6 +2829,12 @@ pub async fn build_graph_params(
         hashlocks.push(hashlock);
     }
     let guest_constant_value = get_guest_constant_value(instance_id, graph_id)?;
+    let guest_operator_vk_hash = get_operator_vk_hash()?;
+    let wrapper_values = wrapper_public_values(
+        guest_operator_vk_hash,
+        *graph_id.as_bytes(),
+        get_genesis_sequencer_commit_id(),
+    );
     Ok(Bitvm2GraphParameters {
         instance_parameters,
         prekickoff_parameters,
@@ -2711,6 +2847,9 @@ pub async fn build_graph_params(
         watchtower_pubkeys,
         hashlocks,
         guest_constant_value,
+        guest_operator_vk_hash,
+        guest_graph_id: wrapper_values[1],
+        guest_genesis_sequencer_commit_txid: wrapper_values[2],
     })
 }
 
@@ -2883,7 +3022,7 @@ pub async fn operator_send_assert_commit(
         let wots_secret_keys = operator_master_key.wots_keypair_for_graph(graph_id).0;
         let operator_committed_blockhash =
             get_largest_watchtower_challenge_block(graph, btc_client).await?;
-        let (guest_inputs, proof, groth16_pubin, vk) = match get_operator_proof(
+        let (guest_inputs, proof, groth16_pubin, vk) = match get_operator_wrapper_proof(
             local_db,
             http_client,
             graph,
@@ -2897,7 +3036,7 @@ pub async fn operator_send_assert_commit(
             (Some(proof_data), _) => proof_data,
             (None, wait_secs) => {
                 tracing::info!(
-                    "operator proof generation in progress for graph_id:{graph_id}, wait and retry {wait_secs}s later"
+                    "operator wrapper proof generation in progress for graph_id:{graph_id}, wait and retry {wait_secs}s later"
                 );
                 return Ok((None, false, Some(wait_secs)));
             }

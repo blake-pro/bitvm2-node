@@ -445,6 +445,20 @@ pub fn hash_operator_constant(
     *hash.as_byte_array()
 }
 
+pub fn pad_graph_id(graph_id: [u8; GRAPH_ID_SIZE]) -> [u8; 32] {
+    let mut padded = [0u8; 32];
+    padded[..GRAPH_ID_SIZE].copy_from_slice(&graph_id);
+    padded
+}
+
+pub fn wrapper_public_values(
+    operator_vk_hash: [u8; 32],
+    graph_id: [u8; GRAPH_ID_SIZE],
+    genesis_sequencer_commit_txid: [u8; 32],
+) -> [[u8; 32]; 3] {
+    [operator_vk_hash, pad_graph_id(graph_id), genesis_sequencer_commit_txid]
+}
+
 // zkm_vk_hash: 66 bytes, prefix with '0x'
 pub fn zkm_vk_hash_to_raw(vk_hash: &[u8]) -> Result<[u8; 32], String> {
     let vk_hash =

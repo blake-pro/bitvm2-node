@@ -1,13 +1,13 @@
 use crate::action::*;
 use crate::env::{
-    COMMITTEE_INSTANCE_KEYS_DIR, get_bitvm_key, get_network, get_node_goat_address, is_relayer,
+    COMMITTEE_INSTANCE_KEYS_DIR, get_bitvm_key, get_network, get_node_goat_address,
+    get_operator_vk_hash, is_relayer,
 };
 use crate::error::SpecialError;
 use crate::middleware::AllBehaviours;
 use crate::scheduled_tasks::graph_maintenance_tasks::ChallengeSubStatus;
 use crate::utils::*;
 use anyhow::{Context, Result, anyhow, bail};
-use bitcoin::hashes::Hash;
 use bitcoin::{OutPoint, Txid};
 use bitcoin::{PublicKey, XOnlyPublicKey};
 use bitvm2_lib::actors::Actor;
@@ -2764,30 +2764,8 @@ async fn handle_operator_commit_blockhash_ready_operator(
         );
         return Ok(());
     }
-    // 1. check that all WatchtowerChallenge Connectors are spent
-    let largest_watchtower_challenge_block_hash = match get_largest_watchtower_challenge_block(
-        &graph,
-        ctx.btc_client,
-    )
-    .await
-    {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!(
-                "Retry OperatorCommitBlockHashReady later for {instance_id}:{graph_id}: failed to get
-                            largest watchtower challenge block, error: {e:?}"
-            );
-            push_local_unhandled_messages(
-                ctx.local_db,
-                graph_id,
-                &message,
-                todo_funcs::avg_block_time_secs(ctx.btc_client.network()) as usize,
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-    // 2. sign & broadcast commit-blockhash txn
+    // 1. sign & broadcast commit-blockhash txn. Connector-G now binds the wrapper operator vk hash.
+    let operator_vk_hash = get_operator_vk_hash()?;
     let operator_master_key = OperatorMasterKey::new(get_bitvm_key()?);
     let operator_graph_keypair = operator_master_key.master_keypair();
     let operator_master_keypair = operator_master_key.master_keypair();
@@ -2797,7 +2775,7 @@ async fn handle_operator_commit_blockhash_ready_operator(
         operator_sign_blockhash_commit(
             operator_graph_keypair,
             &mut graph,
-            &largest_watchtower_challenge_block_hash.to_byte_array(),
+            &operator_vk_hash,
             blockhash_wots_secret_key,
         )?;
     build_sign_and_broadcast_tx(

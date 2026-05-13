@@ -139,6 +139,9 @@ mod dbg {
             watchtower_pubkeys,
             hashlocks,
             guest_constant_value: [3u8; 32],
+            guest_operator_vk_hash: [0u8; 32],
+            guest_graph_id: [0u8; 32],
+            guest_genesis_sequencer_commit_txid: [0u8; 32],
         }
     }
     fn build_dbg_simplified_graph() -> SimplifiedBitvm2Graph {

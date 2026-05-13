@@ -39,6 +39,7 @@ operator-wrapper-proof = { workspace = true }
 util = { workspace = true }
 client = { workspace = true }
 bitcoin-light-client-circuit.workspace = true
+zkm-sdk = { workspace = true }
 
 #config
 toml.workspace = true

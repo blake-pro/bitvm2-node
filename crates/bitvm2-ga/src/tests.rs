@@ -564,6 +564,9 @@ mod tests {
                 .collect(),
             hashlocks: hashlocks().1.to_vec(),
             guest_constant_value: [0u8; 32], // all zero for test
+            guest_operator_vk_hash: [0u8; 32],
+            guest_graph_id: [0u8; 32],
+            guest_genesis_sequencer_commit_txid: [0u8; 32],
         };
 
         generate_bitvm_graph(graph_parameters, disprove_scripts).unwrap()

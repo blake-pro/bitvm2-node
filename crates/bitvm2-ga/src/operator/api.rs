@@ -6,11 +6,14 @@ use crate::types::{
 use anyhow::{Result, bail};
 use bitcoin::{Address, Amount, Network, PublicKey, ScriptBuf, Transaction, TxIn};
 use bitcoin::{OutPoint, Witness, XOnlyPublicKey, key::Keypair};
+use bitcoin_light_client_circuit::wrapper_public_values;
+use bitvm::bigint::U256;
 use bitvm::chunk::api::{
     NUM_HASH, NUM_PUBS, NUM_U256, PublicKeys as Groth16WotsPublicKeys,
     api_generate_full_tapscripts, api_generate_partial_script, generate_assertions,
 };
 use bitvm::signatures::{HASH_LEN, WinternitzSecret, Wots, Wots16, Wots32};
+use bitvm::treepp::*;
 use goat::connectors::assert_connectors::generate_chunked_assert_commit_connectors;
 use goat::connectors::connector_0::Connector0;
 use goat::connectors::connector_a::ConnectorA;
@@ -30,8 +33,9 @@ use goat::constants::{
     CONNECTOR_A_TIMELOCK, CONNECTOR_D_TIMELOCK, CONNECTOR_F_TIMELOCK, WATCHTOWER_CHALLENGE_TIMELOCK,
 };
 use goat::disprove_scripts::{
-    ChallengeHashType, NUM_GUEST, NUM_GUEST_PUBS_ASSERT, NUM_GUEST_PUBS_EXTRA, hash160,
-    verify_guest_pubin,
+    GUEST_PUBIN_COMMITMENT_INDEX, GUEST_VALIDATION_TAPS, NUM_GUEST, NUM_GUEST_PUBS_ASSERT,
+    NUM_GUEST_PUBS_EXTRA, generate_guest_pubin_commitment, hash160,
+    verify_constant_pubin_script_dup, verify_guest_pubin,
 };
 use goat::transactions::assert::{
     AssertCommitTimeoutTransaction, AssertInitTransaction, operator_commit_proof,
@@ -52,6 +56,7 @@ use goat::transactions::watchtower_challenge::{
 };
 use goat::utils::num_blocks_per_network;
 use hex::encode as hex_encode;
+use uuid::Uuid;
 
 const OPERATOR_WOTS_HKDF_SALT: &[u8] = b"bitvm2/operator-wots/v1";
 
@@ -137,21 +142,125 @@ pub fn generate_partial_scripts(ark_vkey: &VerifyingKey) -> Vec<ScriptBuf> {
     api_generate_partial_script(ark_vkey)
 }
 
+pub fn wrapper_challenge_guest_values(
+    operator_vk_hash: [u8; 32],
+    graph_id: Uuid,
+    genesis_sequencer_commit_txid: [u8; 32],
+) -> [[u8; 32]; NUM_GUEST] {
+    wrapper_public_values(operator_vk_hash, *graph_id.as_bytes(), genesis_sequencer_commit_txid)
+}
+
+fn roll(d: usize) -> Script {
+    match d {
+        0 => script! {},
+        1 => script! { OP_SWAP },
+        2 => script! { OP_ROT },
+        _ => script! { { d } OP_ROLL },
+    }
+}
+
+fn roll_n(depth: usize, num_items: usize) -> Script {
+    script! {
+        for _ in 0..num_items {
+            { roll(depth + num_items - 1) }
+        }
+    }
+}
+
+fn discard_witness_preimages_below_top(top_items: usize, preimage_count: usize) -> Script {
+    script! {
+        for _ in 0..top_items {
+            OP_TOALTSTACK
+        }
+        for _ in 0..preimage_count {
+            OP_DROP
+        }
+        for _ in 0..top_items {
+            OP_FROMALTSTACK
+        }
+    }
+}
+
+fn zip_nibbles_bytes32() -> Script {
+    script! {
+        { U256::transform_limbsize(4, 8) }
+    }
+}
+
+fn reverse_zip_nibbles_bytes32() -> Script {
+    script! {
+        for _ in 0..32 {
+            { roll(62) }
+            { roll(63) }
+        }
+        { zip_nibbles_bytes32() }
+    }
+}
+
+pub fn verify_wrapper_guest_pubin(
+    guest_pubin_wots_pubkeys: &[<Wots32 as Wots>::PublicKey; NUM_GUEST],
+    groth16_pubin_wots_pubkeys: &[<Wots32 as Wots>::PublicKey; NUM_PUBS],
+    wrapper_values: &[[u8; 32]; NUM_GUEST],
+    watchtower_preimage_count: usize,
+) -> [Script; GUEST_VALIDATION_TAPS] {
+    let wots32_msg_stack_items_num = Wots32::MSG_BYTE_LEN as usize * 2;
+    let wots32_sig_stack_items_num = Wots32::TOTAL_DIGIT_LEN as usize * 2;
+    let zipped_wots32_msg_stack_items_num = Wots32::MSG_BYTE_LEN as usize;
+    let scr = script! {
+        { 1 } OP_TOALTSTACK
+
+        { verify_constant_pubin_script_dup(&guest_pubin_wots_pubkeys[2], &wrapper_values[2]) }
+        OP_FROMALTSTACK OP_BOOLAND OP_TOALTSTACK
+
+        { discard_witness_preimages_below_top(wots32_msg_stack_items_num, watchtower_preimage_count) }
+
+        { roll_n(wots32_msg_stack_items_num, wots32_sig_stack_items_num) }
+
+        { verify_constant_pubin_script_dup(&guest_pubin_wots_pubkeys[1], &wrapper_values[1]) }
+        OP_FROMALTSTACK OP_BOOLAND OP_TOALTSTACK
+
+        { roll_n(wots32_msg_stack_items_num * 2, wots32_sig_stack_items_num) }
+
+        { verify_constant_pubin_script_dup(&guest_pubin_wots_pubkeys[0], &wrapper_values[0]) }
+        OP_FROMALTSTACK OP_BOOLAND OP_TOALTSTACK
+
+        { roll_n(wots32_msg_stack_items_num * 3, wots32_sig_stack_items_num) }
+
+        { Wots32::checksig_verify(&groth16_pubin_wots_pubkeys[GUEST_PUBIN_COMMITMENT_INDEX]) }
+
+        { reverse_zip_nibbles_bytes32() }
+
+        { roll_n(zipped_wots32_msg_stack_items_num, wots32_msg_stack_items_num * 3) }
+
+        { generate_guest_pubin_commitment(NUM_GUEST as u32) }
+
+        { zip_nibbles_bytes32() }
+
+        OP_FROMALTSTACK
+        for i in (0..32).rev() {
+            OP_SWAP { i + 2 } OP_ROLL OP_NUMEQUAL OP_BOOLAND
+        }
+
+        OP_NOT
+    };
+    [scr]
+}
+
 pub fn generate_disprove_scripts(
     partial_scripts: &[ScriptBuf],
     wots_pubkeys: OperatorWotsPublicKeys,
-    guest_constant_value: &[u8; 32],
-    watchtower_hashlocks: &Vec<ChallengeHashType>,
+    wrapper_values: &[[u8; 32]; NUM_GUEST],
+    watchtower_preimage_count: usize,
 ) -> (Vec<ScriptBuf>, Vec<ScriptBuf>) {
     let (guest_pubkeys_0, guest_pubkeys_1, proof_pubkeys) = wots_pubkeys;
     let mut guest_pubin_wots_pubkeys = guest_pubkeys_0.to_vec();
     guest_pubin_wots_pubkeys.extend(guest_pubkeys_1);
     let guest_pubin_wots_pubkeys = guest_pubin_wots_pubkeys.try_into().unwrap();
-    let guest_pubin_scripts = verify_guest_pubin(
+    let guest_pubin_scripts = verify_wrapper_guest_pubin(
         &guest_pubin_wots_pubkeys,
         &proof_pubkeys.0,
-        guest_constant_value,
-        watchtower_hashlocks,
+        wrapper_values,
+        watchtower_preimage_count,
     );
     let guest_pubin_scripts = guest_pubin_scripts.into_iter().map(|s| s.compile()).collect();
     let proof_scripts = api_generate_full_tapscripts(*proof_pubkeys, partial_scripts);

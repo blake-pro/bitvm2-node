@@ -197,6 +197,7 @@ pub struct WrapperProofDescRequest {
     pub operator_proof_id: Option<i64>,
     pub instance_id: Option<String>,
     pub graph_id: Option<String>,
+    pub genesis_sequencer_commit_txid: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]

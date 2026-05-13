@@ -243,13 +243,14 @@ impl ProofBuilder for OperatorWrapperProofBuilder {
         let ProofRequest::WrapperProofRequest { output, .. } = ctx else {
             anyhow::bail!("invalid context");
         };
-        fs::write(output, proof.bytes())?;
         let public_value_hex = hex::encode(proof.public_values.to_vec());
-        let proof_size = proof.bytes().len();
+        let serialized_proof = bincode::serialize(&proof)?;
+        let proof_size = serialized_proof.len();
         let zkm_version = proof.zkm_version.clone();
         fs::write(format!("{output}.public_inputs.bin"), proof.public_values.to_vec())?;
         fs::write(format!("{output}.vk_hash.bin"), self.verifying_key.bytes32())?;
         fs::write(format!("{output}.zkm_version.bin"), zkm_version)?;
+        fs::write(output, serialized_proof)?;
         Ok((public_value_hex, proof_size))
     }
 }
