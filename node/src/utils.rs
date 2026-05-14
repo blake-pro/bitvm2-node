@@ -32,6 +32,7 @@ use bitvm2_lib::operator::*;
 use bitvm2_lib::types::{
     Bitvm2Graph, Bitvm2GraphParameters, Bitvm2InstanceParameters, Groth16Proof, GuestInputs,
     PrekickoffParameters, PublicInputs, SimplifiedBitvm2Graph, UserInfo, VerifyingKey,
+    WrapperChallengeGuestValues,
 };
 use bitvm2_lib::watchtower::*;
 use client::Utxo as ClientUtxo;
@@ -107,9 +108,7 @@ pub mod todo_funcs {
     use super::*;
     use bitvm::chunk::api::{NUM_HASH, NUM_PUBS, NUM_U256};
     use bitvm2_lib::types::SimplifiedBitvm2Graph;
-    use goat::{
-        connectors::assert_connectors::chunk_assert_commit, disprove_scripts::NUM_GUEST_PUBS_ASSERT,
-    };
+    use goat::connectors::assert_connectors::chunk_assert_commit;
 
     // other operations
     pub fn avg_block_time_secs(network: Network) -> u64 {
@@ -124,8 +123,8 @@ pub mod todo_funcs {
     }
     pub fn assert_commmit_num() -> usize {
         let use_compact = false;
-        let wots32_num = NUM_GUEST_PUBS_ASSERT + NUM_PUBS + NUM_U256;
-        let wots16_num = NUM_HASH;
+        let wots32_num = 1 + NUM_PUBS + NUM_U256;
+        let wots16_num = 1 + NUM_HASH;
         chunk_assert_commit(wots32_num, wots16_num, use_compact).len()
     }
     pub fn min_required_operator() -> usize {
@@ -1640,11 +1639,11 @@ pub async fn get_partial_scripts() -> Result<Vec<ScriptBuf>> {
 
 pub async fn get_disprove_scripts(graph_params: &Bitvm2GraphParameters) -> Result<Vec<ScriptBuf>> {
     let partial_scripts = get_partial_scripts().await?;
-    let wrapper_values = [
-        graph_params.guest_operator_vk_hash,
-        graph_params.guest_graph_id,
-        graph_params.guest_genesis_sequencer_commit_txid,
-    ];
+    let wrapper_values = WrapperChallengeGuestValues {
+        operator_vk_hash: graph_params.guest_operator_vk_hash,
+        graph_id: graph_params.guest_graph_id,
+        genesis_sequencer_commit_txid: graph_params.guest_genesis_sequencer_commit_txid,
+    };
     let (mut disprove_scripts, disprove_scripts_1) = generate_disprove_scripts(
         &partial_scripts,
         graph_params.operator_wots_pubkeys.clone(),
@@ -1960,12 +1959,11 @@ pub async fn get_operator_proof(
                 let part_stark_vk = load_part_stark_vk_for_zkm_version(&proof.zkm_version)?;
                 let operator_vk_hash =
                     zkm_vk_hash_to_raw(proof_data.vk.as_bytes()).map_err(|err| anyhow!(err))?;
-                let output = decode_operator_public_outputs(
+                let _operator_outputs = decode_operator_public_outputs(
                     proof.public_values.as_slice(),
                     operator_vk_hash,
                 )
                 .map_err(|err| anyhow!(err))?;
-                // TODO: additionally check constant and included_watchtower with included_watchtowers.
                 //proof.public_values.head();
                 info!("get_operator_proof parse proof successfully");
                 let ark_proof = convert_ark_imm_wrap_vk(
@@ -1979,7 +1977,12 @@ pub async fn get_operator_proof(
 
                 Ok((
                     Some((
-                        [output.constant, output.included_watchtowers],
+                        GuestInputs {
+                            graph_id: bitvm_graph.parameters.guest_graph_id,
+                            genesis_sequencer_commit_txid: bitvm_graph
+                                .parameters
+                                .guest_genesis_sequencer_commit_txid,
+                        },
                         ark_proof.proof.clone(),
                         ark_proof.public_inputs.into(),
                         ark_proof.groth16_vk.into(),
@@ -2071,8 +2074,7 @@ pub async fn get_operator_wrapper_proof(
     let genesis_txid = get_genesis_sequencer_commit_id();
     let wrapper_values =
         wrapper_public_values(operator_vk_hash, *graph_id.as_bytes(), genesis_txid);
-    let expected_public_values =
-        wrapper_values.iter().flat_map(|value| value.iter().copied()).collect::<Vec<_>>();
+    let expected_public_values = wrapper_values.to_vec();
     let genesis_txid_text = std::env::var(ENV_GENESIS_SEQUENCER_COMMIT_TXID)
         .map_err(|_| anyhow!("{ENV_GENESIS_SEQUENCER_COMMIT_TXID} needs to be set"))?;
 
@@ -2109,7 +2111,10 @@ pub async fn get_operator_wrapper_proof(
 
     Ok((
         Some((
-            [wrapper_values[1], wrapper_values[2]],
+            GuestInputs {
+                graph_id: *graph_id.as_bytes(),
+                genesis_sequencer_commit_txid: genesis_txid,
+            },
             ark_proof.proof.clone(),
             ark_proof.public_inputs.into(),
             ark_proof.groth16_vk.into(),
@@ -2830,11 +2835,6 @@ pub async fn build_graph_params(
     }
     let guest_constant_value = get_guest_constant_value(instance_id, graph_id)?;
     let guest_operator_vk_hash = get_operator_vk_hash()?;
-    let wrapper_values = wrapper_public_values(
-        guest_operator_vk_hash,
-        *graph_id.as_bytes(),
-        get_genesis_sequencer_commit_id(),
-    );
     Ok(Bitvm2GraphParameters {
         instance_parameters,
         prekickoff_parameters,
@@ -2848,8 +2848,8 @@ pub async fn build_graph_params(
         hashlocks,
         guest_constant_value,
         guest_operator_vk_hash,
-        guest_graph_id: wrapper_values[1],
-        guest_genesis_sequencer_commit_txid: wrapper_values[2],
+        guest_graph_id: *graph_id.as_bytes(),
+        guest_genesis_sequencer_commit_txid: get_genesis_sequencer_commit_id(),
     })
 }
 

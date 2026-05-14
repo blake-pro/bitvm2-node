@@ -2,19 +2,26 @@ use crate::types::{Bitvm2Graph, VerifyingKey};
 use anyhow::{Result, bail};
 use bitcoin::{Address, Amount, Network, ScriptBuf, Transaction, TxIn, TxOut, XOnlyPublicKey};
 use bitvm::chunk::api::{
-    NUM_HASH, NUM_PUBS, NUM_TAPS, NUM_U256, type_conversion_utils::RawWitness,
+    NUM_HASH, NUM_PUBS, NUM_TAPS, NUM_U256,
+    type_conversion_utils::{RawWitness, script_to_witness},
+    validate_assertions_lit,
 };
+use bitvm::signatures::{Wots, Wots16, Wots32};
+use bitvm::treepp::*;
 use goat::{
     connectors::{
         assert_connectors::{extract_commits_from_txin, extract_commits_from_txins},
         connector_e::ConnectorE,
     },
     constants::{ACK_TIMELOCK, ASSERT_COMMIT_TIMELOCK, CONNECTOR_G_TIMELOCK},
-    disprove_scripts::{GUEST_VALIDATION_TAPS, NUM_GUEST_PUBS_ASSERT, NUM_GUEST_PUBS_EXTRA},
+    disprove_scripts::{
+        GUEST_PUBIN_COMMITMENT_INDEX, GUEST_VALIDATION_TAPS, NUM_GUEST_PUBS_EXTRA,
+        push_preimage_to_stack,
+    },
     scripts::{generate_opreturn_script, p2a_output},
     transactions::{
         base::{DUST_AMOUNT, Input},
-        disprove::{disprove, validate_assert},
+        disprove::disprove,
         pre_signed::PreSignedTransaction,
         watchtower_challenge::extract_operator_preimage_from_ack_txin,
     },
@@ -35,12 +42,86 @@ pub fn extract_assert_commit_witness(
 ) -> Result<Vec<RawWitness>> {
     match extract_commits_from_txins(
         operator_assert_commit_txins,
-        NUM_GUEST_PUBS_ASSERT + NUM_PUBS + NUM_U256,
-        NUM_HASH,
+        1 + NUM_PUBS + NUM_U256,
+        1 + NUM_HASH,
     ) {
         Ok(v) => Ok(v),
         Err(e) => bail!("Failed to extract assert commit witness: {e}"),
     }
+}
+
+fn validate_wrapper_guest_assertions(
+    raw_commit_blockhash_witness: &[RawWitness],
+    raw_assert_witness: &[RawWitness],
+    ack_preimages: &Vec<Vec<u8>>,
+    guest_validation_scripts: &[ScriptBuf; GUEST_VALIDATION_TAPS],
+) -> Option<(usize, Script)> {
+    if raw_commit_blockhash_witness.len() != NUM_GUEST_PUBS_EXTRA
+        || raw_assert_witness.len() != 1 + NUM_PUBS + NUM_U256 + 1 + NUM_HASH
+    {
+        panic!("unexpected mixed assertion witness length");
+    }
+
+    let pubin_commitment_sig = Wots32::raw_witness_to_signature(&bitcoin::Witness::from_slice(
+        &raw_assert_witness[1 + GUEST_PUBIN_COMMITMENT_INDEX],
+    ));
+    let operator_vk_sig = Wots32::raw_witness_to_signature(&bitcoin::Witness::from_slice(
+        &raw_commit_blockhash_witness[0],
+    ));
+    let graph_id_sig = Wots16::raw_witness_to_signature(&bitcoin::Witness::from_slice(
+        &raw_assert_witness[1 + NUM_PUBS + NUM_U256],
+    ));
+    let genesis_sig =
+        Wots32::raw_witness_to_signature(&bitcoin::Witness::from_slice(&raw_assert_witness[0]));
+
+    let witness_script = script! {
+        { Wots32::signature_to_raw_witness(&pubin_commitment_sig) }
+        { Wots32::signature_to_raw_witness(&operator_vk_sig) }
+        { Wots16::signature_to_raw_witness(&graph_id_sig) }
+        { push_preimage_to_stack(ack_preimages) }
+        { Wots32::signature_to_raw_witness(&genesis_sig) }
+    };
+    let full_script = witness_script.clone().push_script(guest_validation_scripts[0].clone());
+    let res = execute_script(full_script);
+    if res.success {
+        Some((0, witness_script))
+    } else if res.final_stack.len() == 1 {
+        None
+    } else {
+        panic!("unexpected script execution result, maybe sigs/scripts do not match?");
+    }
+}
+
+fn mixed_proof_signatures(raw_assert_witness: &[RawWitness]) -> bitvm::chunk::api::Signatures {
+    let pubins = (0..NUM_PUBS)
+        .map(|i| {
+            Wots32::raw_witness_to_signature(&bitcoin::Witness::from_slice(
+                &raw_assert_witness[1 + i],
+            ))
+        })
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let u256 = (0..NUM_U256)
+        .map(|i| {
+            Wots32::raw_witness_to_signature(&bitcoin::Witness::from_slice(
+                &raw_assert_witness[1 + NUM_PUBS + i],
+            ))
+        })
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let hashes = (0..NUM_HASH)
+        .map(|i| {
+            Wots16::raw_witness_to_signature(&bitcoin::Witness::from_slice(
+                &raw_assert_witness[1 + NUM_PUBS + NUM_U256 + 1 + i],
+            ))
+        })
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+
+    (Box::new(pubins), Box::new(u256), Box::new(hashes))
 }
 
 /// return (if any) disprove witness
@@ -71,14 +152,24 @@ pub fn verify_operator_commits(
         <&[ScriptBuf; GUEST_VALIDATION_TAPS]>::try_from(guest_validation_scripts).unwrap();
     let proof_validation_scripts =
         <&[ScriptBuf; NUM_TAPS]>::try_from(proof_validation_scripts).unwrap();
-    let res = validate_assert(
-        extract_blockhash_commit_witness(&operator_commit_blockhash_txin)?,
-        extract_assert_commit_witness(operator_assert_commit_txins)?,
-        preimages,
+    let raw_commit_blockhash_witness =
+        extract_blockhash_commit_witness(&operator_commit_blockhash_txin)?;
+    let raw_assert_witness = extract_assert_commit_witness(operator_assert_commit_txins)?;
+    let res = validate_wrapper_guest_assertions(
+        &raw_commit_blockhash_witness,
+        &raw_assert_witness,
+        &preimages,
         guest_validation_scripts,
-        vk,
-        proof_validation_scripts,
-    );
+    )
+    .map(|(index, wit)| (script_to_witness(wit), guest_validation_scripts[index].clone()))
+    .or_else(|| {
+        validate_assertions_lit(
+            vk,
+            mixed_proof_signatures(&raw_assert_witness),
+            proof_validation_scripts,
+        )
+        .map(|(index, wit)| (script_to_witness(wit), proof_validation_scripts[index].clone()))
+    });
     if let Some((_, scr)) = &res {
         let guest_index_opt = guest_validation_scripts.iter().position(|s| s == scr);
         if let Some(guest_index) = guest_index_opt {

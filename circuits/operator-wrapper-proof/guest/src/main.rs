@@ -2,7 +2,7 @@
 zkm_zkvm::entrypoint!(main);
 
 use bitcoin_light_client_circuit::{
-    decode_operator_public_outputs, hash_operator_constant, wrapper_public_values, zkm_vk_hash_to_raw,
+    decode_operator_public_outputs, hash_operator_constant, zkm_vk_hash_to_raw,
 };
 use verifier::verify_groth16_proof;
 
@@ -33,11 +33,7 @@ pub fn main() {
     assert_eq!(operator_outputs.constant, expected_constant);
     assert_eq!(operator_outputs.operator_vk_hash, operator_vk_hash_raw);
 
-    for value in wrapper_public_values(
-        operator_vk_hash_raw,
-        graph_id,
-        genesis_sequencer_commit_txid,
-    ) {
-        zkm_zkvm::io::commit(&value);
-    }
+    zkm_zkvm::io::commit(&operator_vk_hash_raw);
+    zkm_zkvm::io::commit(&graph_id);
+    zkm_zkvm::io::commit(&genesis_sequencer_commit_txid);
 }

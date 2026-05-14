@@ -1,20 +1,20 @@
 use crate::keys::hkdf_derive_bytes;
 use crate::types::{
-    Bitvm2Graph, Bitvm2GraphParameters, Groth16Proof, OperatorWotsPublicKeys,
-    OperatorWotsSecretKeys, OperatorWotsSignatures, PublicInputs, VerifyingKey,
+    Bitvm2Graph, Bitvm2GraphParameters, Groth16Proof, GuestInputs,
+    OperatorGuestAssertWotsPublicKeys, OperatorWotsPublicKeys, OperatorWotsSecretKeys,
+    OperatorWotsSignatures, PublicInputs, VerifyingKey, WrapperChallengeGuestValues,
 };
 use anyhow::{Result, bail};
 use bitcoin::{Address, Amount, Network, PublicKey, ScriptBuf, Transaction, TxIn};
 use bitcoin::{OutPoint, Witness, XOnlyPublicKey, key::Keypair};
-use bitcoin_light_client_circuit::wrapper_public_values;
-use bitvm::bigint::U256;
 use bitvm::chunk::api::{
     NUM_HASH, NUM_PUBS, NUM_U256, PublicKeys as Groth16WotsPublicKeys,
     api_generate_full_tapscripts, api_generate_partial_script, generate_assertions,
 };
 use bitvm::signatures::{HASH_LEN, WinternitzSecret, Wots, Wots16, Wots32};
 use bitvm::treepp::*;
-use goat::connectors::assert_connectors::generate_chunked_assert_commit_connectors;
+use goat::connectors::assert_connectors::{AssertCommitConnector, chunk_assert_commit};
+use goat::connectors::base::TaprootConnector;
 use goat::connectors::connector_0::Connector0;
 use goat::connectors::connector_a::ConnectorA;
 use goat::connectors::connector_b::ConnectorB;
@@ -33,13 +33,10 @@ use goat::constants::{
     CONNECTOR_A_TIMELOCK, CONNECTOR_D_TIMELOCK, CONNECTOR_F_TIMELOCK, WATCHTOWER_CHALLENGE_TIMELOCK,
 };
 use goat::disprove_scripts::{
-    GUEST_PUBIN_COMMITMENT_INDEX, GUEST_VALIDATION_TAPS, NUM_GUEST, NUM_GUEST_PUBS_ASSERT,
-    NUM_GUEST_PUBS_EXTRA, generate_guest_pubin_commitment, hash160,
-    verify_constant_pubin_script_dup, verify_guest_pubin,
+    GUEST_PUBIN_COMMITMENT_INDEX, GUEST_VALIDATION_TAPS, NUM_GUEST, NUM_GUEST_PUBS_EXTRA, hash160,
+    verify_constant_pubin_script,
 };
-use goat::transactions::assert::{
-    AssertCommitTimeoutTransaction, AssertInitTransaction, operator_commit_proof,
-};
+use goat::transactions::assert::{AssertCommitTimeoutTransaction, AssertInitTransaction};
 use goat::transactions::base::{DUST_AMOUNT, Input};
 use goat::transactions::challenge::ChallengeTransaction;
 use goat::transactions::kickoff::KickoffTransaction;
@@ -48,6 +45,7 @@ use goat::transactions::prekickoff::{
     ChallengeIncompleteKickoffTransaction, ForceSkipKickoffTransaction, PrekickoffTransaction,
     QuickChallengeTransaction, operator_skip_kickoff,
 };
+use goat::transactions::signing::populate_taproot_txin_witness;
 use goat::transactions::take1::Take1Transaction;
 use goat::transactions::take2::Take2Transaction;
 use goat::transactions::watchtower_challenge::{
@@ -80,11 +78,10 @@ pub fn wots_secrets_to_pubkeys(secrets: &OperatorWotsSecretKeys) -> OperatorWots
         index += 1;
     }
 
-    let mut guest_assert = vec![];
-    for _ in 0..NUM_GUEST_PUBS_ASSERT {
-        guest_assert.push(Wots32::generate_public_key(&secrets[index]));
-        index += 1;
-    }
+    let guest_graph_id = [Wots16::generate_public_key(&secrets[index])];
+    index += 1;
+    let guest_genesis = [Wots32::generate_public_key(&secrets[index])];
+    index += 1;
 
     let mut pubins = vec![];
     for _ in 0..NUM_PUBS {
@@ -104,38 +101,57 @@ pub fn wots_secrets_to_pubkeys(secrets: &OperatorWotsSecretKeys) -> OperatorWots
 
     let g16_wotspubkey: Groth16WotsPublicKeys =
         (pubins.try_into().unwrap(), fq_arr.try_into().unwrap(), h_arr.try_into().unwrap());
-    (guest_extra.try_into().unwrap(), guest_assert.try_into().unwrap(), Box::new(g16_wotspubkey))
+    (
+        guest_extra.try_into().unwrap(),
+        OperatorGuestAssertWotsPublicKeys {
+            graph_id: guest_graph_id,
+            genesis_sequencer_commit_txid: guest_genesis,
+        },
+        Box::new(g16_wotspubkey),
+    )
 }
 
 #[allow(deprecated)]
 pub fn wots_seed_to_secrets(seed: &str) -> OperatorWotsSecretKeys {
     let seed_bytes = seed.as_bytes();
-    let wot32_seckeys = (0..NUM_GUEST + NUM_PUBS + NUM_U256)
-        .map(|idx| {
-            let sec_i = hex_encode(hkdf_derive_bytes(
-                seed_bytes,
-                OPERATOR_WOTS_HKDF_SALT,
-                format!("wots32/{idx}").as_bytes(),
-                32,
-            ));
-            let sec_str = format!("{sec_i}{:04x}{:04x}", 1, idx);
-            Wots32::secret_from_str(&sec_str)
-        })
-        .collect::<Vec<WinternitzSecret>>();
-    let wot16_seckeys = (0..NUM_HASH)
-        .map(|idx| {
-            let sec_i = hex_encode(hkdf_derive_bytes(
-                seed_bytes,
-                OPERATOR_WOTS_HKDF_SALT,
-                format!("wots16/{idx}").as_bytes(),
-                32,
-            ));
-            let sec_str = format!("{sec_i}{:04x}{:04x}", 0, idx);
-            Wots16::secret_from_str(&sec_str)
-        })
-        .collect::<Vec<WinternitzSecret>>();
+    fn derive_secret<W: Wots>(
+        seed_bytes: &[u8],
+        label: &str,
+        type_flag: u16,
+        index: usize,
+    ) -> WinternitzSecret {
+        let sec_i = hex_encode(hkdf_derive_bytes(
+            seed_bytes,
+            OPERATOR_WOTS_HKDF_SALT,
+            label.as_bytes(),
+            32,
+        ));
+        let sec_str = format!("{sec_i}{type_flag:04x}{index:04x}");
+        W::secret_from_str(&sec_str)
+    }
 
-    Box::new([wot32_seckeys, wot16_seckeys].concat().try_into().unwrap())
+    let mut secrets = Vec::with_capacity(NUM_GUEST + NUM_PUBS + NUM_U256 + NUM_HASH);
+    let mut index = 0;
+    secrets.push(derive_secret::<Wots32>(seed_bytes, "guest-extra/operator-vk", 1, index));
+    index += 1;
+    secrets.push(derive_secret::<Wots16>(seed_bytes, "guest-assert/graph-id", 0, index));
+    index += 1;
+    secrets.push(derive_secret::<Wots32>(seed_bytes, "guest-assert/genesis-txid", 1, index));
+    index += 1;
+    for i in 0..NUM_PUBS {
+        secrets.push(derive_secret::<Wots32>(seed_bytes, &format!("groth16/pubin/{i}"), 1, index));
+        index += 1;
+    }
+    for i in 0..NUM_U256 {
+        secrets.push(derive_secret::<Wots32>(seed_bytes, &format!("groth16/u256/{i}"), 1, index));
+        index += 1;
+    }
+    for i in 0..NUM_HASH {
+        secrets.push(derive_secret::<Wots16>(seed_bytes, &format!("groth16/hash/{i}"), 0, index));
+        index += 1;
+    }
+
+    Box::new(secrets.try_into().unwrap())
 }
 
 pub fn generate_partial_scripts(ark_vkey: &VerifyingKey) -> Vec<ScriptBuf> {
@@ -146,101 +162,82 @@ pub fn wrapper_challenge_guest_values(
     operator_vk_hash: [u8; 32],
     graph_id: Uuid,
     genesis_sequencer_commit_txid: [u8; 32],
-) -> [[u8; 32]; NUM_GUEST] {
-    wrapper_public_values(operator_vk_hash, *graph_id.as_bytes(), genesis_sequencer_commit_txid)
-}
-
-fn roll(d: usize) -> Script {
-    match d {
-        0 => script! {},
-        1 => script! { OP_SWAP },
-        2 => script! { OP_ROT },
-        _ => script! { { d } OP_ROLL },
+) -> WrapperChallengeGuestValues {
+    WrapperChallengeGuestValues {
+        operator_vk_hash,
+        graph_id: *graph_id.as_bytes(),
+        genesis_sequencer_commit_txid,
     }
 }
 
-fn roll_n(depth: usize, num_items: usize) -> Script {
+fn discard_witness_preimages(preimage_count: usize) -> Script {
     script! {
-        for _ in 0..num_items {
-            { roll(depth + num_items - 1) }
-        }
-    }
-}
-
-fn discard_witness_preimages_below_top(top_items: usize, preimage_count: usize) -> Script {
-    script! {
-        for _ in 0..top_items {
-            OP_TOALTSTACK
-        }
         for _ in 0..preimage_count {
             OP_DROP
         }
-        for _ in 0..top_items {
-            OP_FROMALTSTACK
+    }
+}
+
+fn verify_constant_inner(constant_value: &[u8]) -> Script {
+    script! {
+        { 1 }
+        for byte in constant_value.to_vec() {
+            OP_SWAP
+            { byte & 0x0F }
+            OP_NUMEQUAL
+            OP_BOOLAND
+
+            OP_SWAP
+            { byte >> 4 }
+            OP_NUMEQUAL
+            OP_BOOLAND
         }
     }
 }
 
-fn zip_nibbles_bytes32() -> Script {
+fn verify_constant_wots16_script(
+    wots_pk: &<Wots16 as Wots>::PublicKey,
+    constant_value: &[u8; 16],
+) -> Script {
     script! {
-        { U256::transform_limbsize(4, 8) }
+        { Wots16::checksig_verify(wots_pk) }
+        { verify_constant_inner(constant_value) }
     }
 }
 
-fn reverse_zip_nibbles_bytes32() -> Script {
+fn flag_and() -> Script {
     script! {
-        for _ in 0..32 {
-            { roll(62) }
-            { roll(63) }
-        }
-        { zip_nibbles_bytes32() }
+        OP_FROMALTSTACK OP_BOOLAND OP_TOALTSTACK
     }
 }
 
 pub fn verify_wrapper_guest_pubin(
-    guest_pubin_wots_pubkeys: &[<Wots32 as Wots>::PublicKey; NUM_GUEST],
+    operator_vk_wots_pubkey: &<Wots32 as Wots>::PublicKey,
+    graph_id_wots_pubkey: &<Wots16 as Wots>::PublicKey,
+    genesis_wots_pubkey: &<Wots32 as Wots>::PublicKey,
     groth16_pubin_wots_pubkeys: &[<Wots32 as Wots>::PublicKey; NUM_PUBS],
-    wrapper_values: &[[u8; 32]; NUM_GUEST],
+    wrapper_values: &WrapperChallengeGuestValues,
     watchtower_preimage_count: usize,
 ) -> [Script; GUEST_VALIDATION_TAPS] {
-    let wots32_msg_stack_items_num = Wots32::MSG_BYTE_LEN as usize * 2;
-    let wots32_sig_stack_items_num = Wots32::TOTAL_DIGIT_LEN as usize * 2;
-    let zipped_wots32_msg_stack_items_num = Wots32::MSG_BYTE_LEN as usize;
+    let public_values_commitment = wrapper_values.public_values_commitment();
     let scr = script! {
         { 1 } OP_TOALTSTACK
 
-        { verify_constant_pubin_script_dup(&guest_pubin_wots_pubkeys[2], &wrapper_values[2]) }
-        OP_FROMALTSTACK OP_BOOLAND OP_TOALTSTACK
+        { verify_constant_pubin_script(genesis_wots_pubkey, &wrapper_values.genesis_sequencer_commit_txid) }
+        { flag_and() }
 
-        { discard_witness_preimages_below_top(wots32_msg_stack_items_num, watchtower_preimage_count) }
+        { discard_witness_preimages(watchtower_preimage_count) }
 
-        { roll_n(wots32_msg_stack_items_num, wots32_sig_stack_items_num) }
+        { verify_constant_wots16_script(graph_id_wots_pubkey, &wrapper_values.graph_id) }
+        { flag_and() }
 
-        { verify_constant_pubin_script_dup(&guest_pubin_wots_pubkeys[1], &wrapper_values[1]) }
-        OP_FROMALTSTACK OP_BOOLAND OP_TOALTSTACK
+        { verify_constant_pubin_script(operator_vk_wots_pubkey, &wrapper_values.operator_vk_hash) }
+        { flag_and() }
 
-        { roll_n(wots32_msg_stack_items_num * 2, wots32_sig_stack_items_num) }
-
-        { verify_constant_pubin_script_dup(&guest_pubin_wots_pubkeys[0], &wrapper_values[0]) }
-        OP_FROMALTSTACK OP_BOOLAND OP_TOALTSTACK
-
-        { roll_n(wots32_msg_stack_items_num * 3, wots32_sig_stack_items_num) }
-
-        { Wots32::checksig_verify(&groth16_pubin_wots_pubkeys[GUEST_PUBIN_COMMITMENT_INDEX]) }
-
-        { reverse_zip_nibbles_bytes32() }
-
-        { roll_n(zipped_wots32_msg_stack_items_num, wots32_msg_stack_items_num * 3) }
-
-        { generate_guest_pubin_commitment(NUM_GUEST as u32) }
-
-        { zip_nibbles_bytes32() }
+        { verify_constant_pubin_script(&groth16_pubin_wots_pubkeys[GUEST_PUBIN_COMMITMENT_INDEX], &public_values_commitment) }
+        { flag_and() }
 
         OP_FROMALTSTACK
-        for i in (0..32).rev() {
-            OP_SWAP { i + 2 } OP_ROLL OP_NUMEQUAL OP_BOOLAND
-        }
-
         OP_NOT
     };
     [scr]
@@ -249,15 +246,14 @@ pub fn verify_wrapper_guest_pubin(
 pub fn generate_disprove_scripts(
     partial_scripts: &[ScriptBuf],
     wots_pubkeys: OperatorWotsPublicKeys,
-    wrapper_values: &[[u8; 32]; NUM_GUEST],
+    wrapper_values: &WrapperChallengeGuestValues,
     watchtower_preimage_count: usize,
 ) -> (Vec<ScriptBuf>, Vec<ScriptBuf>) {
     let (guest_pubkeys_0, guest_pubkeys_1, proof_pubkeys) = wots_pubkeys;
-    let mut guest_pubin_wots_pubkeys = guest_pubkeys_0.to_vec();
-    guest_pubin_wots_pubkeys.extend(guest_pubkeys_1);
-    let guest_pubin_wots_pubkeys = guest_pubin_wots_pubkeys.try_into().unwrap();
     let guest_pubin_scripts = verify_wrapper_guest_pubin(
-        &guest_pubin_wots_pubkeys,
+        &guest_pubkeys_0[0],
+        &guest_pubkeys_1.graph_id[0],
+        &guest_pubkeys_1.genesis_sequencer_commit_txid[0],
         &proof_pubkeys.0,
         wrapper_values,
         watchtower_preimage_count,
@@ -265,6 +261,66 @@ pub fn generate_disprove_scripts(
     let guest_pubin_scripts = guest_pubin_scripts.into_iter().map(|s| s.compile()).collect();
     let proof_scripts = api_generate_full_tapscripts(*proof_pubkeys, partial_scripts);
     (guest_pubin_scripts, proof_scripts)
+}
+
+fn mixed_assert_wots_pubkeys(
+    wots_pubkeys: &OperatorWotsPublicKeys,
+) -> (Vec<<Wots32 as Wots>::PublicKey>, Vec<<Wots16 as Wots>::PublicKey>) {
+    let mut wots32_pubkeys = wots_pubkeys.1.genesis_sequencer_commit_txid.to_vec();
+    wots32_pubkeys.extend(wots_pubkeys.2.0.to_vec());
+    wots32_pubkeys.extend(wots_pubkeys.2.1.to_vec());
+
+    let mut wots16_pubkeys = wots_pubkeys.1.graph_id.to_vec();
+    wots16_pubkeys.extend(wots_pubkeys.2.2.to_vec());
+
+    (wots32_pubkeys, wots16_pubkeys)
+}
+
+pub fn generate_mixed_chunked_assert_commit_connectors(
+    network: Network,
+    n_of_n_taproot_public_key: &XOnlyPublicKey,
+    wots_pubkeys: &OperatorWotsPublicKeys,
+) -> Vec<AssertCommitConnector> {
+    let (wots32_pubkeys, wots16_pubkeys) = mixed_assert_wots_pubkeys(wots_pubkeys);
+    let use_compact_wots = false;
+    let chunks = chunk_assert_commit(wots32_pubkeys.len(), wots16_pubkeys.len(), use_compact_wots);
+    let n32 = wots32_pubkeys.len();
+
+    chunks
+        .into_iter()
+        .map(|(start_index, wots_num)| {
+            let end_index = start_index + wots_num;
+            let start32 = start_index.min(n32);
+            let end32 = end_index.min(n32);
+            let start16 = start_index.saturating_sub(n32);
+            let end16 = end_index.saturating_sub(n32);
+
+            AssertCommitConnector::new(
+                network,
+                n_of_n_taproot_public_key,
+                &wots32_pubkeys[start32..end32].to_vec(),
+                &wots16_pubkeys[start16..end16].to_vec(),
+            )
+        })
+        .collect()
+}
+
+fn mixed_assert_wots_secrets(
+    wots_secret_keys: &OperatorWotsSecretKeys,
+) -> (Vec<WinternitzSecret>, Vec<WinternitzSecret>) {
+    let mut wots32_secret_keys = Vec::with_capacity(1 + NUM_PUBS + NUM_U256);
+    wots32_secret_keys.push(wots_secret_keys[2].clone());
+    wots32_secret_keys.extend(wots_secret_keys[3..3 + NUM_PUBS + NUM_U256].iter().cloned());
+
+    let mut wots16_secret_keys = Vec::with_capacity(1 + NUM_HASH);
+    wots16_secret_keys.push(wots_secret_keys[1].clone());
+    wots16_secret_keys.extend(
+        wots_secret_keys[3 + NUM_PUBS + NUM_U256..3 + NUM_PUBS + NUM_U256 + NUM_HASH]
+            .iter()
+            .cloned(),
+    );
+
+    (wots32_secret_keys, wots16_secret_keys)
 }
 
 #[allow(deprecated)]
@@ -320,11 +376,10 @@ pub(crate) fn generate_bitvm_graph_inner(
     let n_of_n_taproot_public_key =
         XOnlyPublicKey::from(params.instance_parameters.committee_agg_pubkey);
     let watchtower_num = params.watchtower_pubkeys.len();
-    let assert_wots_pubkeys = (params.operator_wots_pubkeys.1, *params.operator_wots_pubkeys.2);
-    let assert_commit_connectors = generate_chunked_assert_commit_connectors(
+    let assert_commit_connectors = generate_mixed_chunked_assert_commit_connectors(
         network,
         &n_of_n_taproot_public_key,
-        assert_wots_pubkeys,
+        &params.operator_wots_pubkeys,
     );
     let assert_commit_num = assert_commit_connectors.len();
 
@@ -955,7 +1010,7 @@ pub fn operator_sign_assert_commit(
     operator_keypair: Keypair,
     graph: &mut Bitvm2Graph,
     wots_secret_keys: &OperatorWotsSecretKeys,
-    guest_inputs: [[u8; 32]; NUM_GUEST_PUBS_ASSERT],
+    guest_inputs: GuestInputs,
     proof: Groth16Proof,
     groth16_pubin: PublicInputs,
     vk: &VerifyingKey,
@@ -965,12 +1020,10 @@ pub fn operator_sign_assert_commit(
     if !is_valid_wots_secrets(wots_secret_keys, &graph.parameters.operator_wots_pubkeys) {
         bail!("provided WOTS secret keys do not match expected public keys".to_string())
     };
-    let assert_wots_pubkeys =
-        (graph.parameters.operator_wots_pubkeys.1, *graph.parameters.operator_wots_pubkeys.2);
-    let assert_commit_connectors = generate_chunked_assert_commit_connectors(
+    let assert_commit_connectors = generate_mixed_chunked_assert_commit_connectors(
         operator_context.network,
         &operator_context.n_of_n_taproot_public_key,
-        assert_wots_pubkeys,
+        &graph.parameters.operator_wots_pubkeys,
     );
     let mut assert_commit_inputs = vec![];
     for i in 0..assert_commit_connectors.len() {
@@ -981,24 +1034,72 @@ pub fn operator_sign_assert_commit(
         };
         assert_commit_inputs.push(input);
     }
-    let assert_assertions = (
-        guest_inputs,
-        generate_assertions(proof, groth16_pubin, vk)
-            .map_err(|e| anyhow::anyhow!("failed to generate assertions: {e}"))?,
-    );
-    match operator_commit_proof(
+    let proof_assertions = generate_assertions(proof, groth16_pubin, vk)
+        .map_err(|e| anyhow::anyhow!("failed to generate assertions: {e}"))?;
+    let txins = operator_commit_mixed_proof(
         &assert_commit_connectors,
-        &wots_secret_keys[1..].to_vec(),
+        wots_secret_keys,
         &assert_commit_inputs,
-        &assert_assertions,
-    ) {
-        Ok(txins) => Ok(txins
-            .into_iter()
-            .enumerate()
-            .map(|(i, txin)| (txin, assert_commit_inputs[i].amount))
-            .collect::<Vec<(TxIn, Amount)>>()),
-        Err(e) => bail!("failed to sign assert commit: {e}"),
+        guest_inputs,
+        proof_assertions,
+    )?;
+    Ok(txins
+        .into_iter()
+        .enumerate()
+        .map(|(i, txin)| (txin, assert_commit_inputs[i].amount))
+        .collect::<Vec<(TxIn, Amount)>>())
+}
+
+fn operator_commit_mixed_proof(
+    assert_commit_connectors: &[AssertCommitConnector],
+    wots_secret_keys: &OperatorWotsSecretKeys,
+    assert_commit_inputs: &[Input],
+    guest_inputs: GuestInputs,
+    proof_assertions: bitvm::chunk::api::Assertions,
+) -> Result<Vec<TxIn>> {
+    if assert_commit_connectors.len() != assert_commit_inputs.len() {
+        bail!("Mismatched number of AssertCommit connectors and inputs");
     }
+
+    let (wots32_secret_keys, wots16_secret_keys) = mixed_assert_wots_secrets(wots_secret_keys);
+    let mut wots32_values = Vec::with_capacity(1 + NUM_PUBS + NUM_U256);
+    wots32_values.push(guest_inputs.genesis_sequencer_commit_txid);
+    wots32_values.extend(proof_assertions.0);
+    wots32_values.extend(proof_assertions.1);
+
+    let mut wots16_values = Vec::with_capacity(1 + NUM_HASH);
+    wots16_values.push(guest_inputs.graph_id);
+    wots16_values.extend(proof_assertions.2);
+
+    let mut res = vec![];
+    let mut wots32_cursor = 0;
+    let mut wots16_cursor = 0;
+    for (i, acc) in assert_commit_connectors.iter().enumerate() {
+        let chunk32_len = acc.wots32_pubkeys.len();
+        let chunk16_len = acc.wots16_pubkeys.len();
+        let input_0_leaf = 0;
+        let mut txin = acc.generate_taproot_leaf_tx_in(input_0_leaf, &assert_commit_inputs[i]);
+
+        let unlock_data = acc
+            .generate_leaf_0_unlock_data(
+                &wots32_secret_keys[wots32_cursor..wots32_cursor + chunk32_len].to_vec(),
+                &wots16_secret_keys[wots16_cursor..wots16_cursor + chunk16_len].to_vec(),
+                &wots32_values[wots32_cursor..wots32_cursor + chunk32_len].to_vec(),
+                &wots16_values[wots16_cursor..wots16_cursor + chunk16_len].to_vec(),
+            )
+            .map_err(|e| anyhow::anyhow!("failed to sign mixed assert commit connector: {e}"))?;
+        populate_taproot_txin_witness(
+            &mut txin,
+            &acc.generate_taproot_spend_info(),
+            &acc.generate_taproot_leaf_script(0),
+            unlock_data,
+        );
+        wots32_cursor += chunk32_len;
+        wots16_cursor += chunk16_len;
+        res.push(txin);
+    }
+
+    Ok(res)
 }
 
 pub fn is_valid_wots_secrets(
@@ -1024,14 +1125,19 @@ pub fn is_valid_wots_secrets(
         idx += 1;
     }
 
-    // guest_assert (Wots32)
-    for expected in guest_assert_expected.iter() {
-        let generated = Wots32::generate_public_key(&wots_seckeys[idx]);
-        if &generated != expected {
-            return false;
-        }
-        idx += 1;
+    // guest_assert graph_id (Wots16)
+    let generated = Wots16::generate_public_key(&wots_seckeys[idx]);
+    if generated != guest_assert_expected.graph_id[0] {
+        return false;
     }
+    idx += 1;
+
+    // guest_assert genesis txid (Wots32)
+    let generated = Wots32::generate_public_key(&wots_seckeys[idx]);
+    if generated != guest_assert_expected.genesis_sequencer_commit_txid[0] {
+        return false;
+    }
+    idx += 1;
 
     // proof pubins (Wots32)
     for expected in proof_pubkeys.0.iter() {
@@ -1061,6 +1167,84 @@ pub fn is_valid_wots_secrets(
     }
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn wrapper_challenge_guest_values_bind_vk_raw_graph_and_genesis() {
+        let operator_vk_hash = [0x11u8; 32];
+        let graph_id = Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+        let genesis_txid = [0x33u8; 32];
+
+        let values = wrapper_challenge_guest_values(operator_vk_hash, graph_id, genesis_txid);
+
+        assert_eq!(values.operator_vk_hash, operator_vk_hash);
+        assert_eq!(values.graph_id, *graph_id.as_bytes());
+        assert_eq!(values.genesis_sequencer_commit_txid, genesis_txid);
+        assert_eq!(
+            values.public_values().to_vec(),
+            [operator_vk_hash.as_slice(), graph_id.as_bytes(), genesis_txid.as_slice()].concat()
+        );
+    }
+
+    #[test]
+    fn operator_wots_guest_assert_keys_use_wots16_for_graph_id() {
+        let (secrets, pubkeys) = generate_wots_keys("mixed-guest-wots");
+
+        assert_eq!(Wots32::generate_public_key(&secrets[0]), pubkeys.0[0]);
+        assert_eq!(Wots16::generate_public_key(&secrets[1]), pubkeys.1.graph_id[0]);
+        assert_eq!(
+            Wots32::generate_public_key(&secrets[2]),
+            pubkeys.1.genesis_sequencer_commit_txid[0]
+        );
+    }
+
+    #[test]
+    fn wrapper_guest_validation_binds_raw_graph_id() {
+        let (secrets, pubkeys) = generate_wots_keys("wrapper-guest-validation-raw-graph");
+        let operator_vk_hash = [0x55u8; 32];
+        let graph_id = Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
+        let genesis_txid = [0x77u8; 32];
+        let values = wrapper_challenge_guest_values(operator_vk_hash, graph_id, genesis_txid);
+        let lock_script = verify_wrapper_guest_pubin(
+            &pubkeys.0[0],
+            &pubkeys.1.graph_id[0],
+            &pubkeys.1.genesis_sequencer_commit_txid[0],
+            &pubkeys.2.0,
+            &values,
+            0,
+        )[0]
+        .clone();
+        let pubin_commitment = values.public_values_commitment();
+
+        let correct_script = script! {
+            { Wots32::sign_to_raw_witness(&secrets[3 + GUEST_PUBIN_COMMITMENT_INDEX], &pubin_commitment) }
+            { Wots32::sign_to_raw_witness(&secrets[0], &operator_vk_hash) }
+            { Wots16::sign_to_raw_witness(&secrets[1], graph_id.as_bytes()) }
+            { Wots32::sign_to_raw_witness(&secrets[2], &genesis_txid) }
+            { lock_script.clone() }
+        };
+        let correct_result = execute_script_without_stack_limit(correct_script);
+        assert!(!correct_result.success);
+        assert_eq!(correct_result.final_stack.len(), 1);
+
+        let mut wrong_graph_id = *graph_id.as_bytes();
+        wrong_graph_id[0] ^= 0xff;
+        let wrong_script = script! {
+            { Wots32::sign_to_raw_witness(&secrets[3 + GUEST_PUBIN_COMMITMENT_INDEX], &pubin_commitment) }
+            { Wots32::sign_to_raw_witness(&secrets[0], &operator_vk_hash) }
+            { Wots16::sign_to_raw_witness(&secrets[1], &wrong_graph_id) }
+            { Wots32::sign_to_raw_witness(&secrets[2], &genesis_txid) }
+            { lock_script }
+        };
+        let wrong_result = execute_script_without_stack_limit(wrong_script);
+        assert!(wrong_result.success);
+        assert_eq!(wrong_result.final_stack.len(), 1);
+    }
 }
 
 pub fn take1_timelock(network: Network) -> u32 {

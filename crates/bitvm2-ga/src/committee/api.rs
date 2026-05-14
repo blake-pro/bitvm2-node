@@ -1,9 +1,9 @@
 use crate::keys::hkdf_derive_bytes;
+use crate::operator::generate_mixed_chunked_assert_commit_connectors;
 use crate::types::Bitvm2Graph;
 use anyhow::{Result, bail};
 use bitcoin::{PublicKey, Transaction, XOnlyPublicKey};
 use bitcoin::{key::Keypair, taproot::Signature as TaprootSignature};
-use goat::connectors::assert_connectors::generate_chunked_assert_commit_connectors;
 use goat::connectors::connector_0::Connector0;
 use goat::connectors::connector_a::ConnectorA;
 use goat::connectors::connector_d::ConnectorD;
@@ -479,12 +479,10 @@ pub fn push_committee_pre_signatures(
             )
         })
         .collect::<Vec<WatchctowerConnectors>>();
-    let assert_wots_pubkeys =
-        (graph.parameters.operator_wots_pubkeys.1, *graph.parameters.operator_wots_pubkeys.2);
-    let assert_commit_connectors = generate_chunked_assert_commit_connectors(
+    let assert_commit_connectors = generate_mixed_chunked_assert_commit_connectors(
         network,
         &n_of_n_taproot_public_key,
-        assert_wots_pubkeys,
+        &graph.parameters.operator_wots_pubkeys,
     );
 
     // take1

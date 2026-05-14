@@ -253,7 +253,7 @@ bash run-operator-wrapper-proof.sh "data/operator-proof/output.bin" "data/operat
 * header-chain-input-proof: the header chain's proof, input and vk.
 * commit-chain-input-proof: the commit chain's proof, input and vk.
 * included-watchtower: a 256-bit bitmask; each bit flags a valid watchtower inside operator proof.
-* operator-wrapper-proof: wraps operator proof and exposes `operator_vk_hash_raw`, `graph_id_padded`, and `genesis_sequencer_commit_txid` as public inputs for Challenge.
+* operator-wrapper-proof: wraps operator proof and exposes `operator_vk_hash_raw`, raw 16-byte `graph_id`, and `genesis_sequencer_commit_txid` as public inputs for Challenge.
 * execution-layer-block-number: the block number that including `proceedWithdraw`(Peg-out) transaction of GOAT Network's execution layer(Geth).
 * watchtower-challenge-info: list of watchtower's challenge transaction id and compressed public key, i.e: [wachtower_info.json](./data/watchtower/watchtower_info.json).
 * watchtower-challenge-init-txid: the watchtower challenge init transaction id in GOAT's BitVM2 graph.

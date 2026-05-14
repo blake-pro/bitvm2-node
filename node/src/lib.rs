@@ -140,7 +140,7 @@ mod dbg {
             hashlocks,
             guest_constant_value: [3u8; 32],
             guest_operator_vk_hash: [0u8; 32],
-            guest_graph_id: [0u8; 32],
+            guest_graph_id: [0u8; 16],
             guest_genesis_sequencer_commit_txid: [0u8; 32],
         }
     }

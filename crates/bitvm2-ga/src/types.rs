@@ -8,7 +8,7 @@ use bitvm::chunk::api::{
     NUM_HASH, NUM_PUBS, NUM_U256, PublicKeys as ProofWotsPubkeys,
     Signatures as Groth16ProofSignatures,
 };
-use bitvm::signatures::{WinternitzSecret, Wots, Wots32};
+use bitvm::signatures::{WinternitzSecret, Wots, Wots16, Wots32};
 use goat::connectors::base::TaprootConnector;
 use goat::connectors::connector_0::Connector0;
 use goat::connectors::connector_e::ConnectorE;
@@ -16,9 +16,7 @@ use goat::connectors::connector_z::ConnectorZ;
 use goat::contexts::base::BaseContext;
 use goat::contexts::operator::OperatorContext;
 use goat::contexts::verifier::VerifierContext;
-use goat::disprove_scripts::{
-    GuestPubinSignatures, NUM_GUEST, NUM_GUEST_PUBS_ASSERT, NUM_GUEST_PUBS_EXTRA,
-};
+use goat::disprove_scripts::{GuestPubinSignatures, NUM_GUEST, NUM_GUEST_PUBS_EXTRA};
 use goat::transactions::assert::{AssertCommitTimeoutTransaction, AssertInitTransaction};
 use goat::transactions::base::Input;
 use goat::transactions::challenge::ChallengeTransaction;
@@ -48,16 +46,48 @@ use crate::operator::{generate_bitvm_graph_inner, push_operator_pre_signature};
 pub type VerifyingKey = ark_groth16::VerifyingKey<ark_bn254::Bn254>;
 pub type Groth16Proof = ark_groth16::Proof<ark_bn254::Bn254>;
 pub type PublicInputs = Vec<ark_bn254::Fr>;
-pub type GuestInputs = [[u8; 32]; NUM_GUEST_PUBS_ASSERT];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestInputs {
+    pub graph_id: [u8; 16],
+    pub genesis_sequencer_commit_txid: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WrapperChallengeGuestValues {
+    pub operator_vk_hash: [u8; 32],
+    pub graph_id: [u8; 16],
+    pub genesis_sequencer_commit_txid: [u8; 32],
+}
+
+impl WrapperChallengeGuestValues {
+    pub fn public_values(&self) -> [u8; bitcoin_light_client_circuit::WRAPPER_PUBLIC_VALUES_SIZE] {
+        bitcoin_light_client_circuit::wrapper_public_values(
+            self.operator_vk_hash,
+            self.graph_id,
+            self.genesis_sequencer_commit_txid,
+        )
+    }
+
+    pub fn public_values_commitment(&self) -> [u8; 32] {
+        use bitcoin::hashes::{Hash, sha256};
+        *sha256::Hash::hash(&self.public_values()).as_byte_array()
+    }
+}
 
 pub type OperatorWotsSignatures = (GuestPubinSignatures, Groth16ProofSignatures);
 
 const NUM_SIGS: usize = NUM_GUEST + NUM_PUBS + NUM_HASH + NUM_U256;
 pub type OperatorWotsSecretKeys = Box<[WinternitzSecret; NUM_SIGS]>;
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct OperatorGuestAssertWotsPublicKeys {
+    pub graph_id: [<Wots16 as Wots>::PublicKey; 1],
+    pub genesis_sequencer_commit_txid: [<Wots32 as Wots>::PublicKey; 1],
+}
+
 pub type OperatorWotsPublicKeys = (
     [<Wots32 as Wots>::PublicKey; NUM_GUEST_PUBS_EXTRA],
-    [<Wots32 as Wots>::PublicKey; NUM_GUEST_PUBS_ASSERT],
+    OperatorGuestAssertWotsPublicKeys,
     Box<ProofWotsPubkeys>,
 );
 
@@ -113,7 +143,7 @@ pub struct Bitvm2GraphParameters {
     #[serde(default)]
     pub guest_operator_vk_hash: [u8; 32],
     #[serde(default)]
-    pub guest_graph_id: [u8; 32],
+    pub guest_graph_id: [u8; 16],
     #[serde(default)]
     pub guest_genesis_sequencer_commit_txid: [u8; 32],
 }
@@ -495,10 +525,10 @@ pub mod node_serializer {
 
     pub mod wots_pubkeys {
         use super::*;
-        use crate::types::OperatorWotsPublicKeys;
+        use crate::types::{OperatorGuestAssertWotsPublicKeys, OperatorWotsPublicKeys};
         use bitvm::chunk::api::{NUM_HASH, NUM_PUBS, NUM_U256};
         use bitvm::signatures::{Wots, Wots16, Wots32};
-        use goat::disprove_scripts::{NUM_GUEST_PUBS_ASSERT, NUM_GUEST_PUBS_EXTRA};
+        use goat::disprove_scripts::NUM_GUEST_PUBS_EXTRA;
         use serde::de::Error as DeError;
         use serde::ser::SerializeSeq;
 
@@ -510,7 +540,8 @@ pub mod node_serializer {
             S: Serializer,
         {
             let total_len = pubkeys.0.len()
-                + pubkeys.1.len()
+                + pubkeys.1.graph_id.len()
+                + pubkeys.1.genesis_sequencer_commit_txid.len()
                 + pubkeys.2.0.len()
                 + pubkeys.2.1.len()
                 + pubkeys.2.2.len();
@@ -534,7 +565,10 @@ pub mod node_serializer {
             for pk in pubkeys.0.iter() {
                 push_pk::<_, Wots32>(&mut seq, pk)?;
             }
-            for pk in pubkeys.1.iter() {
+            for pk in pubkeys.1.graph_id.iter() {
+                push_pk::<_, Wots16>(&mut seq, pk)?;
+            }
+            for pk in pubkeys.1.genesis_sequencer_commit_txid.iter() {
                 push_pk::<_, Wots32>(&mut seq, pk)?;
             }
             for pk in pubkeys.2.0.iter() {
@@ -555,8 +589,7 @@ pub mod node_serializer {
             D: Deserializer<'de>,
         {
             let all: Vec<Vec<Vec<u8>>> = Vec::deserialize(deserializer)?;
-            let expected =
-                NUM_GUEST_PUBS_EXTRA + NUM_GUEST_PUBS_ASSERT + NUM_PUBS + NUM_U256 + NUM_HASH;
+            let expected = NUM_GUEST_PUBS_EXTRA + 2 + NUM_PUBS + NUM_U256 + NUM_HASH;
 
             if all.len() != expected {
                 return Err(D::Error::custom(format!(
@@ -618,12 +651,16 @@ pub mod node_serializer {
             )?;
             cursor += NUM_GUEST_PUBS_EXTRA;
 
-            let pk1 = extract_wots_pubkeys::<Wots32, NUM_GUEST_PUBS_ASSERT, D::Error>(
+            let guest_graph_id =
+                extract_wots_pubkeys::<Wots16, 1, D::Error>(&all, cursor, "guestpk.graph_id")?;
+            cursor += 1;
+
+            let guest_genesis = extract_wots_pubkeys::<Wots32, 1, D::Error>(
                 &all,
                 cursor,
-                "guestpk.assert",
+                "guestpk.genesis_sequencer_commit_txid",
             )?;
-            cursor += NUM_GUEST_PUBS_ASSERT;
+            cursor += 1;
 
             let pk20 =
                 extract_wots_pubkeys::<Wots32, NUM_PUBS, D::Error>(&all, cursor, "groth16pk.pub")?;
@@ -646,7 +683,14 @@ pub mod node_serializer {
                 Err(e) => return Err(e),
                 Ok(pk) => pk,
             };
-            Ok((pk0, pk1, Box::new((pk20, pk21, pk22))))
+            Ok((
+                pk0,
+                OperatorGuestAssertWotsPublicKeys {
+                    graph_id: guest_graph_id,
+                    genesis_sequencer_commit_txid: guest_genesis,
+                },
+                Box::new((pk20, pk21, pk22)),
+            ))
         }
     }
 }

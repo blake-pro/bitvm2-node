@@ -24,7 +24,7 @@ mod tests {
         },
         constants::CONNECTOR_Z_TIMELOCK,
         contexts::{base::generate_n_of_n_public_key, operator::OperatorContext},
-        disprove_scripts::{NUM_GUEST_PUBS_ASSERT, hash160},
+        disprove_scripts::hash160,
         scripts::generate_opreturn_script,
         transactions::{
             base::{BaseTransaction, DUST_AMOUNT, Input},
@@ -408,11 +408,10 @@ mod tests {
     }
 
     fn assert_commit_num() -> usize {
-        chunk_assert_commit(NUM_GUEST_PUBS_ASSERT + NUM_PUBS + NUM_U256, NUM_HASH, false).len()
+        chunk_assert_commit(1 + NUM_PUBS + NUM_U256, 1 + NUM_HASH, false).len()
     }
 
-    fn get_test_proof()
-    -> ([[u8; 32]; NUM_GUEST_PUBS_ASSERT], Groth16Proof, PublicInputs, VerifyingKey) {
+    fn get_test_proof() -> (GuestInputs, Groth16Proof, PublicInputs, VerifyingKey) {
         let proof = hex::decode(
             "b6ef2c5aa48a2f599a13bc4d8010e4d0190aeb05ff79e21266aff8dde6353d1756191f0959c787f6dedfc0c47751aed2648775101285b9da2d6c4e912e74891f884bd672f94f4d78528fb10b5410a94b53bcef07f99952ef72b68c72a5c4ff2a3de7c314ffbf17df018a753f070448c2f698706d4c2b99bdb06f928cffe1bea0",
         ).unwrap();
@@ -425,7 +424,8 @@ mod tests {
         let proof = goat::proof::deserialize_proof(proof);
         let pis = goat::proof::deserialize_pubin(pis);
         let vk = goat::proof::deserialize_vk(vk);
-        let guest_pubs = [[0xddu8; 32]; NUM_GUEST_PUBS_ASSERT];
+        let guest_pubs =
+            GuestInputs { graph_id: [0xddu8; 16], genesis_sequencer_commit_txid: [0xddu8; 32] };
         (guest_pubs, proof, pis, vk)
     }
 
@@ -565,7 +565,7 @@ mod tests {
             hashlocks: hashlocks().1.to_vec(),
             guest_constant_value: [0u8; 32], // all zero for test
             guest_operator_vk_hash: [0u8; 32],
-            guest_graph_id: [0u8; 32],
+            guest_graph_id: [0u8; 16],
             guest_genesis_sequencer_commit_txid: [0u8; 32],
         };
 
