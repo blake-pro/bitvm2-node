@@ -76,8 +76,8 @@ pub fn verify_operator_commits(
         extract_assert_commit_witness(operator_assert_commit_txins)?,
         preimages,
         guest_validation_scripts,
-        vk,
-        proof_validation_scripts,
+            vk,
+            proof_validation_scripts,
     );
     if let Some((_, scr)) = &res {
         let guest_index_opt = guest_validation_scripts.iter().position(|s| s == scr);

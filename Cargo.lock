@@ -9226,6 +9226,7 @@ dependencies = [
  "util",
  "uuid 1.23.0",
  "watchtower-proof",
+ "zkm-sdk",
 ]
 
 [[package]]

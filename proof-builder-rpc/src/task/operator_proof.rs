@@ -11,6 +11,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use util::hex_parse;
+use zkm_sdk::HashableKey;
 
 #[tracing::instrument(level = "info", skip(local_db, cancellation_token))]
 pub(crate) fn spawn_operator_proof_task(

@@ -462,7 +462,7 @@ impl ProofBuilder for OperatorProofBuilder {
         std::fs::write(&format!("{}.public_inputs.bin", output), proof.public_values.to_vec())?;
         std::fs::write(&format!("{}.vk_hash.bin", output), self.verifying_key.bytes32())?;
         std::fs::write(&format!("{}.zkm_version.bin", output), zkm_version)?;
-        let proof = bincode::serialize(&proof).unwrap();
+        let proof = bincode::serialize(&proof)?;
         std::fs::write(&format!("{}", output), proof)?;
         Ok((public_value_hex, proof_size))
     }

@@ -1,10 +1,7 @@
 use bitcoin::Network;
 use borsh::{BorshDeserialize, BorshSerialize};
 use client::btc_chain::BTCClient;
-use header_chain::{
-    BlockHeaderCircuitOutput, ChainState, CircuitBlockHeader, HeaderChainCircuitInput,
-    HeaderChainPrevProofType,
-};
+use header_chain::{CircuitBlockHeader, HeaderChainCircuitInput, HeaderChainPrevProofType};
 use proof_builder::{LongRunning, ProofBuilder, ProofRequest};
 use sha2::{Digest, Sha256};
 use std::{

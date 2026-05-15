@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 use std::str::FromStr;
 use strum::{Display, EnumString};
 use tracing::{info, warn};
+use util::hex_parse;
 use zeroize::Zeroizing;
 
 pub const ENV_BTC_CHAIN_URL: &str = "BTC_CHAIN_URL";
@@ -76,6 +77,7 @@ pub const ENV_GOAT_NETWORK: &str = "GOAT_NETWORK";
 
 pub const ENV_WATCHTOWER_PROOF_WAIT_SECS: &str = "WATCHTOWER_PROOF_WAIT_SECS";
 pub const ENV_OPERATOR_PROOF_WAIT_SECS: &str = "OPERATOR_PROOF_WAIT_SECS";
+pub const ENV_OPERATOR_VK_HASH: &str = "OPERATOR_VK_HASH";
 pub const DEFAULT_WATCHTOWER_PROOF_WAIT_SECS: usize = 60;
 pub const DEFAULT_OPERATOR_PROOF_WAIT_SECS: usize = 60;
 
@@ -555,6 +557,12 @@ pub fn get_operator_proof_wait_secs() -> usize {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(DEFAULT_OPERATOR_PROOF_WAIT_SECS)
+}
+
+pub fn get_operator_vk_hash() -> anyhow::Result<[u8; 32]> {
+    let value = std::env::var(ENV_OPERATOR_VK_HASH)
+        .map_err(|_| anyhow::anyhow!("{ENV_OPERATOR_VK_HASH} needs to be set"))?;
+    hex_parse::<32>(&value).map_err(|err| anyhow::anyhow!("invalid {ENV_OPERATOR_VK_HASH}: {err}"))
 }
 
 pub fn get_instance_maintenance_batch_size() -> u32 {

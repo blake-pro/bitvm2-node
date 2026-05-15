@@ -78,7 +78,7 @@ pub fn wots_secrets_to_pubkeys(secrets: &OperatorWotsSecretKeys) -> OperatorWots
     let mut guest_assert = vec![];
     for _ in 0..NUM_GUEST_PUBS_ASSERT {
         guest_assert.push(Wots32::generate_public_key(&secrets[index]));
-        index += 1;
+    index += 1;
     }
 
     let mut pubins = vec![];
@@ -107,9 +107,9 @@ pub fn wots_seed_to_secrets(seed: &str) -> OperatorWotsSecretKeys {
     let seed_bytes = seed.as_bytes();
     let wot32_seckeys = (0..NUM_GUEST + NUM_PUBS + NUM_U256)
         .map(|idx| {
-            let sec_i = hex_encode(hkdf_derive_bytes(
-                seed_bytes,
-                OPERATOR_WOTS_HKDF_SALT,
+        let sec_i = hex_encode(hkdf_derive_bytes(
+            seed_bytes,
+            OPERATOR_WOTS_HKDF_SALT,
                 format!("wots32/{idx}").as_bytes(),
                 32,
             ));
@@ -123,8 +123,8 @@ pub fn wots_seed_to_secrets(seed: &str) -> OperatorWotsSecretKeys {
                 seed_bytes,
                 OPERATOR_WOTS_HKDF_SALT,
                 format!("wots16/{idx}").as_bytes(),
-                32,
-            ));
+            32,
+        ));
             let sec_str = format!("{sec_i}{:04x}{:04x}", 0, idx);
             Wots16::secret_from_str(&sec_str)
         })
@@ -884,9 +884,9 @@ pub fn operator_sign_assert_commit(
         &assert_assertions,
     ) {
         Ok(txins) => Ok(txins
-            .into_iter()
-            .enumerate()
-            .map(|(i, txin)| (txin, assert_commit_inputs[i].amount))
+        .into_iter()
+        .enumerate()
+        .map(|(i, txin)| (txin, assert_commit_inputs[i].amount))
             .collect::<Vec<(TxIn, Amount)>>()),
         Err(e) => bail!("failed to sign assert commit: {e}"),
     }
@@ -917,11 +917,11 @@ pub fn is_valid_wots_secrets(
 
     // guest_assert (Wots32)
     for expected in guest_assert_expected.iter() {
-        let generated = Wots32::generate_public_key(&wots_seckeys[idx]);
+    let generated = Wots32::generate_public_key(&wots_seckeys[idx]);
         if &generated != expected {
-            return false;
-        }
-        idx += 1;
+        return false;
+    }
+    idx += 1;
     }
 
     // proof pubins (Wots32)
