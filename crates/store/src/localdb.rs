@@ -3002,7 +3002,8 @@ impl<'a> StorageProcessor<'a> {
             "SELECT *
                   FROM watchtower_proof
                   WHERE instance_id = ?
-                    AND graph_id = ?",
+                    AND graph_id = ?
+                  ORDER BY node_index ASC",
         )
         .bind(instance_id)
         .bind(graph_id)

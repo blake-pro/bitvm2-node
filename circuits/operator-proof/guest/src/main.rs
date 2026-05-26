@@ -8,9 +8,11 @@ use header_chain::{HeaderChainCircuitInput, SPV};
 use state_chain::StateChainCircuitInput;
 use std::str::FromStr;
 
+include!(concat!(env!("OUT_DIR"), "/fixed_watchtowers.rs"));
+
 pub fn main() {
     // calculate operator public input:  https://github.com/ProjectZKM/Ziren/blob/main/crates/sdk/src/utils.rs#L42
-    let included_watchertowers: U256 = zkm_zkvm::io::read::<U256>();
+    let included_watchtowers: U256 = zkm_zkvm::io::read::<U256>();
     let graph_id: [u8; 16] = zkm_zkvm::io::read::<[u8; 16]>();
     let operator_genesis_sequencer_commit_txid: [u8; 32] = zkm_zkvm::io::read();
     println!("read operator commit txn");
@@ -31,13 +33,14 @@ pub fn main() {
 
     let (btc_best_block_hash, constant, included_watchtowers, operator_vk_hash) =
         bitcoin_light_client_circuit::propose_longest_chain(
-            included_watchertowers,
+            included_watchtowers,
             graph_id,
             operator_genesis_sequencer_commit_txid,
             watchtower_challenge_txns,
             watchtower_challenge_txn_pubkey,
             watchtower_challenge_txn_scripts,
             watchtower_challenge_txn_prev_outs,
+            &FIXED_WATCHTOWER_XONLY_PUBLIC_KEYS,
             operator_header_chain,
             operator_commit_chain,
             operator_state_chain,

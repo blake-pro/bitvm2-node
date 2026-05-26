@@ -19,7 +19,10 @@ use header_chain::{
 use state_chain::{StateChainCircuitInput, StateChainPrevProofType};
 use zkm_primitives::io::ZKMPublicValues;
 
-use bitcoin::{ScriptBuf, Transaction, TxOut, Txid, secp256k1::PublicKey};
+use bitcoin::{
+    ScriptBuf, Transaction, TxOut, Txid,
+    secp256k1::{PublicKey, XOnlyPublicKey},
+};
 pub use guest_executor::io::EthClientExecutorInput;
 use serde::{Deserialize, Serialize};
 use verifier::verify_groth16_proof;
@@ -184,6 +187,27 @@ pub fn le_bits_to_u256(bits: &[bool]) -> U256 {
     u
 }
 
+pub fn verify_fixed_watchtower_pubkey(
+    fixed_watchtower_xonly_public_keys: &[[u8; 32]],
+    index: usize,
+    pubkey: &PublicKey,
+) -> Result<(), String> {
+    // The fixed list is order-sensitive: index must match graph watchtower_pubkeys/node_index.
+    let Some(expected) = fixed_watchtower_xonly_public_keys.get(index) else {
+        return Err(format!("watchtower index {index} exceeds fixed watchtower list"));
+    };
+    let xonly: XOnlyPublicKey = (*pubkey).into();
+    let actual = xonly.serialize();
+    if &actual != expected {
+        return Err(format!(
+            "watchtower[{index}] pubkey mismatch: actual={}, expected={}",
+            hex::encode(actual),
+            hex::encode(expected)
+        ));
+    }
+    Ok(())
+}
+
 // calculate operator public input:  https://github.com/ProjectZKM/Ziren/blob/main/crates/sdk/src/utils.rs#L42
 #[allow(clippy::too_many_arguments)]
 pub fn propose_longest_chain(
@@ -195,6 +219,7 @@ pub fn propose_longest_chain(
     watchtower_challenge_txn_pubkey: Vec<PublicKey>,
     watchtower_challenge_txn_scripts: Vec<ScriptBuf>,
     watchtower_challenge_txn_prev_outs: Vec<TxOut>,
+    fixed_watchtower_xonly_public_keys: &[[u8; 32]],
 
     operator_header_chain: HeaderChainCircuitInput,
     commit_chain: CommitChainCircuitInput,
@@ -249,21 +274,45 @@ pub fn propose_longest_chain(
     assert!(spv_ss_commit.verify(&btc_header_chain_output.chain_state.block_hashes_mmr));
 
     // parse included_watchtowers into bits array
-    let included_watchertowers_bits = u256_to_le_bits(included_watchtowers);
-    println!("included watchtowers:{included_watchertowers_bits:?}");
+    let included_watchtowers_bits = u256_to_le_bits(included_watchtowers);
+    println!("included watchtowers:{included_watchtowers_bits:?}");
+
+    let mut valid_included_watchtower_count = 0usize;
     // For each watchtowers, if the included_watchtowers[i] is true,
     //   verify the watchtower_challenge_txns[i] is valid
     //   verify watchtower_challenge_txns[i].total_work <= operator_header_chain.total_work
     //   verify watchtower_challenge_txns[i].epoch <= operator_latest_sequencer_commit_tx.epoch
     for i in 0..watchtower_challenge_txns.len() {
-        if included_watchertowers_bits[i] {
+        if included_watchtowers_bits[i] {
             let tx = &watchtower_challenge_txns[i];
             println!("Verify watchtower[{i}] tx: {}, {:?}", tx.compute_txid(), tx);
             let prev_out = &watchtower_challenge_txn_prev_outs[i];
             let prev_index = tx.input[0].previous_output.vout as usize;
             let pubkey = &watchtower_challenge_txn_pubkey[i];
 
-            let sig = bitcoin::taproot::Signature::from_slice(&tx.input[0].witness[0]).unwrap();
+            if let Err(err) =
+                verify_fixed_watchtower_pubkey(fixed_watchtower_xonly_public_keys, i, pubkey)
+            {
+                println!("Watchtower[{i}] fixed pubkey verification: {err}");
+                continue;
+            }
+
+            let sig = match tx
+                .input
+                .first()
+                .and_then(|input| input.witness.iter().next())
+                .map(|sig| bitcoin::taproot::Signature::from_slice(sig))
+            {
+                Some(Ok(sig)) => sig,
+                Some(Err(err)) => {
+                    println!("Watchtower[{i}] invalid taproot signature: {err}");
+                    continue;
+                }
+                None => {
+                    println!("Watchtower[{i}] missing taproot signature");
+                    continue;
+                }
+            };
             // check tx signature is valid
             match verify_taproot_leaf_schnorr_signature(
                 &watchtower_challenge_txn_scripts[i],
@@ -328,20 +377,25 @@ pub fn propose_longest_chain(
             );
             println!("operator_consensus_block_height : {operator_consensus_block_height:?}");
 
-            assert!(
-                U256::from_be_bytes(watchtower_total_work)
-                    <= U256::from_be_bytes(operator_total_work)
-            );
+            if U256::from_be_bytes(watchtower_total_work) > U256::from_be_bytes(operator_total_work)
+            {
+                println!("Watchtower[{i}] total work exceeds operator total work");
+                continue;
+            }
             // check watchtower.consensus.block_height <= consensus.block_height
-            assert!(
-                U32::from_le_bytes(watchtower_consensus_block_height)
-                    <= operator_consensus_block_height
-            );
+            if U32::from_le_bytes(watchtower_consensus_block_height)
+                > operator_consensus_block_height
+            {
+                println!("Watchtower[{i}] consensus block height exceeds operator block height");
+                continue;
+            }
+
+            valid_included_watchtower_count += 1;
         }
     }
+    assert!(valid_included_watchtower_count > 0, "no included watchtower passed verification");
 
     println!("verify el block");
-
     verify_groth16_proof(
         &state_chain.zkm_proof,
         &state_chain.zkm_public_values,
