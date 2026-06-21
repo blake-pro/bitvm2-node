@@ -578,11 +578,8 @@ impl From<GraphQueryParams> for GraphQuery {
         }
         let (_, from_addr) = reflect_goat_address(value.from_addr.clone());
 
-        let mut is_init_withdraw_not_null = value
-            .status
-            .as_ref()
-            .map(|status| status == &GraphStatus::OperatorKickOffing.to_string())
-            .unwrap_or(false);
+        let mut is_init_withdraw_not_null =
+            value.status.as_ref().map(|status| status == "OperatorKickOffing").unwrap_or(false);
         is_init_withdraw_not_null = is_init_withdraw_not_null || value.is_pegout_started;
         let mut statuses = vec![];
         if let Some(status) = value.status {
@@ -759,28 +756,28 @@ trait DisplayStatusConvert {
 impl DisplayStatusConvert for Graph {
     fn convert_to_display_status(&self) -> String {
         match GraphStatus::from_str(&self.status) {
-            Ok(GraphStatus::OperatorPresigned) => GraphStatus::Created.to_string(),
-            Ok(GraphStatus::CommitteePresigned) => GraphStatus::Presigned.to_string(),
+            Ok(GraphStatus::OperatorPresigned) => "Created".to_string(),
+            Ok(GraphStatus::CommitteePresigned) => "Presigned".to_string(),
             Ok(GraphStatus::OperatorDataPushed) => {
                 if self.init_withdraw_tx_hash.is_some() {
-                    GraphStatus::OperatorKickOffing.to_string()
+                    "OperatorKickOffing".to_string()
                 } else {
-                    GraphStatus::L2Recorded.to_string()
+                    "L2Recorded".to_string()
                 }
             }
             Ok(_) | Err(_) => self.status.clone(),
         }
     }
     fn parse_display_status(ori_status: &str) -> Vec<String> {
-        match GraphStatus::from_str(ori_status) {
-            Ok(GraphStatus::Created) => vec![GraphStatus::OperatorPresigned.to_string()],
-            Ok(GraphStatus::Presigned) => vec![GraphStatus::CommitteePresigned.to_string()],
-            Ok(GraphStatus::L2Recorded) => vec![GraphStatus::OperatorDataPushed.to_string()],
-            Ok(GraphStatus::OperatorKickOffing) => {
+        match ori_status {
+            "Created" => vec![GraphStatus::OperatorPresigned.to_string()],
+            "Presigned" => vec![GraphStatus::CommitteePresigned.to_string()],
+            "L2Recorded" | "OperatorKickOffing" => {
                 vec![GraphStatus::OperatorDataPushed.to_string()]
             }
-            Ok(v) => vec![v.to_string()],
-            Err(_) => vec![],
+            _ => GraphStatus::from_str(ori_status)
+                .map(|status| vec![status.to_string()])
+                .unwrap_or_default(),
         }
     }
 }

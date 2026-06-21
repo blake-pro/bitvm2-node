@@ -273,105 +273,8 @@ pub struct BridgeOutGlobalStats {
     pub updated_at: i64,
 }
 
-/// graph status
-#[derive(
-    Copy, Clone, Debug, Serialize, Deserialize, Default, Eq, PartialEq, Display, EnumString,
-)]
-pub enum GraphStatus {
-    #[default]
-    OperatorPresigned,
-    CommitteePresigned,
-    OperatorDataPushed,
-    PreKickoff,
-    OperatorKickOff,
-    Challenge,
-    Disprove,
-    Obsoleted, // reimbursement by other operators
-    Skipped,
-    OperatorTake1,
-    OperatorTake2,
-
-    /// frontend use only
-    Created,
-    Presigned,
-    L2Recorded,
-    OperatorKickOffing,
-    Challenging,
-    Disproving,
-}
-
-impl GraphStatus {
-    pub fn get_closed_status() -> Vec<GraphStatus> {
-        vec![
-            GraphStatus::OperatorTake1,
-            GraphStatus::OperatorTake2,
-            GraphStatus::Skipped,
-            GraphStatus::Disprove,
-        ]
-    }
-    pub fn get_pegin_finalized_status() -> GraphStatus {
-        GraphStatus::OperatorDataPushed
-    }
-
-    pub fn get_pegout_started_status() -> Vec<GraphStatus> {
-        vec![GraphStatus::OperatorKickOff, GraphStatus::Challenge]
-    }
-
-    pub fn is_pegin_finalized(&self) -> bool {
-        GraphStatus::get_pegin_finalized_status().eq(self)
-    }
-    pub fn is_pegout_started(&self) -> bool {
-        GraphStatus::get_pegout_started_status().contains(self)
-    }
-    pub fn is_closed(&self) -> bool {
-        GraphStatus::get_closed_status().contains(self)
-    }
-    pub fn is_obsoleted(&self) -> bool {
-        self.eq(&GraphStatus::Obsoleted)
-    }
-    pub fn get_previous_status(&self) -> Option<GraphStatus> {
-        match self {
-            GraphStatus::OperatorPresigned => None,
-            GraphStatus::CommitteePresigned => Some(GraphStatus::OperatorPresigned),
-            GraphStatus::OperatorDataPushed => Some(GraphStatus::CommitteePresigned),
-            GraphStatus::PreKickoff => Some(GraphStatus::OperatorDataPushed),
-            GraphStatus::Skipped => Some(GraphStatus::OperatorDataPushed),
-            GraphStatus::Obsoleted => Some(GraphStatus::OperatorDataPushed),
-            GraphStatus::OperatorKickOff => Some(GraphStatus::PreKickoff),
-            GraphStatus::OperatorTake1 => Some(GraphStatus::OperatorKickOff),
-            GraphStatus::Challenge => Some(GraphStatus::OperatorKickOff),
-            GraphStatus::Disprove => Some(GraphStatus::Challenge),
-            GraphStatus::OperatorTake2 => Some(GraphStatus::Challenge),
-            // frontend use only
-            GraphStatus::Created => None,
-            GraphStatus::Presigned => Some(GraphStatus::Created),
-            GraphStatus::L2Recorded => Some(GraphStatus::Presigned),
-            GraphStatus::OperatorKickOffing => Some(GraphStatus::L2Recorded),
-            GraphStatus::Challenging => Some(GraphStatus::OperatorKickOffing),
-            GraphStatus::Disproving => Some(GraphStatus::Challenging),
-        }
-    }
-    pub fn is_before(&self, other: &GraphStatus) -> bool {
-        let mut current = *other;
-        while let Some(prev) = current.get_previous_status() {
-            if &prev == self {
-                return true;
-            }
-            current = prev;
-        }
-        false
-    }
-    pub fn is_after(&self, other: &GraphStatus) -> bool {
-        let mut current = *self;
-        while let Some(prev) = current.get_previous_status() {
-            if &prev == other {
-                return true;
-            }
-            current = prev;
-        }
-        false
-    }
-}
+/// Canonical protocol status; database display strings remain unchanged.
+pub use protocol_model::GraphStatus;
 
 /// graph detail
 #[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
@@ -792,17 +695,16 @@ mod tests {
 
     #[test]
     fn test_graph_status_from_str() {
-        assert_eq!(GraphStatus::from_str("Created").unwrap(), GraphStatus::Created);
         assert_eq!(
             GraphStatus::from_str("OperatorPresigned").unwrap(),
             GraphStatus::OperatorPresigned
         );
+        assert!(GraphStatus::from_str("Created").is_err());
         assert!(GraphStatus::from_str("Invalid").is_err());
     }
 
     #[test]
     fn test_graph_status_display() {
-        assert_eq!(GraphStatus::Created.to_string(), "Created");
         assert_eq!(GraphStatus::OperatorPresigned.to_string(), "OperatorPresigned");
     }
 

@@ -94,6 +94,9 @@ use proof_builder::{
     WatchtowerProofResponse, WatchtowerProofTimeoutUpdateRequest,
     WatchtowerProofTimeoutUpdateResponse, WrapperProofResponse,
 };
+use protocol_model::{
+    GraphKey as ModelGraphKey, GraphObservation, ProtocolState, SpendKind, derive_graph_status,
+};
 use store::{
     BridgeOutGlobalStats, ByteArray32, Graph, GraphRawData, GraphStatus, Instance,
     InstanceBridgeInStatus, Message, MessageState, MessageType, Node, PeginGraphProcessData,
@@ -950,7 +953,7 @@ async fn detect_connector_d_disprove(
     }))
 }
 
-async fn scan_graph_chain_state(
+async fn collect_graph_chain_state(
     btc_client: &BTCClient,
     goat_client: &GOATClient,
     graph: &BitvmGcGraph,
@@ -1277,6 +1280,90 @@ async fn scan_graph_chain_state(
         operator_assert_on_chain,
         disprove: None,
     })
+}
+
+/// Converts the collected graph and scan result into reducer input facts.
+fn observation_from_chain_scan(graph: &BitvmGcGraph, scan: &GraphChainScan) -> GraphObservation {
+    let status = scan.status;
+    let committee_pre_signed = status != GraphStatus::OperatorPresigned;
+    let goat_graph_recorded =
+        !matches!(status, GraphStatus::OperatorPresigned | GraphStatus::CommitteePresigned);
+    let prekickoff_confirmed = matches!(
+        status,
+        GraphStatus::PreKickoff
+            | GraphStatus::OperatorKickOff
+            | GraphStatus::Challenge
+            | GraphStatus::Disprove
+            | GraphStatus::Skipped
+            | GraphStatus::OperatorTake1
+            | GraphStatus::OperatorTake2
+    );
+    let prekickoff_spend = match status {
+        GraphStatus::Skipped => SpendKind::Other,
+        GraphStatus::OperatorKickOff
+        | GraphStatus::Challenge
+        | GraphStatus::Disprove
+        | GraphStatus::OperatorTake1
+        | GraphStatus::OperatorTake2 => SpendKind::Expected,
+        _ => SpendKind::Unspent,
+    };
+    let connector_a_spend = match status {
+        GraphStatus::OperatorTake1 => SpendKind::Expected,
+        GraphStatus::Challenge | GraphStatus::OperatorTake2 => SpendKind::Other,
+        GraphStatus::Disprove if scan.challenge_txid.is_some() => SpendKind::Other,
+        _ => SpendKind::Unspent,
+    };
+    let connector_d_spend = match status {
+        GraphStatus::OperatorTake2 => SpendKind::Expected,
+        GraphStatus::Disprove if scan.challenge_txid.is_some() => SpendKind::Other,
+        _ => SpendKind::Unspent,
+    };
+    GraphObservation {
+        key: ModelGraphKey::new(
+            graph.parameters.instance_parameters.instance_id.to_string(),
+            graph.parameters.graph_id.to_string(),
+            graph.parameters.graph_nonce,
+        ),
+        committee_pre_signed,
+        goat_graph_recorded,
+        goat_graph_obsoleted: status == GraphStatus::Obsoleted,
+        prekickoff_confirmed,
+        prekickoff_spend,
+        guardian_disprove: status == GraphStatus::Disprove && scan.challenge_txid.is_none(),
+        connector_a_spend,
+        take1_timelock_satisfied: status == GraphStatus::OperatorTake1,
+        challenge_confirmed: scan.challenge_txid.is_some()
+            || matches!(status, GraphStatus::Challenge | GraphStatus::OperatorTake2),
+        operator_proof_valid: status == GraphStatus::OperatorTake2,
+        connector_d_spend,
+        verifier_disprove: status == GraphStatus::Disprove && scan.challenge_txid.is_some(),
+        take2_confirmed: status == GraphStatus::OperatorTake2,
+        take2_timelock_satisfied: status == GraphStatus::OperatorTake2,
+    }
+}
+
+/// Collects external chain state and makes the pure reducer authoritative for the result.
+async fn scan_graph_chain_state(
+    btc_client: &BTCClient,
+    goat_client: &GOATClient,
+    graph: &BitvmGcGraph,
+    scan_from_status: Option<GraphStatus>,
+    scan_from_sub_status: Option<ChallengeSubStatus>,
+) -> Result<GraphChainScan> {
+    let mut scan = collect_graph_chain_state(
+        btc_client,
+        goat_client,
+        graph,
+        scan_from_status,
+        scan_from_sub_status,
+    )
+    .await?;
+    let observation = observation_from_chain_scan(graph, &scan);
+    let state =
+        ProtocolState::new(1).with_graph(observation.key.clone(), GraphStatus::OperatorPresigned);
+    scan.status = derive_graph_status(&state, &observation)
+        .map_err(|error| anyhow!("pure graph status derivation rejected chain facts: {error}"))?;
+    Ok(scan)
 }
 
 #[allow(clippy::enum_variant_names)]

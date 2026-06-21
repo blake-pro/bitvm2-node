@@ -9,6 +9,7 @@ members = [
     "proof-builder-rpc",
     "crates/cbft-rpc",
     "crates/bitvm-gc",
+    "crates/protocol-model",
     "crates/store",
     "crates/client",
     "crates/util",
@@ -126,6 +127,7 @@ operator-proof = { path = "circuits/operator-proof/host" }
 operator-wrapper-proof = { path = "circuits/operator-wrapper-proof/host" }
 watchtower-proof = { path = "circuits/watchtower-proof/host" }
 proof-builder = { path = "circuits/proof-builder" }
+protocol-model = { path = "crates/protocol-model" }
 
 chrono = "0.4.39"
 tracing = { version = "0.1.40", default-features = false }
