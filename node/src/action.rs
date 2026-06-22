@@ -12,8 +12,8 @@ use anyhow::{Context, Result, anyhow};
 use bitcoin::{PublicKey, Txid};
 use bitvm_lib::actors::Actor;
 use bitvm_lib::babe_adapter::{
-    BabeAssertWitness, BabeBundleBuilder, BabeChallengeAssertWitness, BabeWronglyChallengedWitness,
-    CACSetupPackage,
+    BabeBundleBuilder, BabeChallengeAssertWitness, BabeWronglyChallengedWitness, CACSetupPackage,
+    TxAssertWitness,
 };
 use bitvm_lib::committee::*;
 use bitvm_lib::types::{BitvmGcGraph, SimplifiedBitvmGcGraph};
@@ -245,7 +245,7 @@ pub struct AssertSent {
     pub instance_id: Uuid,
     pub graph_id: Uuid,
     pub assert_txid: Txid,
-    pub assert_witness: Option<BabeAssertWitness>,
+    pub assert_witness: Option<TxAssertWitness>,
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ChallengeAssertSent {

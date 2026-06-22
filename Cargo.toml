@@ -23,7 +23,6 @@ members = [
     "circuits/state-chain-proof/host",
     "circuits/watchtower-proof/host",
     "circuits/operator-proof/host",
-    "circuits/operator-wrapper-proof/host",
     "circuits/proof-builder",
 ]
 default-members = ["node"]
@@ -107,9 +106,9 @@ p3-field = { git = "https://github.com/ProjectZKM/Plonky3" }
 #zkm-verifier = { path = "../Ziren/crates/verifier" }
 
 bitvm-lib = { package = "bitvm-gc", path = "crates/bitvm-gc" }
-verifiable-circuit-babe = { git = "https://github.com/GOATNetwork/bitvm2-gc", branch = "feat/babe" }
-garbled-snark-verifier = { git = "https://github.com/GOATNetwork/bitvm2-gc", branch = "feat/babe" }
-soldering-host = { git = "https://github.com/GOATNetwork/bitvm2-gc", branch = "feat/babe" }
+verifiable-circuit-babe = { git = "https://github.com/GOATNetwork/bitvm2-gc", branch = "feat/goat-bitvm3" }
+garbled-snark-verifier = { git = "https://github.com/GOATNetwork/bitvm2-gc", branch = "feat/goat-bitvm3" }
+soldering-host = { git = "https://github.com/GOATNetwork/bitvm2-gc", branch = "feat/goat-bitvm3" }
 store = { path = "crates/store" }
 util = { path = "crates/util" }
 client = { path = "crates/client" }
@@ -123,7 +122,6 @@ state-chain = { path = "crates/state-chain" }
 verifier = { path = "crates/verifier" }
 state-chain-proof = { path = "circuits/state-chain-proof/host" }
 operator-proof = { path = "circuits/operator-proof/host" }
-operator-wrapper-proof = { path = "circuits/operator-wrapper-proof/host" }
 watchtower-proof = { path = "circuits/watchtower-proof/host" }
 proof-builder = { path = "circuits/proof-builder" }
 

@@ -68,13 +68,6 @@ pub enum ProofRequest {
         watchtower_challenge_txn_pubkeys: Vec<bitcoin::secp256k1::PublicKey>,
         watchtower_challenge_txn_scripts: Vec<ScriptBuf>,
     },
-    WrapperProofRequest {
-        operator_proof_id: i64,
-        operator_input_proof: String,
-        graph_id: [u8; 16],
-        genesis_sequencer_commit_txid: String,
-        output: String,
-    },
 }
 
 #[derive(Error, Debug, Clone)]
@@ -140,7 +133,6 @@ pub enum ProofType {
     StateChain,
     Operator,
     Watchtower,
-    Wrapper,
 }
 
 const HEADER_CHAIN_NAME: &str = "header-chain";
@@ -148,7 +140,6 @@ const COMMIT_CHAIN_NAME: &str = "commit-chain";
 const STATE_CHAIN_NAME: &str = "state-chain";
 const OPERATOR_NAME: &str = "operator";
 const WATCHTOWER_NAME: &str = "watchtower";
-const WRAPPER_NAME: &str = "wrapper";
 impl ProofType {
     pub fn get_chain_name(&self) -> &'static str {
         match self {
@@ -157,7 +148,6 @@ impl ProofType {
             ProofType::StateChain => STATE_CHAIN_NAME,
             ProofType::Operator => OPERATOR_NAME,
             ProofType::Watchtower => WATCHTOWER_NAME,
-            ProofType::Wrapper => WRAPPER_NAME,
         }
     }
 }
@@ -190,14 +180,6 @@ pub struct ProofDesc {
 pub struct OperatorProofDescRequest {
     pub instance_id: String,
     pub graph_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct WrapperProofDescRequest {
-    pub operator_proof_id: Option<i64>,
-    pub instance_id: Option<String>,
-    pub graph_id: Option<String>,
-    pub genesis_sequencer_commit_txid: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -234,8 +216,7 @@ impl ProofData {
             | ProofType::CommitChain
             | ProofType::StateChain
             | ProofType::Watchtower
-            | ProofType::Operator
-            | ProofType::Wrapper => {
+            | ProofType::Operator => {
                 proof_data.proof = fs::read(path).unwrap_or_default();
                 proof_data.public_inputs =
                     fs::read(format!("{path}.public_inputs.bin")).unwrap_or_default();
@@ -255,35 +236,6 @@ impl ProofData {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OperatorProofResponse {
     pub proof_data: Option<ProofData>,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Default)]
-pub struct WrapperProofMetadata {
-    pub id: i64,
-    pub operator_proof_id: i64,
-    pub instance_id: String,
-    pub graph_id: String,
-    pub operator_path_to_proof: String,
-    pub path_to_proof: Option<String>,
-    pub public_value_hex: Option<String>,
-    pub operator_vk_hash: String,
-    pub genesis_sequencer_commit_txid: String,
-    pub operator_public_value_hex: Option<String>,
-    pub proof_state: i64,
-    pub proof_size: i64,
-    pub cycles: i64,
-    pub total_time_to_proof: i64,
-    pub proving_time: i64,
-    pub zkm_version: String,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct WrapperProofResponse {
-    pub proof_data: Option<ProofData>,
-    pub metadata: Option<WrapperProofMetadata>,
     pub error: Option<String>,
 }
 
