@@ -9,6 +9,7 @@ use libp2p::gossipsub::MessageId;
 use libp2p::multiaddr::Protocol;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, Swarm, gossipsub, kad, noise, tcp, yamux};
+use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use std::collections::HashMap;
 
@@ -105,12 +106,19 @@ pub struct BitvmNetworkManager {
     config: BitvmSwarmConfig,
     peer_id: PeerId,
     swarm: BitvmSwarmWrapper,
+    connected_peers: Gauge,
 }
 impl BitvmNetworkManager {
     pub fn new(
         config: BitvmSwarmConfig,
         metric_registry: &mut Registry,
     ) -> anyhow::Result<BitvmNetworkManager> {
+        let connected_peers = Gauge::default();
+        metric_registry.register(
+            "bitvm_node_p2p_connected_peers",
+            "Number of currently connected P2P peers",
+            connected_peers.clone(),
+        );
         let key_pair = libp2p::identity::Keypair::from_protobuf_encoding(&Zeroizing::new(
             base64::engine::general_purpose::STANDARD.decode(config.local_key.clone())?,
         ))?;
@@ -134,6 +142,7 @@ impl BitvmNetworkManager {
             config,
             swarm: BitvmSwarmWrapper::new(swarm),
             peer_id: key_pair.public().to_peer_id(),
+            connected_peers,
         })
     }
 
@@ -269,7 +278,12 @@ impl BitvmNetworkManager {
                             debug!("new external address of peer: {} {}", peer_id, address);
                         }
                         SwarmEvent::ConnectionEstablished {peer_id, connection_id, endpoint, .. } => {
+                            self.connected_peers.set(self.swarm.connected_peers().count() as i64);
                             debug!("connected to {peer_id}: {connection_id}, endpoint: {:?}", endpoint);
+                        }
+                        SwarmEvent::ConnectionClosed {peer_id, connection_id, .. } => {
+                            self.connected_peers.set(self.swarm.connected_peers().count() as i64);
+                            debug!("disconnected from {peer_id}: {connection_id}");
                         }
                         e => {
                             debug!("Unhandled {:?}", e);

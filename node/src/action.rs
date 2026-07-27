@@ -4,6 +4,7 @@
 
 use crate::env::get_local_node_info;
 use crate::handle::{HandlerContext, dispatch as handle_dispatch};
+use crate::metrics_service::MetricsState;
 use crate::middleware::AllBehaviours;
 use crate::rpc_service::current_time_secs;
 use crate::utils::*;
@@ -436,6 +437,7 @@ pub async fn handle_self_p2p_msg(
     from_peer_id: PeerId,
     id: MessageId,
     message: &[u8],
+    metrics_state: &MetricsState,
 ) -> Result<()> {
     if id != GOATMessage::default_message_id() {
         tracing::warn!(
@@ -480,6 +482,7 @@ pub async fn handle_self_p2p_msg(
             from_peer_id,
             id.clone(),
             &message.content,
+            metrics_state,
         )
         .await
         {
@@ -563,6 +566,7 @@ pub async fn recv_and_dispatch(
     from_peer_id: PeerId,
     id: MessageId,
     message: &[u8],
+    metrics_state: &MetricsState,
 ) -> Result<()> {
     if id != GOATMessage::default_message_id() {
         update_node_timestamp(local_db, &from_peer_id.to_string()).await?;
@@ -587,6 +591,8 @@ pub async fn recv_and_dispatch(
         is_self_peer,
     };
     let result = handle_dispatch(&mut handler_ctx, message.content()).await;
+    metrics_state
+        .record_message_dispatch(message_type, if result.is_ok() { "success" } else { "failed" });
     match &result {
         Ok(()) => tracing::info!(
             event = "message_dispatch_result",

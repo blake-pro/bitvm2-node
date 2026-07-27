@@ -524,6 +524,15 @@ pub struct Message {
     pub created_at: i64,
 }
 
+#[derive(Clone, Debug, FromRow, PartialEq, Eq)]
+pub struct MetricsStateCount {
+    pub category: String,
+    pub state: String,
+    pub count: i64,
+    pub oldest_created_at: Option<i64>,
+    pub last_success_at: Option<i64>,
+}
+
 #[derive(Clone, FromRow, Debug, Serialize, Deserialize, Default)]
 pub struct PeginInstanceProcessData {
     pub instance_id: Uuid,

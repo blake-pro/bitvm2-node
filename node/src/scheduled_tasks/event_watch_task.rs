@@ -6,6 +6,7 @@ use crate::env::{
     get_goat_gateway_the_graph_urls_from_env, get_goat_swap_event_filter_from_from_env,
     get_goat_swap_event_filter_gap_from_env, get_goat_swap_the_graph_urls_from_env, get_network,
 };
+use crate::metrics_service::MetricsState;
 use crate::rpc_service::current_time_secs;
 use crate::scheduled_tasks::get_timestamp_from_contract_data;
 use crate::utils::evm_swap_utils::IEscrowManager::EscrowData;
@@ -39,7 +40,7 @@ use std::collections::HashMap;
 use std::ops::AddAssign;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use store::localdb::{GraphRuntimeUpdate, InstanceUpdate, LocalDB, NodeQuery, StorageProcessor};
 use store::{
     GoatTxProcessingStatus, GoatTxRecord, GoatTxType, GraphStatus, GraphStatusSource,
@@ -1366,6 +1367,7 @@ pub async fn monitor_events_item(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_watch_event_task(
     actor: Actor,
     local_db: LocalDB,
@@ -1374,6 +1376,7 @@ pub async fn run_watch_event_task(
     interval: u64,
     cancellation_token: CancellationToken,
     goat_init_config: GoatInitConfig,
+    metrics_state: MetricsState,
 ) -> anyhow::Result<String> {
     let gateway_contract: EvmAddress = get_goat_address_from_env(ENV_GOAT_GATEWAY_CONTRACT_ADDRESS)
         .ok_or(anyhow::anyhow!("need to set gateway contract address"))?;
@@ -1490,6 +1493,7 @@ pub async fn run_watch_event_task(
     loop {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(interval)) => {
+                let started_at = Instant::now();
                 // Execute the normal monitoring logic
                 match monitor_events(
                         actor.clone(),
@@ -1500,8 +1504,19 @@ pub async fn run_watch_event_task(
                     )
                     .await
                     {
-                        Ok(_) => {}
+                        Ok(_) => {
+                            metrics_state.record_task_run(
+                                "event_watcher",
+                                "success",
+                                started_at.elapsed(),
+                            );
+                        }
                         Err(e) => {
+                            metrics_state.record_task_run(
+                                "event_watcher",
+                                "failed",
+                                started_at.elapsed(),
+                            );
                             warn!("fail to monitor events: {e}");
                         }
                     }

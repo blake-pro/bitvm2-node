@@ -11,6 +11,7 @@ use crate::env::{
     get_maintenance_run_timeout_secs, is_enable_babe_setup_state_cleanup,
     is_enable_update_spv_contract, is_relayer,
 };
+use crate::metrics_service::MetricsState;
 use crate::rpc_service::current_time_secs;
 use crate::scheduled_tasks::babe_setup_state_cleanup_task::babe_setup_state_cleanup_monitor;
 use crate::scheduled_tasks::graph_maintenance_tasks::{
@@ -55,27 +56,36 @@ async fn fetch_on_turn_graph_by_status<'a>(
 }
 
 async fn run_maintenance_subtask<T>(
+    metrics_state: &MetricsState,
     task: &'static str,
     operation: impl Future<Output = anyhow::Result<T>>,
 ) {
     let started_at = Instant::now();
     match operation.await {
-        Ok(_) => debug!(
-            event = "maintenance_subtask_result",
-            task,
-            outcome = "succeeded",
-            elapsed_ms = started_at.elapsed().as_millis() as u64,
-            "maintenance subtask completed"
-        ),
-        Err(error) => warn!(
-            event = "maintenance_subtask_result",
-            task,
-            outcome = "failed",
-            elapsed_ms = started_at.elapsed().as_millis() as u64,
-            error_class = "maintenance",
-            error = %error,
-            "maintenance subtask failed after execution"
-        ),
+        Ok(_) => {
+            let elapsed = started_at.elapsed();
+            metrics_state.record_task_run(task, "success", elapsed);
+            debug!(
+                event = "maintenance_subtask_result",
+                task,
+                outcome = "succeeded",
+                elapsed_ms = elapsed.as_millis() as u64,
+                "maintenance subtask completed"
+            )
+        }
+        Err(error) => {
+            let elapsed = started_at.elapsed();
+            metrics_state.record_task_run(task, "failed", elapsed);
+            warn!(
+                event = "maintenance_subtask_result",
+                task,
+                outcome = "failed",
+                elapsed_ms = elapsed.as_millis() as u64,
+                error_class = "maintenance",
+                error = %error,
+                "maintenance subtask failed after execution"
+            )
+        }
     }
 }
 
@@ -89,6 +99,7 @@ async fn run(
     local_db: &LocalDB,
     btc_client: Arc<BTCClient>,
     goat_client: Arc<GOATClient>,
+    metrics_state: &MetricsState,
 ) -> anyhow::Result<MaintenanceRunOutcome> {
     let btc_client = btc_client.as_ref();
     let goat_client = goat_client.as_ref();
@@ -97,6 +108,7 @@ async fn run(
         && matches!(&actor, Actor::Verifier | Actor::Operator | Actor::All)
     {
         run_maintenance_subtask(
+            metrics_state,
             "babe_setup_state_cleanup_monitor",
             babe_setup_state_cleanup_monitor(local_db),
         )
@@ -105,6 +117,7 @@ async fn run(
 
     if actor == Actor::Operator || is_relayer() {
         run_maintenance_subtask(
+            metrics_state,
             "node_available_pbtc_update_monitor",
             node_available_pbtc_update_monitor(local_db, goat_client),
         )
@@ -113,6 +126,7 @@ async fn run(
 
     if is_enable_update_spv_contract() {
         run_maintenance_subtask(
+            metrics_state,
             "spv_header_hash_update",
             spv_header_hash_update(btc_client, goat_client),
         )
@@ -132,40 +146,57 @@ async fn run(
     }
 
     run_maintenance_subtask(
+        metrics_state,
         "instance_answers_monitor",
         instance_answers_monitor(local_db, btc_client, goat_client),
     )
     .await;
     run_maintenance_subtask(
+        metrics_state,
         "instance_window_expiration_monitor",
         instance_window_expiration_monitor(local_db, goat_client),
     )
     .await;
     run_maintenance_subtask(
+        metrics_state,
         "instance_expiration_monitor",
         instance_expiration_monitor(local_db, btc_client),
     )
     .await;
     run_maintenance_subtask(
+        metrics_state,
         "instance_btc_tx_monitor",
         instance_btc_tx_monitor(local_db, btc_client),
     )
     .await;
     run_maintenance_subtask(
+        metrics_state,
         "instance_committee_key_cleanup_monitor",
         instance_committee_key_cleanup_monitor(local_db, btc_client),
     )
     .await;
-    run_maintenance_subtask("instance_bridge_out_monitor", instance_bridge_out_monitor(local_db))
-        .await;
-    run_maintenance_subtask("detect_init_withdraw_call", detect_init_withdraw_call(local_db)).await;
-    run_maintenance_subtask("detect_kickoff", detect_kickoff(local_db, btc_client)).await;
     run_maintenance_subtask(
+        metrics_state,
+        "instance_bridge_out_monitor",
+        instance_bridge_out_monitor(local_db),
+    )
+    .await;
+    run_maintenance_subtask(
+        metrics_state,
+        "detect_init_withdraw_call",
+        detect_init_withdraw_call(local_db),
+    )
+    .await;
+    run_maintenance_subtask(metrics_state, "detect_kickoff", detect_kickoff(local_db, btc_client))
+        .await;
+    run_maintenance_subtask(
+        metrics_state,
         "detect_take1_or_challenge",
         detect_take1_or_challenge(local_db, btc_client),
     )
     .await;
     run_maintenance_subtask(
+        metrics_state,
         "process_graph_challenge",
         process_graph_challenge(local_db, btc_client),
     )
@@ -180,6 +211,7 @@ pub async fn run_maintenance_tasks(
     goat_client: Arc<GOATClient>,
     interval: u64,
     cancellation_token: CancellationToken,
+    metrics_state: MetricsState,
 ) -> anyhow::Result<String> {
     let mut tick: u64 = 0;
     let maintenance_run_timeout = Duration::from_secs(get_maintenance_run_timeout_secs());
@@ -198,9 +230,16 @@ pub async fn run_maintenance_tasks(
                 // Execute the normal monitoring logic
                 match tokio::time::timeout(
                     maintenance_run_timeout,
-                    run(actor.clone(),&local_db,btc_client.clone(),goat_client.clone()),
+                    run(
+                        actor.clone(),
+                        &local_db,
+                        btc_client.clone(),
+                        goat_client.clone(),
+                        &metrics_state,
+                    ),
                 ).await {
                     Ok(Ok(MaintenanceRunOutcome::Completed)) => {
+                        metrics_state.record_task_run("maintenance", "success", tick_start.elapsed());
                         info!(
                             event = "maintenance_tick_result",
                             tick,
@@ -210,6 +249,7 @@ pub async fn run_maintenance_tasks(
                         );
                     }
                     Ok(Ok(MaintenanceRunOutcome::DeferredHistorySync)) => {
+                        metrics_state.record_task_run("maintenance", "deferred", tick_start.elapsed());
                         info!(
                             event = "maintenance_tick_result",
                             tick,
@@ -220,6 +260,7 @@ pub async fn run_maintenance_tasks(
                         );
                     }
                     Ok(Err(error)) => {
+                        metrics_state.record_task_run("maintenance", "failed", tick_start.elapsed());
                         error!(
                             event = "maintenance_tick_result",
                             tick,
@@ -230,6 +271,7 @@ pub async fn run_maintenance_tasks(
                         )
                     }
                     Err(_) => {
+                        metrics_state.record_task_run("maintenance", "timeout", tick_start.elapsed());
                         error!(
                             event = "maintenance_tick_result",
                             tick,
