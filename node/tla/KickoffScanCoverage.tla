@@ -30,46 +30,38 @@
 (* force-skips the one before it - but only if verifiers keep handling      *)
 (* those messages; single-tick coverage depended on that liveness.          *)
 (*                                                                          *)
-(* STATUS: FIXED - detect_kickoff now takes EVERY OperatorDataPushed /      *)
-(* PreKickoff graph as a scan entry (fetch_all_graphs_by_status) and        *)
-(* checks each entry's own kickoff directly. The chain walk (still capped   *)
-(* at 32) only propagates PreKickoffSent; coverage no longer depends on     *)
-(* walk depth, the root, or message handling. Modeled by ScanAllPending.    *)
+(* STATUS: FIXED - the walk from the root no longer has a depth cap: it     *)
+(* follows confirmed next_prekickoff links until the first unconfirmed one, *)
+(* so every graph on the confirmed chain is reached in the round that its   *)
+(* kickoff confirms, whatever its depth. Every step costs the operator a    *)
+(* confirmed Bitcoin transaction, and detect_kickoff runs as its own task   *)
+(* (run_kickoff_scan_task) so an unbounded walk cannot starve the other     *)
+(* maintenance checks. Modeled by ScanDepth >= NumGraphs - 1.               *)
 (*                                                                          *)
 (* This spec is a COVERAGE abstraction (same static-Init idiom as           *)
 (* Take2DisproveRace.tla): the operator kicks graph `kicked`, keeping the   *)
 (* root idle; detect_kickoff covers exactly the confirmed chain reachable   *)
-(* from some scan entry within ScanDepth. Property: the kicked graph is     *)
-(* covered (hence Challenged). With ScanAllPending = FALSE the only entry   *)
-(* is the root: ScanDepth=0 models the original no-walk selection;          *)
-(* ScanDepth>=NumGraphs-1 models #451 with an adequate depth budget;        *)
-(* 0<ScanDepth<NumGraphs-1 models the depth-limit residual. With            *)
-(* ScanAllPending = TRUE every graph is an entry and coverage holds for     *)
-(* any ScanDepth, including 0.                                              *)
+(* from the root within ScanDepth. Property: the kicked graph is covered    *)
+(* (hence Challenged). ScanDepth=0 models the original no-walk selection;   *)
+(* 0<ScanDepth<NumGraphs-1 models the capped walk of #451 (the residual);   *)
+(* ScanDepth>=NumGraphs-1 models the uncapped walk shipped now.             *)
 (************************************************************************** *)
 EXTENDS Naturals
 
 CONSTANTS
     NumGraphs,     \* graphs this operator has posted (all OperatorDataPushed, nonce 0..NumGraphs-1)
-    ScanDepth,     \* how many confirmed prekickoff successors a walk follows from its entry
-                   \*   0                    = no chain walk
-                   \*   >= NumGraphs-1        = adequate budget for this chain (real MAX = 32)
-                   \*   0 < d < NumGraphs-1   = depth-limit residual
-    ScanAllPending \* FALSE = only the lowest-nonce root is a scan entry (original / #451)
-                   \* TRUE  = every pending graph is a scan entry (current code)
-
-ASSUME ScanAllPending \in BOOLEAN
+    ScanDepth      \* how many confirmed prekickoff successors the walk follows from the root
+                   \*   0                    = no chain walk (original bug)
+                   \*   0 < d < NumGraphs-1   = capped walk (#451, cap was 32)
+                   \*   >= NumGraphs-1        = uncapped walk (current code)
 
 Graphs == 0 .. (NumGraphs - 1)
 
-\* The operator keeps the lowest-nonce graph idle as the decoy. Under the
-\* original / #451 selection (fetch_first_graph_per_operator_by_status) it is
-\* the single root detect_kickoff selects per operator; because it is never
-\* kicked it never leaves OperatorDataPushed within the modeled tick.
+\* The operator keeps the lowest-nonce graph idle as the decoy. It is the
+\* single root detect_kickoff selects per operator
+\* (fetch_first_graph_per_operator_by_status); because it is never kicked it
+\* never leaves OperatorDataPushed within the modeled round.
 Root == 0
-
-\* Graphs from which detect_kickoff starts a walk this tick.
-Entries == IF ScanAllPending THEN Graphs ELSE {Root}
 
 VARIABLE kicked          \* the graph whose kickoff the operator broadcasts (no L2 initWithdraw)
 vars == <<kicked>>
@@ -79,14 +71,11 @@ TypeOK == kicked \in Graphs
 \* To broadcast graph `kicked`'s kickoff the operator must have confirmed the
 \* prekickoff chain Root..kicked on Bitcoin (each successor's prekickoff spends
 \* the prior next_prekickoff). scan_kickoff_chain therefore CAN follow that
-\* confirmed chain from any entry - but only up to ScanDepth successors deep.
+\* confirmed chain from the root - but only up to ScanDepth successors deep.
 \* A graph g is covered (its kickoff observed -> KickoffSent -> Challenge) iff
-\* some walk reaches it: it lies on the confirmed chain (g <= kicked) and is
-\* within the depth budget of some entry at or below it. With the root as the
-\* only entry this is g <= ScanDepth; with every graph an entry, g itself is
-\* an entry at distance 0.
-WalkedSet == { g \in Graphs :
-                 g <= kicked /\ \E e \in Entries : e <= g /\ g - e <= ScanDepth }
+\* the walk reaches it: it lies on the confirmed chain (g <= kicked) and is
+\* within the depth budget of the root, i.e. g <= ScanDepth.
+WalkedSet == { g \in Graphs : g <= kicked /\ g - Root <= ScanDepth }
 
 Init == kicked \in Graphs
 Next == UNCHANGED vars   \* exhaustive over the Init choice of `kicked`
@@ -95,8 +84,7 @@ Spec == Init /\ [][Next]_vars
 --------------------------------------------------------------------------
 \* Safety: every unauthorized kickoff is covered by detect_kickoff (so a
 \* Challenge can fire before the operator's uncontested Take1).
-\* Root-only entries: kicked \in WalkedSet  <=>  kicked <= ScanDepth.
-\* All-pending entries: always true (kicked is its own entry).
+\* kicked \in WalkedSet  <=>  kicked <= ScanDepth.
 KickoffAlwaysCovered == kicked \in WalkedSet
 
 ====
