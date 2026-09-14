@@ -2130,6 +2130,27 @@ impl<'a> StorageProcessor<'a> {
         Ok(res.map(|graph| graph.graph_id))
     }
 
+    /// The operator's stored graph with the smallest kickoff index above
+    /// `kickoff_index`, regardless of status.
+    pub async fn find_next_operator_graph_after_index(
+        &mut self,
+        operator_pubkey: &str,
+        kickoff_index: i64,
+    ) -> anyhow::Result<Option<Graph>> {
+        let res = sqlx::query_as::<_, Graph>(
+            "SELECT *
+             FROM graph
+             WHERE operator_pubkey = ? AND kickoff_index > ?
+             ORDER BY kickoff_index ASC
+             LIMIT 1",
+        )
+        .bind(operator_pubkey)
+        .bind(kickoff_index)
+        .fetch_optional(self.conn())
+        .await?;
+        Ok(res)
+    }
+
     pub async fn get_graph_pre_kickoff_chain_by_cur_pre_kickoff(
         &mut self,
         current_pre_kickoff: SerializableTxid,

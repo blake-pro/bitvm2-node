@@ -158,13 +158,31 @@ async fn refresh_alert_health(
 }
 
 /// Return every graph in the requested status, ordered by operator and
-/// kickoff index. Time-sensitive flows (including the kickoff scan) must not
-/// let a lower-index graph hide another graph owned by the same operator.
+/// kickoff index. Time-sensitive flows must not let a lower-index graph hide
+/// another graph owned by the same operator.
 pub(super) async fn fetch_all_graphs_by_status<'a>(
     storage_processor: &mut StorageProcessor<'a>,
     graph_status: &str,
 ) -> anyhow::Result<Vec<Graph>> {
     storage_processor.find_graphs_by_status_group_by_operator(graph_status).await
+}
+
+/// Return the lowest-index graph for each operator in the requested status.
+/// This is only suitable as the entry point for a chain-aware scan.
+pub(super) async fn fetch_first_graph_per_operator_by_status<'a>(
+    storage_processor: &mut StorageProcessor<'a>,
+    graph_status: &str,
+) -> anyhow::Result<Vec<Graph>> {
+    let graphs_ori = fetch_all_graphs_by_status(storage_processor, graph_status).await?;
+    let mut graphs: Vec<Graph> = vec![];
+    let mut pre_operator_pubkey = "".to_string();
+    for graph in graphs_ori {
+        if graph.operator_pubkey != pre_operator_pubkey {
+            pre_operator_pubkey = graph.operator_pubkey.clone();
+            graphs.push(graph);
+        }
+    }
+    Ok(graphs)
 }
 
 async fn run_maintenance_subtask<T>(
@@ -305,8 +323,8 @@ async fn run(
         detect_init_withdraw_call(local_db),
     )
     .await;
-    run_maintenance_subtask(metrics_state, "detect_kickoff", detect_kickoff(local_db, btc_client))
-        .await;
+    // detect_kickoff runs in its own task (run_kickoff_scan_task): its walks
+    // are unbounded and must not share this run's timeout budget.
     run_maintenance_subtask(
         metrics_state,
         "detect_take1_or_challenge",
@@ -320,6 +338,83 @@ async fn run(
     )
     .await;
     Ok(MaintenanceRunOutcome::Completed)
+}
+
+/// A kickoff scan round that takes longer than this is logged; the walk is
+/// unbounded by design, so this is a signal, not a cutoff.
+const KICKOFF_SCAN_SLOW_ROUND: Duration = Duration::from_secs(60);
+
+/// Independent kickoff scan loop. Each round is gated by the gateway history
+/// sync like the maintenance tick, records its own metrics, and is cancellable
+/// while scanning as well as while sleeping. A failed round is logged and the
+/// next round runs after `interval`.
+pub async fn run_kickoff_scan_task(
+    local_db: LocalDB,
+    btc_client: Arc<BTCClient>,
+    goat_client: Arc<GOATClient>,
+    interval: u64,
+    cancellation_token: CancellationToken,
+    metrics_state: MetricsState,
+) -> anyhow::Result<String> {
+    loop {
+        tokio::select! {
+            _ = kickoff_scan_round(&local_db, &btc_client, &goat_client, &metrics_state) => {}
+            _ = cancellation_token.cancelled() => break,
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(interval)) => {}
+            _ = cancellation_token.cancelled() => break,
+        }
+    }
+    info!(
+        event = "kickoff_scan_lifecycle",
+        outcome = "shutdown",
+        "kickoff scan received shutdown signal"
+    );
+    Ok("kickoff_scan_shutdown".to_string())
+}
+
+async fn kickoff_scan_round(
+    local_db: &LocalDB,
+    btc_client: &BTCClient,
+    goat_client: &GOATClient,
+    metrics_state: &MetricsState,
+) {
+    match is_processing_gateway_history_events(local_db, goat_client).await {
+        Ok(true) => {
+            info!(
+                event = "maintenance_subtask_result",
+                task = "detect_kickoff",
+                outcome = "deferred",
+                reason = "history_sync_in_progress",
+                "kickoff scan deferred while gateway history sync is active"
+            );
+            return;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            warn!(
+                event = "maintenance_subtask_result",
+                task = "detect_kickoff",
+                outcome = "failed",
+                error = %error,
+                "kickoff scan could not check gateway history sync"
+            );
+            return;
+        }
+    }
+    let started_at = Instant::now();
+    run_maintenance_subtask(metrics_state, "detect_kickoff", detect_kickoff(local_db, btc_client))
+        .await;
+    let elapsed = started_at.elapsed();
+    if elapsed > KICKOFF_SCAN_SLOW_ROUND {
+        warn!(
+            event = "maintenance_subtask_result",
+            task = "detect_kickoff",
+            elapsed_ms = elapsed.as_millis() as u64,
+            "kickoff scan round is slow"
+        );
+    }
 }
 
 pub async fn run_maintenance_tasks(

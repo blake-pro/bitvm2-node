@@ -6,7 +6,9 @@ use crate::action::{
 };
 use crate::env::get_network;
 use crate::rpc_service::current_time_secs;
-use crate::scheduled_tasks::fetch_all_graphs_by_status;
+use crate::scheduled_tasks::{
+    fetch_all_graphs_by_status, fetch_first_graph_per_operator_by_status,
+};
 use crate::utils::{
     SELF_SENDER, load_validated_graph_definition, outpoint_spent_txid, upsert_message,
 };
@@ -36,11 +38,12 @@ const MONITE_BTC_TX_NAME_KICKOFF: &str = "kickoff";
 const MONITE_BTC_TX_NAME_WATCHTOWER_INIT: &str = "watchtower_init";
 const MONITE_BTC_TX_NAME_PROVER_ASSERT: &str = "prover_assert";
 const MONITE_BTC_TX_NAME_VERIFIER_ASSERT: &str = "verifier_assert";
-const MAX_PREKICKOFF_SUCCESSORS_PER_SCAN: usize = 32;
-/// Upper bound on kickoff scan entries checked against Bitcoin at the same
-/// time. Every pending graph is an entry, so the per-tick cost is bounded by
-/// the number of pending graphs rather than by chain depth.
+/// Upper bound on kickoff scan entries walked against Bitcoin at the same time.
 const KICKOFF_SCAN_CONCURRENCY: usize = 8;
+/// A pre-kickoff walk this deep means either an attack (every step is a
+/// confirmed Bitcoin transaction the operator paid for) or a stalled message
+/// queue that stopped force-skipping the decoys; warn once and keep walking.
+const KICKOFF_SCAN_DEPTH_WARN: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq, Display, EnumString)]
 enum OperatorWithdrawType {
@@ -333,12 +336,6 @@ fn is_kickoff_pending_status(status: &str) -> bool {
         || status == GraphStatus::PreKickoff.to_string()
 }
 
-/// Whether `txid` is confirmed. Unlike `get_tx_status`, an unknown txid is
-/// reported as not confirmed instead of as an error.
-async fn tx_confirmed_on_chain(btc_client: &BTCClient, txid: &Txid) -> anyhow::Result<bool> {
-    Ok(btc_client.get_tx_info(txid).await?.map(|tx| tx.status.confirmed).unwrap_or(false))
-}
-
 async fn detect_graph_kickoff(
     local_db: &LocalDB,
     btc_client: &BTCClient,
@@ -353,9 +350,8 @@ async fn detect_graph_kickoff(
         return Ok(());
     };
     let kickoff_txid: Txid = kickoff_txid.into();
-    // A kickoff that has not been broadcast yet is the normal state of a
-    // pending graph; esplora answers 404, which get_tx_info maps to None.
-    if tx_confirmed_on_chain(btc_client, &kickoff_txid).await? {
+    let tx_status = btc_client.get_tx_status(&kickoff_txid).await?;
+    if tx_status.confirmed {
         enqueue_kickoff_sent(local_db, graph).await?;
     } else {
         trace!(graph_id = %graph.graph_id, kickoff_txid = %kickoff_txid, "kickoff is not confirmed yet");
@@ -363,17 +359,26 @@ async fn detect_graph_kickoff(
     Ok(())
 }
 
+enum PrekickoffSuccessor {
+    /// The next pre-kickoff is confirmed and its graph is stored and valid.
+    Found(Box<Graph>),
+    /// The next pre-kickoff is confirmed but this node has no graph for it.
+    Missing,
+    /// There is no next pre-kickoff, or it is not confirmed yet.
+    Stop,
+}
+
 async fn confirmed_prekickoff_successor(
     local_db: &LocalDB,
     btc_client: &BTCClient,
     graph: &Graph,
-) -> anyhow::Result<Option<Graph>> {
+) -> anyhow::Result<PrekickoffSuccessor> {
     let Some(next_prekickoff) = graph.next_prekickoff.clone() else {
-        return Ok(None);
+        return Ok(PrekickoffSuccessor::Stop);
     };
     let next_prekickoff_txid: Txid = next_prekickoff.clone().into();
-    if !tx_confirmed_on_chain(btc_client, &next_prekickoff_txid).await? {
-        return Ok(None);
+    if !btc_client.get_tx_status(&next_prekickoff_txid).await?.confirmed {
+        return Ok(PrekickoffSuccessor::Stop);
     }
 
     let successor = {
@@ -387,7 +392,7 @@ async fn confirmed_prekickoff_successor(
                 next_prekickoff_txid = %next_prekickoff_txid,
                 "confirmed next prekickoff has no successor graph"
             );
-            return Ok(None);
+            return Ok(PrekickoffSuccessor::Missing);
         };
         let successor = storage_processor.find_graph(&graph_id).await?.ok_or_else(|| {
             anyhow::anyhow!("pre-kickoff successor graph {graph_id} disappeared from storage")
@@ -406,7 +411,33 @@ async fn confirmed_prekickoff_successor(
         successor
     };
 
-    Ok(Some(successor))
+    Ok(PrekickoffSuccessor::Found(Box::new(successor)))
+}
+
+/// Resume a walk past a graph this node has not stored: the operator's next
+/// stored graph, if its own pre-kickoff is confirmed on Bitcoin.
+async fn resume_after_missing_graph(
+    local_db: &LocalDB,
+    btc_client: &BTCClient,
+    graph: &Graph,
+) -> anyhow::Result<Option<Graph>> {
+    let next_stored = {
+        let mut storage_processor = local_db.acquire().await?;
+        storage_processor
+            .find_next_operator_graph_after_index(&graph.operator_pubkey, graph.kickoff_index)
+            .await?
+    };
+    let Some(next_stored) = next_stored else {
+        return Ok(None);
+    };
+    let Some(cur_prekickoff) = next_stored.cur_prekickoff_txid.clone() else {
+        return Ok(None);
+    };
+    let cur_prekickoff_txid: Txid = cur_prekickoff.into();
+    if !btc_client.get_tx_status(&cur_prekickoff_txid).await?.confirmed {
+        return Ok(None);
+    }
+    Ok(Some(next_stored))
 }
 
 async fn scan_kickoff_chain(
@@ -416,8 +447,9 @@ async fn scan_kickoff_chain(
     visited_graph_ids: &Mutex<HashSet<Uuid>>,
 ) -> anyhow::Result<()> {
     let mut graph = start_graph;
-    for successor_depth in 0..=MAX_PREKICKOFF_SUCCESSORS_PER_SCAN {
-        // Entries are scanned concurrently; whichever walker claims a graph
+    let mut depth = 0usize;
+    loop {
+        // Entries are walked concurrently; whichever walker claims a graph
         // first scans it, the others stop at it. The lock is never held
         // across an await.
         let first_visit = visited_graph_ids
@@ -429,7 +461,7 @@ async fn scan_kickoff_chain(
         }
 
         // A failed lookup for the lower-index kickoff must not hide a
-        // confirmed successor pre-kickoff in the same scan.
+        // confirmed successor pre-kickoff in the same walk.
         if let Err(error) = detect_graph_kickoff(local_db, btc_client, &graph).await {
             warn!(
                 graph_id = %graph.graph_id,
@@ -437,41 +469,54 @@ async fn scan_kickoff_chain(
                 "failed to scan graph kickoff; continuing pre-kickoff chain"
             );
         }
-        let Some(successor) = confirmed_prekickoff_successor(local_db, btc_client, &graph).await?
-        else {
-            return Ok(());
+        let next = match confirmed_prekickoff_successor(local_db, btc_client, &graph).await? {
+            PrekickoffSuccessor::Found(successor) => {
+                // Notify before the successor's own claim check so a walker
+                // that started at the successor cannot swallow it.
+                enqueue_prekickoff_sent(local_db, &successor).await?;
+                *successor
+            }
+            // The chain continues on Bitcoin past a graph this node has not
+            // stored. Keep the graphs behind the gap covered; the resumed
+            // graph gets no PreKickoffSent here because its predecessor is
+            // unknown locally, the normal walk sends it once that graph
+            // arrives.
+            PrekickoffSuccessor::Missing => {
+                match resume_after_missing_graph(local_db, btc_client, &graph).await? {
+                    Some(resumed) => resumed,
+                    None => return Ok(()),
+                }
+            }
+            PrekickoffSuccessor::Stop => return Ok(()),
         };
-
-        // Enqueue before checking the depth limit so the successor at the
-        // boundary still gets its PreKickoffSent this tick.
-        enqueue_prekickoff_sent(local_db, &successor).await?;
-        if successor_depth == MAX_PREKICKOFF_SUCCESSORS_PER_SCAN {
-            info!(
+        depth += 1;
+        if depth == KICKOFF_SCAN_DEPTH_WARN {
+            warn!(
                 graph_id = %graph.graph_id,
-                max_depth = MAX_PREKICKOFF_SUCCESSORS_PER_SCAN,
-                "stopped this pre-kickoff walk at the depth limit; later graphs are scanned as their own entries"
+                depth,
+                "pre-kickoff walk is unusually deep; every step is a confirmed decoy the operator paid for"
             );
-            return Ok(());
         }
-        graph = successor;
+        graph = next;
     }
-    Ok(())
 }
 
 /// May trigger PreKickoffSent and KickoffSent.
 ///
-/// Every OperatorDataPushed or PreKickoff graph is a scan entry, so a kickoff
-/// on any stored graph is observed in the tick it confirms, regardless of how
-/// deep it sits in the operator's pre-kickoff chain or whether the earlier
-/// graphs' messages have been handled. The chain walk from each entry only
-/// propagates PreKickoffSent to confirmed successors (which drives the
-/// force-skip of the graph before each of them); it is not what guarantees
-/// coverage, so its depth limit only bounds a single walk.
+/// Runs as its own task (see `run_kickoff_scan_task`), not inside the
+/// maintenance tick: a walk is unbounded by design. Entries per round are the
+/// lowest OperatorDataPushed graph of each operator, every PreKickoff graph and
+/// every OperatorKickOff graph. Each walk follows confirmed `next_prekickoff`
+/// links until the first unconfirmed one, re-checking the kickoff of every
+/// pending graph it passes (a graph behind the frontier can still be kicked
+/// until its force-skip confirms) and notifying each confirmed successor.
+/// OperatorKickOff entries only propagate: the graph after one has no pending
+/// predecessor that could notify it.
 pub async fn detect_kickoff(local_db: &LocalDB, btc_client: &BTCClient) -> anyhow::Result<()> {
     trace!("start tick action: detect_kickoff");
     let graphs = {
         let mut storage_processor = local_db.acquire().await?;
-        let mut graphs = fetch_all_graphs_by_status(
+        let mut graphs = fetch_first_graph_per_operator_by_status(
             &mut storage_processor,
             &GraphStatus::OperatorDataPushed.to_string(),
         )
@@ -481,6 +526,13 @@ pub async fn detect_kickoff(local_db: &LocalDB, btc_client: &BTCClient) -> anyho
             fetch_all_graphs_by_status(
                 &mut storage_processor,
                 &GraphStatus::PreKickoff.to_string(),
+            )
+            .await?,
+        );
+        graphs.extend(
+            fetch_all_graphs_by_status(
+                &mut storage_processor,
+                &GraphStatus::OperatorKickOff.to_string(),
             )
             .await?,
         );
@@ -1223,34 +1275,22 @@ async fn detect_kickoff_ref_disprove_tx(
     graph: &Graph,
 ) -> anyhow::Result<bool> {
     let mut detected = false;
-    let (kickoff_txid, take1_txid, take2_txid, next_pre_kickoff): (
-        Txid,
-        Txid,
-        Txid,
-        SerializableTxid,
-    ) = match (
+    let (kickoff_txid, take1_txid, take2_txid): (Txid, Txid, Txid) = match (
         graph.kickoff_txid.clone(),
         graph.take1_txid.clone(),
         graph.take2_txid.clone(),
         graph.next_prekickoff.clone(),
     ) {
-        (Some(kickoff_txid), Some(take1_txid), Some(take2_txid), Some(next_pre_kickoff)) => {
-            (kickoff_txid.into(), take1_txid.into(), take2_txid.into(), next_pre_kickoff)
+        (Some(kickoff_txid), Some(take1_txid), Some(take2_txid), Some(_)) => {
+            (kickoff_txid.into(), take1_txid.into(), take2_txid.into())
         }
         _ => {
             warn!("graph:{} kickoff_txid/take1_txid/take2_txid  has none value", graph.graph_id);
             return Ok(detected);
         }
     };
-    let pre_sents = check_pre_kickoff_sent(
-        local_db,
-        btc_client,
-        next_pre_kickoff,
-        MAX_PREKICKOFF_SUCCESSORS_PER_SCAN,
-    )
-    .await?;
-    if pre_sents > 0 {
-        info!("graph_id:{} next {pre_sents} graphs's pre_kickoff has been sent!", graph.graph_id);
+    if check_pre_kickoff_sent(local_db, btc_client, graph).await? {
+        info!("graph_id:{} next graph's pre_kickoff has been sent!", graph.graph_id);
         detected = true;
     }
     let guardian_connector_vout = output_topology::kickoff::guardian_connector() as u64;
@@ -1445,51 +1485,548 @@ async fn detect_take2(
 }
 
 /// may trigger: PreKickoffSent
+/// Notify the direct successor once its pre-kickoff is confirmed. Deeper
+/// propagation belongs to the kickoff scan task; this single hop is what
+/// decides whether the caller keeps processing the graph this tick, so it
+/// only reports true when the successor was found, validated and enqueued.
 async fn check_pre_kickoff_sent(
     local_db: &LocalDB,
     btc_client: &BTCClient,
-    pre_kickoff: SerializableTxid,
-    max_depth: usize,
-) -> anyhow::Result<usize> {
-    let check_graphs = {
-        let mut check_graphs: Vec<(Uuid, Uuid, Txid)> = vec![];
-        let mut storage_processor = local_db.acquire().await?;
-        let mut remaining_depth = max_depth;
-        let mut pre_kickoff = pre_kickoff;
-
-        while remaining_depth > 0 {
-            if let Some((graph_id, instance_id, cur_pre_kickoff, next_pre_kickoff)) =
-                storage_processor
-                    .get_graph_pre_kickoff_chain_by_cur_pre_kickoff(pre_kickoff.clone())
-                    .await?
-            {
-                check_graphs.push((graph_id, instance_id, cur_pre_kickoff.into()));
-                pre_kickoff = next_pre_kickoff;
-                remaining_depth -= 1;
-            } else {
-                break;
-            }
+    graph: &Graph,
+) -> anyhow::Result<bool> {
+    match confirmed_prekickoff_successor(local_db, btc_client, graph).await? {
+        PrekickoffSuccessor::Found(successor) => {
+            enqueue_prekickoff_sent(local_db, &successor).await?;
+            Ok(true)
         }
-        check_graphs
+        PrekickoffSuccessor::Missing | PrekickoffSuccessor::Stop => Ok(false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metrics_service::MetricsState;
+    use crate::scheduled_tasks::run_kickoff_scan_task;
+    use bitcoin::hashes::Hash;
+    use esplora_client::{OutputStatus, Tx, TxStatus};
+    use prometheus_client::registry::Registry;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use store::{
+        GraphStatusSource, GraphStatusTransitionOutcome, Message, MessageState, MessageType,
+        create_local_db,
     };
-    let mut pre_sents = 0;
-    for (graph_id, instance_id, cur_pre_kickoff) in check_graphs {
-        if btc_client.get_tx_status(&cur_pre_kickoff).await?.confirmed {
-            let mut storage_processor = local_db.acquire().await?;
-            upsert_message(
-                &mut storage_processor,
-                false,
-                graph_id,
-                None,
-                SELF_SENDER.to_string(),
-                Actor::Verifier,
-                GOATMessageContent::PreKickoffSent(PreKickoffSent { instance_id, graph_id }),
-                0,
-                0,
-            )
-            .await?;
-            pre_sents += 1;
+    use tokio_util::sync::CancellationToken;
+
+    /// Deterministic txid for a (chain, index, kind) triple so that graphs and
+    /// mock chain state can be built independently.
+    fn txid(chain: u32, index: u32, kind: u8) -> Txid {
+        let mut bytes = [0u8; 32];
+        bytes[0] = kind;
+        bytes[1..5].copy_from_slice(&chain.to_be_bytes());
+        bytes[5..9].copy_from_slice(&index.to_be_bytes());
+        Txid::from_byte_array(bytes)
+    }
+
+    fn prekickoff_txid(chain: u32, index: u32) -> Txid {
+        txid(chain, index, 1)
+    }
+
+    fn kickoff_txid(chain: u32, index: u32) -> Txid {
+        txid(chain, index, 2)
+    }
+
+    fn take1_txid(chain: u32, index: u32) -> Txid {
+        txid(chain, index, 3)
+    }
+
+    fn take2_txid(chain: u32, index: u32) -> Txid {
+        txid(chain, index, 4)
+    }
+
+    fn mock_tx(txid: Txid, confirmed: bool) -> Tx {
+        Tx {
+            txid,
+            version: 2,
+            locktime: 0,
+            vin: vec![],
+            vout: vec![],
+            size: 10,
+            weight: 40,
+            status: TxStatus {
+                confirmed,
+                block_height: if confirmed { Some(1) } else { None },
+                block_hash: None,
+                block_time: if confirmed { Some(1) } else { None },
+            },
+            fee: 0,
         }
     }
-    Ok(pre_sents)
+
+    /// Register every txid the scan may query for a chain of `len` graphs:
+    /// prekickoffs 0..len confirmed, the one past the end and all kickoffs
+    /// unconfirmed. A real esplora answers `{"confirmed":false}` for a txid
+    /// that was never broadcast, whereas the mock errors on an unknown txid,
+    /// so tests register unbroadcast transactions explicitly.
+    fn seed_chain_txs(set_tx: impl Fn(Txid, Tx), chain: u32, len: u32) {
+        for index in 0..len {
+            set_tx(prekickoff_txid(chain, index), mock_tx(prekickoff_txid(chain, index), true));
+            set_tx(kickoff_txid(chain, index), mock_tx(kickoff_txid(chain, index), false));
+        }
+        set_tx(prekickoff_txid(chain, len), mock_tx(prekickoff_txid(chain, len), false));
+    }
+
+    /// Store graph `index` of an operator's pre-kickoff chain in `status`.
+    /// Graph i's `cur_prekickoff` is prekickoff(i) and its `next_prekickoff`
+    /// is prekickoff(i + 1), mirroring the continuity enforced at ingestion.
+    async fn insert_chain_graph(
+        local_db: &LocalDB,
+        operator: &str,
+        chain: u32,
+        index: u32,
+        status: GraphStatus,
+        kickoff_txid: Option<Txid>,
+    ) -> Graph {
+        let graph = Graph {
+            graph_id: Uuid::new_v4(),
+            instance_id: Uuid::new_v4(),
+            kickoff_index: index as i64,
+            status: GraphStatus::OperatorPresigned.to_string(),
+            operator_pubkey: operator.to_string(),
+            definition_hash: format!("definition-{operator}-{index}"),
+            cur_prekickoff_txid: Some(prekickoff_txid(chain, index).into()),
+            next_prekickoff: Some(prekickoff_txid(chain, index + 1).into()),
+            kickoff_txid: kickoff_txid.map(Into::into),
+            take1_txid: Some(take1_txid(chain, index).into()),
+            take2_txid: Some(take2_txid(chain, index).into()),
+            ..Default::default()
+        };
+        let mut storage_processor = local_db.acquire().await.unwrap();
+        storage_processor.upsert_graph_definition(&graph).await.unwrap();
+        let outcome = storage_processor
+            .transition_graph_status(
+                graph.instance_id,
+                graph.graph_id,
+                status,
+                GraphStatusSource::ChainReconcile,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, GraphStatusTransitionOutcome::Applied), "{outcome:?}");
+        graph
+    }
+
+    async fn pending_messages(local_db: &LocalDB) -> Vec<Message> {
+        let mut storage_processor = local_db.acquire().await.unwrap();
+        storage_processor
+            .filter_messages(MessageState::Pending.to_string(), 0, i64::MAX, 0, 10_000, 0)
+            .await
+            .unwrap()
+    }
+
+    fn count_messages(messages: &[Message], graph_id: Uuid, msg_type: MessageType) -> usize {
+        let msg_type = msg_type.to_string();
+        messages.iter().filter(|m| m.business_id == graph_id && m.msg_type == msg_type).count()
+    }
+
+    #[tokio::test]
+    async fn deep_kickoff_is_covered_in_one_round() {
+        // Well past the 32-step cap the walk used to have; only the root is
+        // an entry, so coverage of the deepest graph comes from the walk.
+        let chain_len = 40u32;
+        let kicked = chain_len - 1;
+        let local_db = create_local_db("sqlite::memory:").await;
+        let (btc_client, mock_adaptor) = BTCClient::new_mock_client();
+
+        let mut graphs = Vec::new();
+        for index in 0..chain_len {
+            let graph = insert_chain_graph(
+                &local_db,
+                "operator-a",
+                1,
+                index,
+                GraphStatus::OperatorDataPushed,
+                Some(kickoff_txid(1, index)),
+            )
+            .await;
+            graphs.push(graph);
+        }
+        seed_chain_txs(|t, tx| mock_adaptor.set_tx(t, tx), 1, chain_len);
+        // Only the deepest graph has a confirmed kickoff.
+        mock_adaptor.set_tx(kickoff_txid(1, kicked), mock_tx(kickoff_txid(1, kicked), true));
+
+        detect_kickoff(&local_db, &btc_client).await.unwrap();
+
+        let messages = pending_messages(&local_db).await;
+        for (index, graph) in graphs.iter().enumerate() {
+            let expected_kickoff = usize::from(index as u32 == kicked);
+            assert_eq!(
+                count_messages(&messages, graph.graph_id, MessageType::KickoffSent),
+                expected_kickoff,
+                "KickoffSent for graph {index}"
+            );
+            // Every confirmed successor gets exactly one PreKickoffSent, the
+            // root gets none.
+            let expected_prekickoff = usize::from(index > 0);
+            assert_eq!(
+                count_messages(&messages, graph.graph_id, MessageType::PreKickoffSent),
+                expected_prekickoff,
+                "PreKickoffSent for graph {index}"
+            );
+        }
+        assert_eq!(messages.len(), chain_len as usize);
+    }
+
+    #[tokio::test]
+    async fn walk_stops_at_unconfirmed_link_and_passes_through_every_status() {
+        let local_db = create_local_db("sqlite::memory:").await;
+        let (btc_client, mock_adaptor) = BTCClient::new_mock_client();
+
+        // Operator A: the root has no kickoff txid; prekickoffs 0..2 are
+        // confirmed and the link 2 -> 3 is not, with the kickoff confirmed
+        // on graph 2, the last graph the walk can reach.
+        let a0 = insert_chain_graph(
+            &local_db,
+            "operator-a",
+            1,
+            0,
+            GraphStatus::OperatorDataPushed,
+            None,
+        )
+        .await;
+        let a1 = insert_chain_graph(
+            &local_db,
+            "operator-a",
+            1,
+            1,
+            GraphStatus::OperatorDataPushed,
+            Some(kickoff_txid(1, 1)),
+        )
+        .await;
+        let a2 = insert_chain_graph(
+            &local_db,
+            "operator-a",
+            1,
+            2,
+            GraphStatus::OperatorDataPushed,
+            Some(kickoff_txid(1, 2)),
+        )
+        .await;
+        seed_chain_txs(|t, tx| mock_adaptor.set_tx(t, tx), 1, 3);
+        mock_adaptor.set_tx(kickoff_txid(1, 2), mock_tx(kickoff_txid(1, 2), true));
+
+        // Operator B: OperatorDataPushed / PreKickoff / OperatorKickOff along
+        // one confirmed chain. Graph 2 is reached only through the walk (it is
+        // not an entry), graph 3 is an entry that only propagates.
+        let b0 = insert_chain_graph(
+            &local_db,
+            "operator-b",
+            2,
+            0,
+            GraphStatus::OperatorDataPushed,
+            Some(kickoff_txid(2, 0)),
+        )
+        .await;
+        let b1 = insert_chain_graph(
+            &local_db,
+            "operator-b",
+            2,
+            1,
+            GraphStatus::PreKickoff,
+            Some(kickoff_txid(2, 1)),
+        )
+        .await;
+        let b2 = insert_chain_graph(
+            &local_db,
+            "operator-b",
+            2,
+            2,
+            GraphStatus::OperatorDataPushed,
+            Some(kickoff_txid(2, 2)),
+        )
+        .await;
+        let b3 = insert_chain_graph(
+            &local_db,
+            "operator-b",
+            2,
+            3,
+            GraphStatus::OperatorKickOff,
+            Some(kickoff_txid(2, 3)),
+        )
+        .await;
+        seed_chain_txs(|t, tx| mock_adaptor.set_tx(t, tx), 2, 4);
+        mock_adaptor.set_tx(kickoff_txid(2, 2), mock_tx(kickoff_txid(2, 2), true));
+        mock_adaptor.set_tx(kickoff_txid(2, 3), mock_tx(kickoff_txid(2, 3), true));
+
+        detect_kickoff(&local_db, &btc_client).await.unwrap();
+
+        let messages = pending_messages(&local_db).await;
+        assert_eq!(count_messages(&messages, a0.graph_id, MessageType::PreKickoffSent), 0);
+        assert_eq!(count_messages(&messages, a1.graph_id, MessageType::PreKickoffSent), 1);
+        assert_eq!(count_messages(&messages, a2.graph_id, MessageType::PreKickoffSent), 1);
+        assert_eq!(count_messages(&messages, a0.graph_id, MessageType::KickoffSent), 0);
+        assert_eq!(count_messages(&messages, a1.graph_id, MessageType::KickoffSent), 0);
+        assert_eq!(count_messages(&messages, a2.graph_id, MessageType::KickoffSent), 1);
+
+        // Every confirmed successor is notified, whatever its status; only the
+        // pending graph whose kickoff confirmed gets KickoffSent.
+        assert_eq!(count_messages(&messages, b0.graph_id, MessageType::PreKickoffSent), 0);
+        assert_eq!(count_messages(&messages, b1.graph_id, MessageType::PreKickoffSent), 1);
+        assert_eq!(count_messages(&messages, b2.graph_id, MessageType::PreKickoffSent), 1);
+        assert_eq!(count_messages(&messages, b3.graph_id, MessageType::PreKickoffSent), 1);
+        assert_eq!(count_messages(&messages, b0.graph_id, MessageType::KickoffSent), 0);
+        assert_eq!(count_messages(&messages, b1.graph_id, MessageType::KickoffSent), 0);
+        assert_eq!(count_messages(&messages, b2.graph_id, MessageType::KickoffSent), 1);
+        assert_eq!(count_messages(&messages, b3.graph_id, MessageType::KickoffSent), 0);
+    }
+
+    #[tokio::test]
+    async fn operator_kickoff_entry_notifies_pending_successor() {
+        let local_db = create_local_db("sqlite::memory:").await;
+        let (btc_client, mock_adaptor) = BTCClient::new_mock_client();
+
+        // The pending graph's predecessor is not pending, so no root walk
+        // passes through it; the OperatorKickOff entry has to notify it.
+        let c0 = insert_chain_graph(
+            &local_db,
+            "operator-c",
+            3,
+            0,
+            GraphStatus::OperatorKickOff,
+            Some(kickoff_txid(3, 0)),
+        )
+        .await;
+        let c1 = insert_chain_graph(
+            &local_db,
+            "operator-c",
+            3,
+            1,
+            GraphStatus::OperatorDataPushed,
+            Some(kickoff_txid(3, 1)),
+        )
+        .await;
+        seed_chain_txs(|t, tx| mock_adaptor.set_tx(t, tx), 3, 2);
+        mock_adaptor.set_tx(kickoff_txid(3, 0), mock_tx(kickoff_txid(3, 0), true));
+
+        detect_kickoff(&local_db, &btc_client).await.unwrap();
+
+        let messages = pending_messages(&local_db).await;
+        assert_eq!(count_messages(&messages, c1.graph_id, MessageType::PreKickoffSent), 1);
+        assert_eq!(count_messages(&messages, c0.graph_id, MessageType::KickoffSent), 0);
+        assert_eq!(count_messages(&messages, c1.graph_id, MessageType::KickoffSent), 0);
+        assert_eq!(messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_graph_keeps_coverage_and_normal_path_notifies_later() {
+        let local_db = create_local_db("sqlite::memory:").await;
+        let (btc_client, mock_adaptor) = BTCClient::new_mock_client();
+
+        // Graph 1 has not been received yet; graph 2 is stored, its prekickoff
+        // is confirmed and its kickoff is confirmed.
+        let d0 = insert_chain_graph(
+            &local_db,
+            "operator-d",
+            4,
+            0,
+            GraphStatus::OperatorDataPushed,
+            Some(kickoff_txid(4, 0)),
+        )
+        .await;
+        let d2 = insert_chain_graph(
+            &local_db,
+            "operator-d",
+            4,
+            2,
+            GraphStatus::OperatorDataPushed,
+            Some(kickoff_txid(4, 2)),
+        )
+        .await;
+        seed_chain_txs(|t, tx| mock_adaptor.set_tx(t, tx), 4, 3);
+        mock_adaptor.set_tx(kickoff_txid(4, 2), mock_tx(kickoff_txid(4, 2), true));
+
+        // Round 1: the walk resumes past the gap and observes the kickoff, but
+        // the resumed graph gets no PreKickoffSent (its predecessor is
+        // unknown locally).
+        detect_kickoff(&local_db, &btc_client).await.unwrap();
+        let messages = pending_messages(&local_db).await;
+        assert_eq!(count_messages(&messages, d2.graph_id, MessageType::KickoffSent), 1);
+        assert_eq!(count_messages(&messages, d2.graph_id, MessageType::PreKickoffSent), 0);
+        assert_eq!(messages.len(), 1);
+
+        // Round 2: graph 1 arrived; the normal path notifies 1 and 2.
+        let d1 = insert_chain_graph(
+            &local_db,
+            "operator-d",
+            4,
+            1,
+            GraphStatus::OperatorDataPushed,
+            Some(kickoff_txid(4, 1)),
+        )
+        .await;
+        detect_kickoff(&local_db, &btc_client).await.unwrap();
+        let messages = pending_messages(&local_db).await;
+        assert_eq!(count_messages(&messages, d1.graph_id, MessageType::PreKickoffSent), 1);
+        assert_eq!(count_messages(&messages, d2.graph_id, MessageType::PreKickoffSent), 1);
+        assert_eq!(count_messages(&messages, d2.graph_id, MessageType::KickoffSent), 1);
+        assert_eq!(count_messages(&messages, d0.graph_id, MessageType::PreKickoffSent), 0);
+        assert_eq!(count_messages(&messages, d1.graph_id, MessageType::KickoffSent), 0);
+        assert_eq!(messages.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn rescan_is_idempotent_and_unconfirmed_kickoff_is_ignored() {
+        let local_db = create_local_db("sqlite::memory:").await;
+        let (btc_client, mock_adaptor) = BTCClient::new_mock_client();
+
+        let c0 = insert_chain_graph(
+            &local_db,
+            "operator-c",
+            3,
+            0,
+            GraphStatus::OperatorDataPushed,
+            Some(kickoff_txid(3, 0)),
+        )
+        .await;
+        let c1 = insert_chain_graph(
+            &local_db,
+            "operator-c",
+            3,
+            1,
+            GraphStatus::OperatorDataPushed,
+            Some(kickoff_txid(3, 1)),
+        )
+        .await;
+        // Both kickoffs are registered but unconfirmed.
+        seed_chain_txs(|t, tx| mock_adaptor.set_tx(t, tx), 3, 2);
+
+        detect_kickoff(&local_db, &btc_client).await.unwrap();
+        detect_kickoff(&local_db, &btc_client).await.unwrap();
+
+        let messages = pending_messages(&local_db).await;
+        assert_eq!(count_messages(&messages, c0.graph_id, MessageType::KickoffSent), 0);
+        assert_eq!(count_messages(&messages, c1.graph_id, MessageType::KickoffSent), 0);
+        assert_eq!(count_messages(&messages, c1.graph_id, MessageType::PreKickoffSent), 1);
+        assert_eq!(messages.len(), 1, "a rescan must not create duplicate messages");
+    }
+
+    #[tokio::test]
+    async fn one_hop_detection_requires_stored_successor_and_keeps_guardian_override() {
+        let local_db = create_local_db("sqlite::memory:").await;
+        let (btc_client, mock_adaptor) = BTCClient::new_mock_client();
+        let guardian_vout = output_topology::kickoff::guardian_connector() as u64;
+
+        let e0 = insert_chain_graph(
+            &local_db,
+            "operator-e",
+            5,
+            0,
+            GraphStatus::OperatorKickOff,
+            Some(kickoff_txid(5, 0)),
+        )
+        .await;
+        seed_chain_txs(|t, tx| mock_adaptor.set_tx(t, tx), 5, 2);
+        mock_adaptor.set_tx(kickoff_txid(5, 0), mock_tx(kickoff_txid(5, 0), true));
+
+        // The successor's prekickoff is confirmed but the graph is not stored:
+        // nothing is enqueued and nothing is detected.
+        assert!(!detect_kickoff_ref_disprove_tx(&btc_client, &local_db, &e0).await.unwrap());
+        assert!(pending_messages(&local_db).await.is_empty());
+
+        // Stored successor: notified and detected.
+        let e1 = insert_chain_graph(
+            &local_db,
+            "operator-e",
+            5,
+            1,
+            GraphStatus::OperatorDataPushed,
+            Some(kickoff_txid(5, 1)),
+        )
+        .await;
+        assert!(detect_kickoff_ref_disprove_tx(&btc_client, &local_db, &e0).await.unwrap());
+        let messages = pending_messages(&local_db).await;
+        assert_eq!(count_messages(&messages, e1.graph_id, MessageType::PreKickoffSent), 1);
+        assert_eq!(messages.len(), 1);
+
+        // The guardian output spent by Take1 still overrides the detection.
+        mock_adaptor.set_tx(take1_txid(5, 0), mock_tx(take1_txid(5, 0), true));
+        mock_adaptor.set_output_status(
+            kickoff_txid(5, 0),
+            guardian_vout,
+            OutputStatus { spent: true, txid: Some(take1_txid(5, 0)), vin: Some(0), status: None },
+        );
+        assert!(!detect_kickoff_ref_disprove_tx(&btc_client, &local_db, &e0).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn scan_task_completes_a_round_and_is_cancellable() {
+        // The history-sync gate needs a gateway address; the mock GOAT client
+        // reports finalized block 0, so the gate is open.
+        unsafe {
+            std::env::set_var(
+                crate::env::ENV_GOAT_GATEWAY_CONTRACT_ADDRESS,
+                "0x0000000000000000000000000000000000000001",
+            )
+        };
+        let local_db = create_local_db("sqlite::memory:").await;
+        let (btc_client, mock_adaptor) = BTCClient::new_mock_client();
+        let btc_client = Arc::new(btc_client);
+        let (goat_client, _) = client::goat_chain::GOATClient::new_mock_client();
+        let metrics_state = MetricsState::new(Arc::new(std::sync::Mutex::new(Registry::default())));
+
+        let chain_len = 5u32;
+        let kicked = chain_len - 1;
+        let mut graphs = Vec::new();
+        for index in 0..chain_len {
+            graphs.push(
+                insert_chain_graph(
+                    &local_db,
+                    "operator-f",
+                    6,
+                    index,
+                    GraphStatus::OperatorDataPushed,
+                    Some(kickoff_txid(6, index)),
+                )
+                .await,
+            );
+        }
+        seed_chain_txs(|t, tx| mock_adaptor.set_tx(t, tx), 6, chain_len);
+        mock_adaptor.set_tx(kickoff_txid(6, kicked), mock_tx(kickoff_txid(6, kicked), true));
+
+        let cancellation_token = CancellationToken::new();
+        let scan = tokio::spawn(run_kickoff_scan_task(
+            local_db.clone(),
+            btc_client.clone(),
+            Arc::new(goat_client),
+            1,
+            cancellation_token.clone(),
+            metrics_state,
+        ));
+
+        // The round runs to completion: the deepest kickoff is observed.
+        let kicked_id = graphs[kicked as usize].graph_id;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while count_messages(
+                &pending_messages(&local_db).await,
+                kicked_id,
+                MessageType::KickoffSent,
+            ) == 0
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("kickoff scan did not complete");
+        assert!(!scan.is_finished());
+
+        cancellation_token.cancel();
+        let tag = tokio::time::timeout(Duration::from_secs(5), scan)
+            .await
+            .expect("kickoff scan did not stop after cancellation")
+            .unwrap()
+            .unwrap();
+        assert_eq!(tag, "kickoff_scan_shutdown");
+    }
 }
