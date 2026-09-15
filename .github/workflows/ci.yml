@@ -80,10 +80,13 @@ jobs:
           # assert), anything else = TLC did not finish. The log is kept for
           # the failure case. TLC names its state directory by the current
           # second, so give each run its own parent to keep back-to-back runs
-          # from colliding.
+          # from colliding. The runner's default shell is `bash -e`, so a
+          # non-zero TLC status must be captured with `|| rc=$?` instead of
+          # read back from `$?`, or the first counterexample aborts the step.
           run_tlc() {
-            java -jar "$JAR" -metadir "states/$1" -config "$1" "$2" > tlc.log 2>&1
-            case $? in
+            local rc=0
+            java -jar "$JAR" -metadir "states/$1" -config "$1" "$2" > tlc.log 2>&1 || rc=$?
+            case $rc in
               0) outcome=verified ;;
               1[0-4]) outcome=counterexample ;;
               *) outcome=failed ;;
