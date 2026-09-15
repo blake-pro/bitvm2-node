@@ -1963,11 +1963,14 @@ mod tests {
     #[tokio::test]
     async fn scan_task_completes_a_round_and_is_cancellable() {
         // The history-sync gate needs a gateway address; the mock GOAT client
-        // reports finalized block 0, so the gate is open.
+        // reports finalized block 0, so the gate is open. The variable is
+        // process-wide and rpc_service::tests::init sets it concurrently, so
+        // use the same value: the write is then idempotent whichever test
+        // runs first, and those tests keep talking to the real contract.
         unsafe {
             std::env::set_var(
                 crate::env::ENV_GOAT_GATEWAY_CONTRACT_ADDRESS,
-                "0x0000000000000000000000000000000000000001",
+                "0x21f619040AC2eAcacEF8Fe17Ae8bDF53ec69C66f",
             )
         };
         let local_db = create_local_db("sqlite::memory:").await;
